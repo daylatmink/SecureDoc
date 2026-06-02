@@ -7,3 +7,4 @@ frontend/dist/
 __pycache__/
 *.pyc
 .DS_Store
+AGENTS.md
