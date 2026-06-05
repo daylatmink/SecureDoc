@@ -1,19 +1,19 @@
 # SecureDoc
 
-SecureDoc la web app demo cho mon Nhap mon An toan thong tin, chu de "Chu ky so". Project minh hoa cach bam tai lieu bang SHA-256, ky digest bang RSA-PSS/private key, xac minh bang public key, va dung certificate JSON gia lap de lien ket public key voi danh tinh nguoi ky.
+SecureDoc là web app demo cho môn Nhập môn An toàn thông tin, chủ đề **chữ ký số**. Project minh họa cách băm tài liệu bằng SHA-256, ký digest bằng RSA-PSS/private key, xác minh bằng public key, dùng certificate do Demo CA ký để liên kết public key với danh tính người ký, và mô phỏng chữ ký mù RSA.
 
-Day la ban MVP chay local, khong phai he thong ky so san xuat.
+Đây là bản demo chạy local cho mục tiêu học thuật, chưa phải hệ thống ký số production.
 
-## Kien truc
+## Kiến trúc
 
 ```text
 SecureDoc/
   backend/    FastAPI, cryptography, SQLite, SQLAlchemy
   frontend/   React + Vite + TypeScript
-  docs/       Giai thich crypto flow, API va kich ban kiem thu
+  docs/       Giải thích crypto flow, API và kịch bản kiểm thử
 ```
 
-## Chay backend
+## Chạy backend
 
 ```powershell
 cd backend
@@ -23,9 +23,9 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-Backend mac dinh chay tai `http://127.0.0.1:8000`. Swagger docs: `http://127.0.0.1:8000/docs`.
+Backend mặc định chạy tại `http://127.0.0.1:8000`. Swagger docs: `http://127.0.0.1:8000/docs`.
 
-## Chay frontend
+## Chạy frontend
 
 ```powershell
 cd frontend
@@ -33,45 +33,58 @@ npm install
 npm run dev
 ```
 
-Frontend mac dinh chay tai `http://127.0.0.1:5173`.
+Frontend mặc định chạy tại `http://127.0.0.1:5173`.
 
-## Luong ky
+## Repo đã demo được gì
 
-1. Nguoi dung tao key pair voi ten va email.
+- Tính SHA-256 cho file upload.
+- Sinh RSA key pair 2048-bit cho người ký.
+- Tạo certificate JSON có chữ ký của `SecureDoc Demo CA`.
+- Ký tài liệu bằng RSA-PSS trên hash SHA-256.
+- Xuất `signed_package.json` gồm hash, chữ ký tài liệu, thời điểm ký và certificate.
+- Xác minh tài liệu bằng cách kiểm tra hash, chữ ký CA của certificate, trạng thái thu hồi trong server DB và chữ ký tài liệu.
+- Thu hồi certificate theo `serialNumber`.
+- Mô phỏng chữ ký mù RSA cho phần mở rộng lý thuyết.
+
+## Luồng ký
+
+1. Người dùng tạo key pair với tên và email.
 2. Backend sinh RSA 2048-bit private/public key.
-3. Backend tao certificate JSON gia lap gom serial number, owner, email, public key, issuer, ngay cap, ngay het han va status.
-4. Nguoi dung upload file, private key PEM va certificate JSON.
-5. Backend tinh SHA-256 cua file.
-6. Backend ky digest bang RSA-PSS + SHA-256.
-7. Backend tra ve `signed_package.json` gom hash, signature Base64, thoi diem ky va certificate.
+3. Backend tạo certificate JSON và ký các trường định danh bằng private key của Demo CA.
+4. Người dùng upload file, private key PEM và certificate JSON.
+5. Backend kiểm tra certificate có chữ ký hợp lệ của Demo CA và chưa bị thu hồi.
+6. Backend tính SHA-256 của file.
+7. Backend ký digest bằng RSA-PSS + SHA-256.
+8. Backend trả về `signed_package.json`.
 
-## Luong xac minh
+## Luồng xác minh
 
-1. Nguoi dung upload file can verify va `signed_package.json`.
-2. Backend tinh lai SHA-256 cua file.
-3. Backend so sanh hash moi voi `documentHash`.
-4. Backend kiem tra certificate chua het han va `status` la `valid`.
-5. Backend verify signature bang public key trong certificate.
-6. Ket qua tra ve `valid`, `reason`, signer info, hash va verification details.
+1. Người dùng upload file cần verify và `signed_package.json`.
+2. Backend tính lại SHA-256 của file.
+3. Backend so sánh hash mới với `documentHash`.
+4. Backend kiểm tra chữ ký CA trên certificate.
+5. Backend tra trạng thái certificate từ SQLite theo `serialNumber`.
+6. Backend kiểm tra certificate chưa hết hạn.
+7. Backend verify chữ ký tài liệu bằng public key trong certificate.
 
-## Kich ban kiem thu
+## Kịch bản kiểm thử
 
 Xem kịch bản kiểm thử thủ công trong `docs/test-scenarios.md`.
 
-## Gioi han bao mat cua demo
+## Giới hạn bảo mật của demo
 
-- Private key duoc paste/upload tu nguoi dung de demo. He thong that khong nen luu private key plaintext va khong nen gui private key len server neu khong co mo hinh bao ve phu hop.
-- Certificate chi la JSON gia lap, chua co CA thuc, chain of trust, OCSP/CRL that, hay co che chong sua certificate.
-- Revocation trong demo chu yeu dua vao truong `status` cua certificate.
-- Khong co authentication, authorization, audit log day du, rate limit hay hardening production.
-- Khong duoc thay RSA-PSS/SHA-256 bang MD5, SHA-1 hoac thuat toan yeu.
+- Demo CA vẫn chạy local, private key CA được tạo trong thư mục backend để phục vụ demo.
+- Private key người ký vẫn được paste/upload lên backend để ký; hệ thống thật nên ký ở client, USB token, smart card, HSM hoặc dịch vụ ký số bảo vệ khóa.
+- Chưa có CA thật, chain of trust thật, OCSP/CRL thật hay quy trình định danh người ký.
+- Chưa có authentication, authorization, audit log đầy đủ, rate limit, HTTPS bắt buộc hay hardening production.
+- Demo chữ ký mù dùng mô phỏng RSA giáo dục, chưa phải giao thức production.
 
-## File chinh
+## File chính
 
-- `backend/app/main.py`: cac API FastAPI.
-- `backend/app/crypto_utils.py`: SHA-256, RSA key generation, RSA-PSS sign/verify.
+- `backend/app/main.py`: các API FastAPI.
+- `backend/app/crypto_utils.py`: SHA-256, RSA key generation, RSA-PSS sign/verify, Demo CA, chữ ký mù.
 - `backend/app/models.py`: SQLAlchemy certificate record.
-- `frontend/src/main.tsx`: UI React cho cac tab demo.
-- `docs/crypto-flow.md`: giai thich crypto flow.
-- `docs/api.md`: mo ta API va payload mau.
-- `docs/test-scenarios.md`: kich ban kiem thu thu cong.
+- `frontend/src/main.tsx`: UI React cho các tab demo.
+- `docs/crypto-flow.md`: giải thích crypto flow.
+- `docs/api.md`: mô tả API và payload mẫu.
+- `docs/test-scenarios.md`: kịch bản kiểm thử thủ công.
