@@ -17,6 +17,8 @@ class Certificate(BaseModel):
     issuedAt: str
     expiresAt: str
     status: str
+    caSignatureAlgorithm: Optional[str] = None
+    caSignatureBase64: Optional[str] = None
 
 
 class KeyGenerateResponse(BaseModel):
@@ -46,4 +48,14 @@ class VerifyResponse(BaseModel):
     documentHash: str
     signedAt: Optional[str]
     details: Dict[str, Any]
+
+
+class CaPublicKeyResponse(BaseModel):
+    issuer: str
+    publicKeyPem: str
+    signatureAlgorithm: str
+
+
+class BlindSignatureDemoRequest(BaseModel):
+    message: str
 

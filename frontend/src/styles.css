@@ -35,7 +35,7 @@ textarea:focus-visible {
 
 .appShell {
   display: grid;
-  grid-template-columns: 292px minmax(0, 1fr);
+  grid-template-columns: 304px minmax(0, 1fr);
   min-height: 100dvh;
 }
 
@@ -488,6 +488,10 @@ pre {
   color: #b91c1c;
 }
 
+.verifyBox .detailList {
+  margin-top: 14px;
+}
+
 .errorText {
   color: #b91c1c;
   font-weight: 750;
@@ -503,7 +507,7 @@ pre {
   }
 
   .navList {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
   }
 
   .navButton {

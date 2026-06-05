@@ -5,10 +5,13 @@ import {
   Ban,
   CheckCircle2,
   Download,
+  EyeOff,
   FileCheck,
   FileSignature,
   Fingerprint,
+  Hash,
   KeyRound,
+  RotateCcw,
   ShieldCheck,
   Upload
 } from "lucide-react";
@@ -25,6 +28,8 @@ type Certificate = {
   issuedAt: string;
   expiresAt: string;
   status: string;
+  caSignatureAlgorithm?: string;
+  caSignatureBase64?: string;
 };
 
 type SignedPackage = {
@@ -37,6 +42,12 @@ type SignedPackage = {
   certificate: Certificate;
 };
 
+type HashResult = {
+  documentName: string;
+  hashAlgorithm: string;
+  documentHash: string;
+};
+
 type VerifyResult = {
   valid: boolean;
   reason: string;
@@ -46,13 +57,29 @@ type VerifyResult = {
   details: Record<string, unknown>;
 };
 
-type Tab = "home" | "keys" | "sign" | "verify";
+type BlindSignatureResult = {
+  message: string;
+  hashAlgorithm: string;
+  messageHash: string;
+  scheme: string;
+  publicKey: { modulusHex: string; publicExponent: number };
+  blindedMessageBase64: string;
+  blindSignatureBase64: string;
+  unblindedSignatureBase64: string;
+  verificationValueHex: string;
+  valid: boolean;
+};
+
+type Tab = "home" | "hash" | "keys" | "sign" | "verify" | "revoke" | "blind";
 
 const tabs: Array<{ tab: Tab; label: string; helper: string; icon: React.ReactNode }> = [
-  { tab: "home", label: "Tổng quan", helper: "Quy trình demo", icon: <BadgeCheck size={18} /> },
-  { tab: "keys", label: "Tạo khóa", helper: "RSA + certificate", icon: <KeyRound size={18} /> },
-  { tab: "sign", label: "Ký tài liệu", helper: "Hash + signature", icon: <FileSignature size={18} /> },
-  { tab: "verify", label: "Xác minh", helper: "Kiểm tra chữ ký", icon: <FileCheck size={18} /> }
+  { tab: "home", label: "Tổng quan", helper: "Luồng demo", icon: <BadgeCheck size={18} /> },
+  { tab: "hash", label: "Băm file", helper: "SHA-256", icon: <Hash size={18} /> },
+  { tab: "keys", label: "Tạo khóa", helper: "RSA + CA", icon: <KeyRound size={18} /> },
+  { tab: "sign", label: "Ký tài liệu", helper: "RSA-PSS", icon: <FileSignature size={18} /> },
+  { tab: "verify", label: "Xác minh", helper: "Trust + revoke", icon: <FileCheck size={18} /> },
+  { tab: "revoke", label: "Thu hồi", helper: "Server DB", icon: <RotateCcw size={18} /> },
+  { tab: "blind", label: "Chữ ký mù", helper: "RSA blind", icon: <EyeOff size={18} /> }
 ];
 
 function App() {
@@ -77,15 +104,18 @@ function App() {
         </nav>
         <div className="sidebarNote">
           <ShieldCheck size={18} />
-          <p>SHA-256 trước, RSA-PSS sau. Private key plaintext chỉ dùng cho demo.</p>
+          <p>Luồng hiện có thêm Demo CA, kiểm tra chữ ký certificate và tra trạng thái thu hồi từ server.</p>
         </div>
       </aside>
 
       <main>
         {activeTab === "home" && <Home setActiveTab={setActiveTab} />}
+        {activeTab === "hash" && <HashDocument />}
         {activeTab === "keys" && <GenerateKeys />}
         {activeTab === "sign" && <SignDocument />}
         {activeTab === "verify" && <VerifyDocument />}
+        {activeTab === "revoke" && <RevokeCertificate />}
+        {activeTab === "blind" && <BlindSignatureDemo />}
       </main>
     </div>
   );
@@ -120,7 +150,7 @@ function Home({ setActiveTab }: { setActiveTab: (tab: Tab) => void }) {
           <p className="eyebrow">Nhập môn An toàn thông tin</p>
           <h2>Demo ký số và xác minh tài liệu điện tử</h2>
           <p>
-            SecureDoc minh họa luồng ký số bằng SHA-256, RSA-PSS, cặp khóa công khai/bí mật và certificate giả lập.
+            SecureDoc minh họa chữ ký số bằng SHA-256, RSA-PSS, certificate do Demo CA ký, kiểm tra thu hồi từ server và một mô phỏng chữ ký mù RSA.
           </p>
         </div>
         <button className="primary heroAction" onClick={() => setActiveTab("keys")}>
@@ -130,16 +160,16 @@ function Home({ setActiveTab }: { setActiveTab: (tab: Tab) => void }) {
       </div>
 
       <div className="workflowGrid" aria-label="Quy trình demo">
-        <StepCard number="01" title="Tạo khóa" text="Sinh RSA key pair 2048-bit và certificate JSON cho người ký." />
-        <StepCard number="02" title="Ký tài liệu" text="Băm file bằng SHA-256, sau đó ký digest bằng RSA-PSS." />
-        <StepCard number="03" title="Xác minh" text="So khớp hash, certificate, trạng thái và chữ ký để kết luận hợp lệ." />
+        <StepCard number="01" title="Tạo khóa" text="Sinh RSA key pair 2048-bit và certificate JSON được Demo CA ký." />
+        <StepCard number="02" title="Ký tài liệu" text="Băm file bằng SHA-256, ký digest bằng RSA-PSS và xuất signed package." />
+        <StepCard number="03" title="Xác minh" text="So khớp hash, kiểm tra chữ ký CA, trạng thái thu hồi và chữ ký tài liệu." />
       </div>
 
       <div className="metricGrid">
-        <InfoBox title="SHA-256" text="Băm file thành digest hex có độ dài cố định." />
-        <InfoBox title="RSA-PSS" text="Ký digest bằng private key và xác minh bằng public key." />
-        <InfoBox title="Certificate" text="Liên kết public key với danh tính người ký trong demo." />
-        <InfoBox title="Kiểm thử" text="Sửa file, dùng sai key, hết hạn hoặc thu hồi certificate." />
+        <InfoBox title="SHA-256" text="Băm file thành digest cố định để phát hiện thay đổi nội dung." />
+        <InfoBox title="RSA-PSS" text="Tạo và xác minh chữ ký số bằng cặp khóa bất đối xứng." />
+        <InfoBox title="Demo CA" text="Certificate không còn là JSON tự khai mà có chữ ký của CA giả lập." />
+        <InfoBox title="Chữ ký mù" text="Có mô phỏng RSA blind signature để khớp phần mở rộng của chủ đề." />
       </div>
     </section>
   );
@@ -164,6 +194,58 @@ function InfoBox({ title, text }: { title: string; text: string }) {
   );
 }
 
+function HashDocument() {
+  const [file, setFile] = useState<File | null>(null);
+  const [result, setResult] = useState<HashResult | null>(null);
+  const [error, setError] = useState("");
+
+  async function submit() {
+    if (!file) {
+      setError("Vui lòng chọn tài liệu trước");
+      return;
+    }
+    setError("");
+    setResult(null);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const response = await fetch(`${API_BASE}/api/documents/hash`, { method: "POST", body });
+      setResult(await parseResponse<HashResult>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Không thể băm tài liệu"));
+    }
+  }
+
+  return (
+    <section className="page taskPage">
+      <PageHeader title="Băm tài liệu" description="Tính SHA-256 của file để thấy nền tảng toàn vẹn trước khi ký số." />
+      <div className="surface">
+        <FileInput label="Tài liệu" onFile={setFile} />
+        <button className="primary" onClick={submit}>
+          <Hash size={18} />
+          Tính SHA-256
+        </button>
+        {error && <p className="errorText" role="alert">{error}</p>}
+      </div>
+      {result && (
+        <div className="resultPanel" aria-label="Kết quả băm tài liệu">
+          <div className="resultHeader">
+            <CheckCircle2 size={22} />
+            <div>
+              <h3>Đã tính hash</h3>
+              <p>{result.documentName}</p>
+            </div>
+          </div>
+          <dl className="detailList">
+            <DetailItem label="Thuật toán" value={result.hashAlgorithm} />
+            <DetailItem label="Document hash" value={result.documentHash} />
+          </dl>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function GenerateKeys() {
   const [name, setName] = useState("Nguyễn Văn A");
   const [email, setEmail] = useState("student@example.com");
@@ -172,22 +254,22 @@ function GenerateKeys() {
 
   async function submit() {
     setError("");
-    const response = await fetch(`${API_BASE}/api/keys/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, email })
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      setError(data.detail ?? "Không thể tạo khóa");
-      return;
+    setResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/keys/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, email })
+      });
+      setResult(await parseResponse<{ privateKeyPem: string; publicKeyPem: string; certificate: Certificate }>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Không thể tạo khóa"));
     }
-    setResult(data);
   }
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Tạo khóa" description="Tạo RSA key pair 2048-bit và certificate JSON giả lập." />
+      <PageHeader title="Tạo khóa" description="Tạo RSA key pair 2048-bit và certificate JSON được Demo CA ký." />
       <div className="surface">
         <div className="formGrid">
           <label>
@@ -209,7 +291,7 @@ function GenerateKeys() {
         <div className="outputStack" aria-label="Kết quả tạo khóa">
           <PemBlock title="Private key" value={result.privateKeyPem} filename="private_key.pem" />
           <PemBlock title="Public key" value={result.publicKeyPem} filename="public_key.pem" />
-          <PemBlock title="Certificate" value={JSON.stringify(result.certificate, null, 2)} filename="certificate.json" />
+          <PemBlock title="Certificate do Demo CA ký" value={JSON.stringify(result.certificate, null, 2)} filename="certificate.json" />
         </div>
       )}
     </section>
@@ -229,22 +311,22 @@ function SignDocument() {
       return;
     }
     setError("");
+    setResult(null);
     const body = new FormData();
     body.append("file", file);
     body.append("privateKeyPem", privateKey);
     body.append("certificate", certificate);
-    const response = await fetch(`${API_BASE}/api/sign`, { method: "POST", body });
-    const data = await response.json();
-    if (!response.ok) {
-      setError(data.detail ?? "Không thể ký tài liệu");
-      return;
+    try {
+      const response = await fetch(`${API_BASE}/api/sign`, { method: "POST", body });
+      setResult(await parseResponse<SignedPackage>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Không thể ký tài liệu"));
     }
-    setResult(data);
   }
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Ký tài liệu" description="Upload file, nhập private key và certificate để tạo signed package." />
+      <PageHeader title="Ký tài liệu" description="Upload file, private key và certificate hợp lệ để tạo signed package." />
       <div className="surface">
         <FileInput label="Tài liệu" onFile={setFile} />
         <TextOrFile label="Private key PEM" value={privateKey} setValue={setPrivateKey} />
@@ -265,18 +347,10 @@ function SignDocument() {
             </div>
           </div>
           <dl className="detailList">
-            <div>
-              <dt>Hash tài liệu</dt>
-              <dd>{result.documentHash}</dd>
-            </div>
-            <div>
-              <dt>Thời điểm ký</dt>
-              <dd>{result.signedAt}</dd>
-            </div>
-            <div>
-              <dt>Chữ ký</dt>
-              <dd>{result.signatureBase64.slice(0, 96)}...</dd>
-            </div>
+            <DetailItem label="Hash tài liệu" value={result.documentHash} />
+            <DetailItem label="Thời điểm ký" value={result.signedAt} />
+            <DetailItem label="Chữ ký tài liệu" value={`${result.signatureBase64.slice(0, 120)}...`} />
+            <DetailItem label="Chữ ký CA trên certificate" value={`${result.certificate.caSignatureBase64?.slice(0, 120) ?? ""}...`} />
           </dl>
           <button className="secondary" onClick={() => downloadText("signed_package.json", JSON.stringify(result, null, 2))}>
             <Download size={18} />
@@ -300,21 +374,21 @@ function VerifyDocument() {
       return;
     }
     setError("");
+    setResult(null);
     const body = new FormData();
     body.append("file", file);
     body.append("signedPackage", packageText);
-    const response = await fetch(`${API_BASE}/api/verify`, { method: "POST", body });
-    const data = await response.json();
-    if (!response.ok) {
-      setError(data.detail ?? "Không thể xác minh tài liệu");
-      return;
+    try {
+      const response = await fetch(`${API_BASE}/api/verify`, { method: "POST", body });
+      setResult(await parseResponse<VerifyResult>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Không thể xác minh tài liệu"));
     }
-    setResult(data);
   }
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Xác minh tài liệu" description="Upload file gốc và signed package để kiểm tra hash, certificate và chữ ký." />
+      <PageHeader title="Xác minh tài liệu" description="Kiểm tra hash, chữ ký CA của certificate, trạng thái thu hồi trên server và chữ ký tài liệu." />
       <div className="surface">
         <FileInput label="Tài liệu" onFile={setFile} />
         <TextOrFile label="signed_package.json" value={packageText} setValue={setPackageText} />
@@ -332,7 +406,114 @@ function VerifyDocument() {
           <div>
             <h3>{result.valid ? "Chữ ký hợp lệ" : "Chữ ký không hợp lệ"}</h3>
             <p>{result.reason}</p>
+            {result.signer && <p>Người ký: {result.signer.name} ({result.signer.email})</p>}
             <pre>{JSON.stringify(result.details, null, 2)}</pre>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RevokeCertificate() {
+  const [certificateText, setCertificateText] = useState("");
+  const [result, setResult] = useState<{ certificate: Certificate } | null>(null);
+  const [error, setError] = useState("");
+
+  async function submit() {
+    setError("");
+    setResult(null);
+    try {
+      const certificate = JSON.parse(certificateText);
+      const response = await fetch(`${API_BASE}/api/certificates/revoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ certificate })
+      });
+      setResult(await parseResponse<{ certificate: Certificate }>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Không thể thu hồi certificate"));
+    }
+  }
+
+  return (
+    <section className="page taskPage">
+      <PageHeader title="Thu hồi certificate" description="Đánh dấu certificate là revoked trong server DB; bước verify sẽ tra trạng thái này theo serial number." />
+      <div className="surface">
+        <TextOrFile label="Certificate JSON" value={certificateText} setValue={setCertificateText} />
+        <button className="primary" onClick={submit}>
+          <RotateCcw size={18} />
+          Thu hồi certificate
+        </button>
+        {error && <p className="errorText" role="alert">{error}</p>}
+      </div>
+      {result && (
+        <div className="outputStack">
+          <div className="resultPanel">
+            <div className="resultHeader">
+              <Ban size={22} />
+              <div>
+                <h3>Certificate đã bị thu hồi</h3>
+                <p>Serial: {result.certificate.serialNumber}</p>
+              </div>
+            </div>
+          </div>
+          <PemBlock title="Certificate revoked" value={JSON.stringify(result.certificate, null, 2)} filename="certificate_revoked.json" />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BlindSignatureDemo() {
+  const [message, setMessage] = useState("Phiếu bình chọn ẩn danh số 01");
+  const [result, setResult] = useState<BlindSignatureResult | null>(null);
+  const [error, setError] = useState("");
+
+  async function submit() {
+    setError("");
+    setResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/blind-signature/demo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message })
+      });
+      setResult(await parseResponse<BlindSignatureResult>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Không thể chạy demo chữ ký mù"));
+    }
+  }
+
+  return (
+    <section className="page taskPage">
+      <PageHeader title="Chữ ký mù" description="Mô phỏng RSA blind signature: làm mù thông điệp, ký bản đã làm mù, bỏ mù và xác minh." />
+      <div className="surface">
+        <label>
+          Thông điệp
+          <textarea value={message} onChange={(event) => setMessage(event.target.value)} />
+        </label>
+        <button className="primary" onClick={submit}>
+          <EyeOff size={18} />
+          Chạy mô phỏng
+        </button>
+        {error && <p className="errorText" role="alert">{error}</p>}
+      </div>
+      {result && (
+        <div className={result.valid ? "verifyBox valid" : "verifyBox invalid"} role="status" aria-live="polite">
+          <div className="statusIcon" aria-hidden="true">
+            {result.valid ? <BadgeCheck size={24} /> : <Ban size={24} />}
+          </div>
+          <div>
+            <h3>{result.valid ? "Chữ ký mù hợp lệ" : "Chữ ký mù không hợp lệ"}</h3>
+            <p>{result.scheme}</p>
+            <dl className="detailList">
+              <DetailItem label="Message hash" value={result.messageHash} />
+              <DetailItem label="Public exponent" value={String(result.publicKey.publicExponent)} />
+              <DetailItem label="Blinded message" value={`${result.blindedMessageBase64.slice(0, 140)}...`} />
+              <DetailItem label="Blind signature" value={`${result.blindSignatureBase64.slice(0, 140)}...`} />
+              <DetailItem label="Unblinded signature" value={`${result.unblindedSignatureBase64.slice(0, 140)}...`} />
+            </dl>
           </div>
         </div>
       )}
@@ -345,6 +526,15 @@ function PageHeader({ title, description }: { title: string; description: string
     <div className="pageHeader compact">
       <h2>{title}</h2>
       <p>{description}</p>
+    </div>
+  );
+}
+
+function DetailItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>{value}</dd>
     </div>
   );
 }
@@ -389,6 +579,19 @@ function PemBlock({ title, value, filename }: { title: string; value: string; fi
       <pre>{value}</pre>
     </article>
   );
+}
+
+async function parseResponse<T>(response: Response): Promise<T> {
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = data && typeof data.detail === "string" ? data.detail : "Yêu cầu thất bại";
+    throw new Error(detail);
+  }
+  return data as T;
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
 }
 
 function downloadText(filename: string, content: string) {
