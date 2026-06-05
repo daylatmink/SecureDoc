@@ -1,10 +1,48 @@
+# Local agent/config files
+.agents/
+.codex/
+AGENTS.md
+skills-lock.json
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Backend runtime and Python cache
 backend/.venv/
 backend/securedoc.db
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Frontend dependencies and build output
 frontend/node_modules/
 frontend/dist/
+node_modules/
+dist/
 *.tsbuildinfo
+
+# Logs and local runtime files
 *.log
-__pycache__/
-*.pyc
+*.pid
+
+# Demo crypto artifacts generated during manual testing
+*.pem
+*.key
+private_key*
+public_key*
+certificate*.json
+signed_package*.json
+
+# OS and editor files
 .DS_Store
-AGENTS.md
+Thumbs.db
+.idea/
+.vscode/
