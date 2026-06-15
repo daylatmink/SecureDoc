@@ -1,6 +1,6 @@
 # SecureDoc
 
-SecureDoc là web app demo cho môn Nhập môn An toàn thông tin, chủ đề **chữ ký số**. Project minh họa cách băm tài liệu bằng SHA-256, ký digest bằng RSA-PSS/private key, xác minh bằng public key, dùng certificate do Demo CA ký để liên kết public key với danh tính người ký, và mô phỏng chữ ký mù RSA.
+SecureDoc là web app demo cho môn Nhập môn An toàn thông tin, chủ đề **chữ ký số**. Project minh họa cách băm tài liệu bằng SHA-256/SHA-384/SHA-512/SHA3-256, ký digest bằng RSA-PSS/private key, xác minh bằng public key, dùng certificate do Demo CA ký để liên kết public key với danh tính người ký, và mô phỏng chữ ký mù RSA.
 
 Đây là bản demo chạy local cho mục tiêu học thuật, chưa phải hệ thống ký số production.
 
@@ -37,12 +37,12 @@ Frontend mặc định chạy tại `http://127.0.0.1:5173`.
 
 ## Repo đã demo được gì
 
-- Tính SHA-256 cho file upload.
+- Tính hash cho file upload bằng SHA-256, SHA-384, SHA-512 hoặc SHA3-256.
 - Sinh RSA key pair 2048-bit cho người ký.
 - Tạo certificate JSON có chữ ký của `SecureDoc Demo CA`.
 - Ký tài liệu bằng RSA-PSS trên hash SHA-256.
 - Xuất `signed_package.json` gồm hash, chữ ký tài liệu, thời điểm ký và certificate.
-- Xác minh tài liệu bằng cách kiểm tra hash, chữ ký CA của certificate, trạng thái thu hồi trong server DB và chữ ký tài liệu.
+- Xác minh tài liệu bằng checklist từng bước: kiểm tra thuật toán, hash, chữ ký CA của certificate, trạng thái thu hồi trong server DB, thời hạn certificate và chữ ký tài liệu.
 - Thu hồi certificate theo `serialNumber`.
 - Mô phỏng chữ ký mù RSA cho phần mở rộng lý thuyết.
 
@@ -53,14 +53,14 @@ Frontend mặc định chạy tại `http://127.0.0.1:5173`.
 3. Backend tạo certificate JSON và ký các trường định danh bằng private key của Demo CA.
 4. Người dùng upload file, private key PEM và certificate JSON.
 5. Backend kiểm tra certificate có chữ ký hợp lệ của Demo CA và chưa bị thu hồi.
-6. Backend tính SHA-256 của file.
+6. Backend tính hash của file theo thuật toán người dùng chọn.
 7. Backend ký digest bằng RSA-PSS + SHA-256.
 8. Backend trả về `signed_package.json`.
 
 ## Luồng xác minh
 
 1. Người dùng upload file cần verify và `signed_package.json`.
-2. Backend tính lại SHA-256 của file.
+2. Backend tính lại hash của file theo thuật toán ghi trong signed package.
 3. Backend so sánh hash mới với `documentHash`.
 4. Backend kiểm tra chữ ký CA trên certificate.
 5. Backend tra trạng thái certificate từ SQLite theo `serialNumber`.

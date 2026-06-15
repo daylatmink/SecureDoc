@@ -16,6 +16,26 @@ Response:
 }
 ```
 
+## GET /api/crypto/hash-algorithms
+
+Trả về các thuật toán hash demo hỗ trợ. `SHA-256` vẫn là mặc định, các lựa chọn khác giúp mô phỏng profile bảo mật cao hơn hoặc SHA-3.
+
+Response:
+
+```json
+{
+  "default": "SHA-256",
+  "algorithms": [
+    {
+      "name": "SHA-256",
+      "digestBits": 256,
+      "securityStrengthBits": 128,
+      "family": "SHA-2"
+    }
+  ]
+}
+```
+
 ## POST /api/keys/generate
 
 Tạo RSA key pair và certificate được Demo CA ký.
@@ -57,6 +77,7 @@ Tính SHA-256 của file upload.
 Request: `multipart/form-data`
 
 - `file`: document cần băm.
+- `hashAlgorithm`: optional, một trong `SHA-256`, `SHA-384`, `SHA-512`, `SHA3-256`. Mặc định là `SHA-256`.
 
 Response:
 
@@ -77,6 +98,7 @@ Request: `multipart/form-data`
 - `file`: document cần ký.
 - `privateKeyPem`: private key PEM.
 - `certificate`: certificate JSON string.
+- `hashAlgorithm`: optional, một trong `SHA-256`, `SHA-384`, `SHA-512`, `SHA3-256`. Mặc định là `SHA-256`.
 
 Response:
 
@@ -131,7 +153,14 @@ Response valid:
     "certificateStatusFromServer": "valid",
     "caSignatureValid": true,
     "revocationSource": "server database",
-    "signatureValid": true
+    "signatureValid": true,
+    "verificationSteps": [
+      {
+        "step": "Check declared algorithms",
+        "status": "passed",
+        "message": "Using SHA-256 for the document digest and RSA-PSS for the signature."
+      }
+    ]
   }
 }
 ```

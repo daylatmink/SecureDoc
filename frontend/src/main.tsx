@@ -48,13 +48,25 @@ type HashResult = {
   documentHash: string;
 };
 
+type HashAlgorithm = "SHA-256" | "SHA-384" | "SHA-512" | "SHA3-256";
+
+type VerificationStep = {
+  step: string;
+  status: "passed" | "failed";
+  message: string;
+};
+
+type VerifyDetails = Record<string, unknown> & {
+  verificationSteps?: VerificationStep[];
+};
+
 type VerifyResult = {
   valid: boolean;
   reason: string;
   signer: { name: string; email: string; serialNumber: string } | null;
   documentHash: string;
   signedAt: string | null;
-  details: Record<string, unknown>;
+  details: VerifyDetails;
 };
 
 type BlindSignatureResult = {
@@ -80,6 +92,13 @@ const tabs: Array<{ tab: Tab; label: string; helper: string; icon: React.ReactNo
   { tab: "verify", label: "Xác minh", helper: "Trust + revoke", icon: <FileCheck size={18} /> },
   { tab: "revoke", label: "Thu hồi", helper: "Server DB", icon: <RotateCcw size={18} /> },
   { tab: "blind", label: "Chữ ký mù", helper: "RSA blind", icon: <EyeOff size={18} /> }
+];
+
+const hashAlgorithmOptions: Array<{ value: HashAlgorithm; label: string; helper: string }> = [
+  { value: "SHA-256", label: "SHA-256", helper: "Mặc định hiện đại, phổ biến trong chữ ký số" },
+  { value: "SHA-384", label: "SHA-384", helper: "SHA-2 mạnh hơn, hợp với profile bảo mật cao" },
+  { value: "SHA-512", label: "SHA-512", helper: "Digest 512-bit, mô phỏng mức an toàn cao" },
+  { value: "SHA3-256", label: "SHA3-256", helper: "SHA-3/Keccak, cấu trúc sponge hiện đại" }
 ];
 
 function App() {
@@ -196,6 +215,7 @@ function InfoBox({ title, text }: { title: string; text: string }) {
 
 function HashDocument() {
   const [file, setFile] = useState<File | null>(null);
+  const [hashAlgorithm, setHashAlgorithm] = useState<HashAlgorithm>("SHA-256");
   const [result, setResult] = useState<HashResult | null>(null);
   const [error, setError] = useState("");
 
@@ -208,6 +228,7 @@ function HashDocument() {
     setResult(null);
     const body = new FormData();
     body.append("file", file);
+    body.append("hashAlgorithm", hashAlgorithm);
     try {
       const response = await fetch(`${API_BASE}/api/documents/hash`, { method: "POST", body });
       setResult(await parseResponse<HashResult>(response));
@@ -218,12 +239,13 @@ function HashDocument() {
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Băm tài liệu" description="Tính SHA-256 của file để thấy nền tảng toàn vẹn trước khi ký số." />
+      <PageHeader title="Băm tài liệu" description="Tính digest của file để thấy nền tảng toàn vẹn trước khi ký số." />
       <div className="surface">
         <FileInput label="Tài liệu" onFile={setFile} />
+        <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />
         <button className="primary" onClick={submit}>
           <Hash size={18} />
-          Tính SHA-256
+          Tính hash
         </button>
         {error && <p className="errorText" role="alert">{error}</p>}
       </div>
@@ -302,6 +324,7 @@ function SignDocument() {
   const [file, setFile] = useState<File | null>(null);
   const [privateKey, setPrivateKey] = useState("");
   const [certificate, setCertificate] = useState("");
+  const [hashAlgorithm, setHashAlgorithm] = useState<HashAlgorithm>("SHA-256");
   const [result, setResult] = useState<SignedPackage | null>(null);
   const [error, setError] = useState("");
 
@@ -316,6 +339,7 @@ function SignDocument() {
     body.append("file", file);
     body.append("privateKeyPem", privateKey);
     body.append("certificate", certificate);
+    body.append("hashAlgorithm", hashAlgorithm);
     try {
       const response = await fetch(`${API_BASE}/api/sign`, { method: "POST", body });
       setResult(await parseResponse<SignedPackage>(response));
@@ -329,6 +353,7 @@ function SignDocument() {
       <PageHeader title="Ký tài liệu" description="Upload file, private key và certificate hợp lệ để tạo signed package." />
       <div className="surface">
         <FileInput label="Tài liệu" onFile={setFile} />
+        <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />
         <TextOrFile label="Private key PEM" value={privateKey} setValue={setPrivateKey} />
         <TextOrFile label="Certificate JSON" value={certificate} setValue={setCertificate} />
         <button className="primary" onClick={submit}>
@@ -348,6 +373,7 @@ function SignDocument() {
           </div>
           <dl className="detailList">
             <DetailItem label="Hash tài liệu" value={result.documentHash} />
+            <DetailItem label="Hash algorithm" value={result.hashAlgorithm} />
             <DetailItem label="Thời điểm ký" value={result.signedAt} />
             <DetailItem label="Chữ ký tài liệu" value={`${result.signatureBase64.slice(0, 120)}...`} />
             <DetailItem label="Chữ ký CA trên certificate" value={`${result.certificate.caSignatureBase64?.slice(0, 120) ?? ""}...`} />
@@ -407,6 +433,16 @@ function VerifyDocument() {
             <h3>{result.valid ? "Chữ ký hợp lệ" : "Chữ ký không hợp lệ"}</h3>
             <p>{result.reason}</p>
             {result.signer && <p>Người ký: {result.signer.name} ({result.signer.email})</p>}
+            {Array.isArray(result.details.verificationSteps) && (
+              <ol className="verifySteps">
+                {result.details.verificationSteps.map((item, index) => (
+                  <li key={`${item.step}-${index}`} className={item.status === "passed" ? "passed" : "failed"}>
+                    <strong>{item.step}</strong>
+                    <span>{item.message}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
             <pre>{JSON.stringify(result.details, null, 2)}</pre>
           </div>
         </div>
@@ -547,6 +583,22 @@ function FileInput({ label, onFile }: { label: string; onFile: (file: File | nul
         <Upload size={18} />
         <input type="file" onChange={(event) => onFile(event.target.files?.[0] ?? null)} />
       </span>
+    </label>
+  );
+}
+
+function HashAlgorithmSelect({ value, setValue }: { value: HashAlgorithm; setValue: (value: HashAlgorithm) => void }) {
+  const selected = hashAlgorithmOptions.find((item) => item.value === value);
+
+  return (
+    <label>
+      Thuật toán hash
+      <select value={value} onChange={(event) => setValue(event.target.value as HashAlgorithm)}>
+        {hashAlgorithmOptions.map((item) => (
+          <option key={item.value} value={item.value}>{item.label}</option>
+        ))}
+      </select>
+      {selected && <small className="fieldHint">{selected.helper}</small>}
     </label>
   );
 }

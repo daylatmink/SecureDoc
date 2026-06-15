@@ -10,12 +10,42 @@ from typing import Any, Dict, Tuple
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
 
 ISSUER = "SecureDoc Demo CA"
 CA_PRIVATE_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_ca_private.pem"
 CA_PUBLIC_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_ca_public.pem"
 CERTIFICATE_SIGNATURE_ALGORITHM = "RSA-PSS-SHA256"
+HASH_ALGORITHM_PROFILES = {
+    "SHA-256": {
+        "name": "SHA-256",
+        "digestBits": 256,
+        "securityStrengthBits": 128,
+        "family": "SHA-2",
+        "description": "Widely used default for modern digital signatures.",
+    },
+    "SHA-384": {
+        "name": "SHA-384",
+        "digestBits": 384,
+        "securityStrengthBits": 192,
+        "family": "SHA-2",
+        "description": "Higher-strength SHA-2 profile, often paired with stronger keys.",
+    },
+    "SHA-512": {
+        "name": "SHA-512",
+        "digestBits": 512,
+        "securityStrengthBits": 256,
+        "family": "SHA-2",
+        "description": "High-strength SHA-2 profile with a 512-bit digest.",
+    },
+    "SHA3-256": {
+        "name": "SHA3-256",
+        "digestBits": 256,
+        "securityStrengthBits": 128,
+        "family": "SHA-3",
+        "description": "NIST SHA-3 profile based on the Keccak sponge construction.",
+    },
+}
 
 
 def utc_now() -> datetime:
@@ -35,6 +65,47 @@ def parse_iso_datetime(value: str) -> datetime:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def normalize_hash_algorithm(hash_algorithm: str) -> str:
+    normalized = hash_algorithm.strip().upper().replace("_", "-")
+    aliases = {
+        "SHA256": "SHA-256",
+        "SHA384": "SHA-384",
+        "SHA512": "SHA-512",
+        "SHA3_256": "SHA3-256",
+        "SHA-3-256": "SHA3-256",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in HASH_ALGORITHM_PROFILES:
+        raise ValueError("Unsupported hash algorithm")
+    return normalized
+
+
+def supported_hash_algorithm_profiles() -> list[Dict[str, Any]]:
+    return list(HASH_ALGORITHM_PROFILES.values())
+
+
+def _hashlib_name(hash_algorithm: str) -> str:
+    return {
+        "SHA-256": "sha256",
+        "SHA-384": "sha384",
+        "SHA-512": "sha512",
+        "SHA3-256": "sha3_256",
+    }[normalize_hash_algorithm(hash_algorithm)]
+
+
+def _cryptography_hash_algorithm(hash_algorithm: str) -> hashes.HashAlgorithm:
+    return {
+        "SHA-256": hashes.SHA256,
+        "SHA-384": hashes.SHA384,
+        "SHA-512": hashes.SHA512,
+        "SHA3-256": hashes.SHA3_256,
+    }[normalize_hash_algorithm(hash_algorithm)]()
+
+
+def hash_bytes(data: bytes, hash_algorithm: str = "SHA-256") -> str:
+    return hashlib.new(_hashlib_name(hash_algorithm), data).hexdigest()
 
 
 def generate_key_pair() -> Tuple[str, str]:
@@ -150,34 +221,41 @@ def create_demo_certificate(name: str, email: str, public_key_pem: str) -> Dict[
     return certificate
 
 
-def sign_hash(document_hash_hex: str, private_key_pem: str) -> str:
+def sign_hash(document_hash_hex: str, private_key_pem: str, hash_algorithm: str = "SHA-256") -> str:
     private_key = serialization.load_pem_private_key(
         private_key_pem.encode("utf-8"),
         password=None,
     )
-    # The demo signs the SHA-256 digest bytes with RSA-PSS and SHA-256.
+    algorithm = _cryptography_hash_algorithm(hash_algorithm)
+    # The demo signs a precomputed document digest with RSA-PSS.
     signature = private_key.sign(
         bytes.fromhex(document_hash_hex),
         padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
+            mgf=padding.MGF1(algorithm),
             salt_length=padding.PSS.MAX_LENGTH,
         ),
-        hashes.SHA256(),
+        utils.Prehashed(algorithm),
     )
     return base64.b64encode(signature).decode("ascii")
 
 
-def verify_signature(document_hash_hex: str, signature_base64: str, public_key_pem: str) -> bool:
+def verify_signature(
+    document_hash_hex: str,
+    signature_base64: str,
+    public_key_pem: str,
+    hash_algorithm: str = "SHA-256",
+) -> bool:
     public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+    algorithm = _cryptography_hash_algorithm(hash_algorithm)
     try:
         public_key.verify(
             base64.b64decode(signature_base64),
             bytes.fromhex(document_hash_hex),
             padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
+                mgf=padding.MGF1(algorithm),
                 salt_length=padding.PSS.MAX_LENGTH,
             ),
-            hashes.SHA256(),
+            utils.Prehashed(algorithm),
         )
         return True
     except (InvalidSignature, ValueError, binascii.Error):

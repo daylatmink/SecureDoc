@@ -6,11 +6,19 @@ Tài liệu này giải thích các thành phần crypto của SecureDoc bằng 
 
 SHA-256 là hàm băm mật mã học. Nó nhận dữ liệu đầu vào như file TXT, PDF hoặc JSON và tạo ra một giá trị băm có độ dài cố định. Nếu nội dung file thay đổi chỉ một ký tự, giá trị SHA-256 gần như chắc chắn sẽ thay đổi hoàn toàn.
 
-Trong SecureDoc, backend không ký trực tiếp toàn bộ file. Backend tính SHA-256 của file trước, sau đó ký giá trị băm này.
+Trong SecureDoc, backend không ký trực tiếp toàn bộ file. Backend tính hash của file trước, sau đó ký giá trị băm này.
+
+SHA-256 vẫn là lựa chọn phổ biến và hợp lệ trong nhiều hệ thống chữ ký số hiện nay. SecureDoc giữ SHA-256 làm mặc định vì nó dễ giải thích, tương thích tốt và đủ thực tế cho demo. Để repo mang tính ứng dụng hiện đại hơn, backend/frontend cũng hỗ trợ thêm:
+
+- `SHA-384`: profile SHA-2 mạnh hơn, thường dùng khi muốn mức an toàn cao hơn.
+- `SHA-512`: digest dài hơn, phù hợp để minh họa profile bảo mật cao.
+- `SHA3-256`: thuộc họ SHA-3, dùng cấu trúc sponge/Keccak khác SHA-2.
+
+Khi ký, signed package lưu `hashAlgorithm`. Khi xác minh, backend dùng chính thuật toán này để băm lại file, rồi mới verify chữ ký RSA-PSS.
 
 ## RSA-PSS dùng để làm gì?
 
-RSA-PSS là cơ chế chữ ký số dựa trên RSA. Người ký dùng private key để tạo chữ ký trên digest SHA-256. Người xác minh dùng public key từ certificate để kiểm tra chữ ký.
+RSA-PSS là cơ chế chữ ký số dựa trên RSA. Người ký dùng private key để tạo chữ ký trên digest của tài liệu. Người xác minh dùng public key từ certificate để kiểm tra chữ ký.
 
 RSA-PSS được ưu tiên hơn padding RSA cũ vì có thiết kế an toàn hơn cho chữ ký số hiện đại.
 
@@ -49,9 +57,20 @@ Khi verify, backend tra DB để lấy `certificateStatusFromServer`. Nếu DB b
 
 ## Vì sao sửa tài liệu thì verify fail?
 
-Khi ký, SecureDoc lưu `documentHash` trong signed package. Khi verify, backend tính lại SHA-256 của file upload. Nếu file đã bị sửa, hash mới sẽ khác hash ban đầu.
+Khi ký, SecureDoc lưu `documentHash` và `hashAlgorithm` trong signed package. Khi verify, backend tính lại hash của file upload bằng đúng thuật toán đó. Nếu file đã bị sửa, hash mới sẽ khác hash ban đầu.
 
 Vì chữ ký được tạo trên hash ban đầu, hash mới không khớp sẽ bị reject với reason `document modified`.
+
+Kết quả verify có thêm `verificationSteps` để mô phỏng rõ quy trình xác minh:
+
+1. Kiểm tra thuật toán được khai báo.
+2. Tính lại hash của tài liệu.
+3. Kiểm tra chữ ký CA trên certificate.
+4. Tra certificate trong server database.
+5. So khớp certificate với bản ghi server.
+6. Kiểm tra thời hạn certificate.
+7. Kiểm tra trạng thái thu hồi.
+8. Verify chữ ký tài liệu bằng public key.
 
 ## Chữ ký mù trong demo
 

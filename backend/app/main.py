@@ -13,11 +13,13 @@ from .crypto_utils import (
     ensure_demo_ca_keys,
     generate_key_pair,
     get_demo_ca_public_key,
+    hash_bytes,
     isoformat,
+    normalize_hash_algorithm,
     parse_iso_datetime,
     rsa_blind_signature_demo,
-    sha256_hex,
     sign_hash,
+    supported_hash_algorithm_profiles,
     utc_now,
     verify_certificate_signature,
     verify_signature,
@@ -79,6 +81,11 @@ def get_ca_public_key():
     }
 
 
+@app.get("/api/crypto/hash-algorithms")
+def get_hash_algorithms():
+    return {"algorithms": supported_hash_algorithm_profiles(), "default": "SHA-256"}
+
+
 @app.post("/api/keys/generate", response_model=KeyGenerateResponse)
 def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
     private_key_pem, public_key_pem = generate_key_pair()
@@ -103,9 +110,18 @@ def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/api/documents/hash")
-async def hash_document(file: UploadFile = File(...)):
+async def hash_document(file: UploadFile = File(...), hashAlgorithm: str = Form("SHA-256")):
+    try:
+        normalized_hash_algorithm = normalize_hash_algorithm(hashAlgorithm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unsupported hash algorithm") from exc
+
     content = await file.read()
-    return {"documentName": file.filename, "hashAlgorithm": "SHA-256", "documentHash": sha256_hex(content)}
+    return {
+        "documentName": file.filename,
+        "hashAlgorithm": normalized_hash_algorithm,
+        "documentHash": hash_bytes(content, normalized_hash_algorithm),
+    }
 
 
 @app.post("/api/sign", response_model=SignedPackage)
@@ -113,8 +129,14 @@ async def sign_document(
     file: UploadFile = File(...),
     privateKeyPem: str = Form(...),
     certificate: str = Form(...),
+    hashAlgorithm: str = Form("SHA-256"),
     db: Session = Depends(get_db),
 ):
+    try:
+        normalized_hash_algorithm = normalize_hash_algorithm(hashAlgorithm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unsupported hash algorithm") from exc
+
     certificate_obj = read_json_form(certificate, "certificate")
     try:
         certificate_model = Certificate.model_validate(certificate_obj)
@@ -131,19 +153,19 @@ async def sign_document(
         raise HTTPException(status_code=400, detail="Certificate is revoked")
 
     content = await file.read()
-    document_hash = sha256_hex(content)
+    document_hash = hash_bytes(content, normalized_hash_algorithm)
     try:
-        signature = sign_hash(document_hash, privateKeyPem)
+        signature = sign_hash(document_hash, privateKeyPem, normalized_hash_algorithm)
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="Invalid private key PEM") from exc
 
-    if not verify_signature(document_hash, signature, certificate_model.publicKeyPem):
+    if not verify_signature(document_hash, signature, certificate_model.publicKeyPem, normalized_hash_algorithm):
         raise HTTPException(status_code=400, detail="Private key does not match certificate public key")
 
     return {
         "documentName": file.filename,
         "documentHash": document_hash,
-        "hashAlgorithm": "SHA-256",
+        "hashAlgorithm": normalized_hash_algorithm,
         "signatureAlgorithm": "RSA-PSS",
         "signatureBase64": signature,
         "signedAt": isoformat(utc_now()),
@@ -164,7 +186,29 @@ async def verify_document(
         raise HTTPException(status_code=400, detail="Malformed signed package") from exc
 
     content = await file.read()
-    current_hash = sha256_hex(content)
+    try:
+        normalized_hash_algorithm = normalize_hash_algorithm(package.hashAlgorithm)
+    except ValueError:
+        details = {
+            "hashMatches": False,
+            "certificateStatusInPackage": package.certificate.status,
+            "certificateStatusFromServer": None,
+            "certificateExpiresAt": package.certificate.expiresAt,
+            "caSignatureValid": False,
+            "revocationSource": "server database",
+            "signatureAlgorithm": package.signatureAlgorithm,
+            "hashAlgorithm": package.hashAlgorithm,
+            "verificationSteps": [
+                {
+                    "step": "Check declared algorithms",
+                    "status": "failed",
+                    "message": f"Unsupported hash algorithm: {package.hashAlgorithm}",
+                }
+            ],
+        }
+        return _invalid("unsupported algorithm", package, "", details)
+
+    current_hash = hash_bytes(content, normalized_hash_algorithm)
     cert = package.certificate
     cert_obj = cert.model_dump()
     details = {
@@ -175,53 +219,131 @@ async def verify_document(
         "caSignatureValid": False,
         "revocationSource": "server database",
         "signatureAlgorithm": package.signatureAlgorithm,
-        "hashAlgorithm": package.hashAlgorithm,
+        "hashAlgorithm": normalized_hash_algorithm,
+        "verificationSteps": [],
     }
 
-    if package.hashAlgorithm != "SHA-256" or package.signatureAlgorithm != "RSA-PSS":
+    if package.signatureAlgorithm != "RSA-PSS":
+        _add_step(details, "Check declared algorithms", "failed", "Only RSA-PSS signatures are supported in this demo.")
         return _invalid("unsupported algorithm", package, current_hash, details)
+    _add_step(
+        details,
+        "Check declared algorithms",
+        "passed",
+        f"Using {normalized_hash_algorithm} for the document digest and RSA-PSS for the signature.",
+    )
 
     if current_hash != package.documentHash:
+        _add_step(
+            details,
+            "Recompute document hash",
+            "failed",
+            "The uploaded document hash does not match the hash stored in the signed package.",
+        )
         return _invalid("document modified", package, current_hash, details)
+    _add_step(
+        details,
+        "Recompute document hash",
+        "passed",
+        "The uploaded document matches the signed document hash.",
+    )
 
     ca_signature_ok = verify_certificate_signature(cert_obj)
     details["caSignatureValid"] = ca_signature_ok
     if not ca_signature_ok:
+        _add_step(
+            details,
+            "Verify certificate CA signature",
+            "failed",
+            "The certificate contents are not signed by SecureDoc Demo CA.",
+        )
         return _invalid("certificate not issued by demo CA", package, current_hash, details)
+    _add_step(
+        details,
+        "Verify certificate CA signature",
+        "passed",
+        "The certificate identity and public key are protected by the Demo CA signature.",
+    )
 
     record = db.get(CertificateRecord, cert.serialNumber)
     if not record:
         details["certificateStatusFromServer"] = "unknown"
+        _add_step(
+            details,
+            "Lookup certificate on server",
+            "failed",
+            "No certificate record exists for this serial number.",
+        )
         return _invalid("unknown certificate serial number", package, current_hash, details)
 
     details["certificateStatusFromServer"] = record.status
+    _add_step(
+        details,
+        "Lookup certificate on server",
+        "passed",
+        f"Server record found with status '{record.status}'.",
+    )
     if (
         record.owner_name != cert.ownerName
         or record.email != cert.email
         or record.public_key_pem != cert.publicKeyPem
         or record.issuer != cert.issuer
     ):
+        _add_step(
+            details,
+            "Compare certificate with server record",
+            "failed",
+            "Certificate fields do not match the trusted server record.",
+        )
         return _invalid("certificate record mismatch", package, current_hash, details)
+    _add_step(
+        details,
+        "Compare certificate with server record",
+        "passed",
+        "Certificate identity and public key match the trusted server record.",
+    )
 
     try:
         expires_at = parse_iso_datetime(cert.expiresAt)
     except ValueError:
+        _add_step(details, "Check certificate validity period", "failed", "Certificate expiration is malformed.")
         return _invalid("malformed certificate", package, current_hash, details)
 
     if expires_at < utc_now():
+        _add_step(details, "Check certificate validity period", "failed", "Certificate has expired.")
         return _invalid("certificate expired", package, current_hash, details)
+    _add_step(details, "Check certificate validity period", "passed", "Certificate is still within its validity period.")
 
     if record.status != "valid":
+        _add_step(details, "Check certificate revocation", "failed", "Server database marks this certificate as revoked.")
         return _invalid("certificate revoked", package, current_hash, details)
+    _add_step(details, "Check certificate revocation", "passed", "Server database marks this certificate as valid.")
 
     try:
-        signature_ok = verify_signature(package.documentHash, package.signatureBase64, cert.publicKeyPem)
+        signature_ok = verify_signature(
+            package.documentHash,
+            package.signatureBase64,
+            cert.publicKeyPem,
+            normalized_hash_algorithm,
+        )
     except (ValueError, TypeError):
         signature_ok = False
 
     details["signatureValid"] = signature_ok
     if not signature_ok:
+        _add_step(
+            details,
+            "Verify document signature",
+            "failed",
+            "RSA-PSS verification failed with the public key in the certificate.",
+        )
         return _invalid("invalid signature or public key mismatch", package, current_hash, details)
+    _add_step(
+        details,
+        "Verify document signature",
+        "passed",
+        "RSA-PSS verification succeeded with the public key in the certificate.",
+    )
 
     return {
         "valid": True,
@@ -243,6 +365,10 @@ def _invalid(reason: str, package: SignedPackage, document_hash: str, details: D
         "signedAt": package.signedAt,
         "details": details,
     }
+
+
+def _add_step(details: Dict[str, Any], step: str, status: str, message: str) -> None:
+    details["verificationSteps"].append({"step": step, "status": status, "message": message})
 
 
 @app.post("/api/certificates/revoke")

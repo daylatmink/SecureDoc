@@ -14,6 +14,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -28,6 +29,7 @@ button:active {
 
 button:focus-visible,
 input:focus-visible,
+select:focus-visible,
 textarea:focus-visible {
   outline: 3px solid #7dd3c7;
   outline-offset: 2px;
@@ -284,6 +286,7 @@ label {
 }
 
 input,
+select,
 textarea {
   background: #fbfdfe;
   border: 1px solid #becbd2;
@@ -291,6 +294,17 @@ textarea {
   color: #17202a;
   padding: 11px 12px;
   width: 100%;
+}
+
+select {
+  appearance: auto;
+}
+
+.fieldHint {
+  color: #4b5f6d;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
 }
 
 textarea,
@@ -490,6 +504,43 @@ pre {
 
 .verifyBox .detailList {
   margin-top: 14px;
+}
+
+.verifySteps {
+  display: grid;
+  gap: 10px;
+  list-style: none;
+  margin: 18px 0;
+  padding: 0;
+}
+
+.verifySteps li {
+  border: 1px solid #dbe6e9;
+  border-radius: 10px;
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+}
+
+.verifySteps li.passed {
+  background: #f0fdf8;
+  border-color: #86efac;
+}
+
+.verifySteps li.failed {
+  background: #fff5f5;
+  border-color: #fca5a5;
+}
+
+.verifySteps strong {
+  color: #17202a;
+  font-size: 13px;
+}
+
+.verifySteps span {
+  color: #4b5f6d;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .errorText {
