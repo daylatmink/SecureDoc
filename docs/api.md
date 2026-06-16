@@ -1,46 +1,46 @@
-# API
+# SecureDoc API
 
 Base URL local: `http://127.0.0.1:8000`.
 
-## GET /api/ca/public-key
+## Tong quan v2
 
-Trả về public key của Demo CA để minh họa trust anchor.
+Luon ky chinh hien nay la v2 client-side signing:
 
-Response:
+1. Client/backend tinh `documentHash` cho file.
+2. Client goi `/api/sign/v2/prepare` voi `documentName`, `documentHash`, `hashAlgorithm`, `certificateSerialNumber`, `signingPurpose`.
+3. Backend tao `signingPayload` chuan hoa gom:
+   `documentName`, `documentHash`, `hashAlgorithm`, `signatureAlgorithm`, signer info,
+   `certificateSerialNumber`, `certificateFingerprint`, `signingPurpose`, `requestId`, `nonce`,
+   `createdAt`, `payloadVersion`.
+4. Client hien man hinh review va ky canonical JSON cua `signingPayload` tai client bang private key.
+5. Client gui `signedPackage` toi `/api/sign/v2/submit`.
+6. Backend chi verify/luu package; backend khong nhan private key trong luong v2.
+
+Canonicalization method: `JSON-canonical-sorted-keys`.
+
+Signature mac dinh: `RSA-PSS` + `SHA-256`, salt length bang digest size de tuong thich Web Crypto. Backend policy chap nhan `SHA-256`, `SHA-384`, `SHA-512`, `SHA3-256`; khong chap nhan `MD5` hoac `SHA-1`.
+
+Luu y: browser Web Crypto khong ho tro RSA-PSS voi SHA3-256. SHA3-256 co the verify tren backend neu package duoc tao boi client/tool ben ngoai co ho tro SHA3.
+
+## GET /api/algorithm-policy
+
+Tra ve policy thuat toan duoc phep.
 
 ```json
 {
-  "issuer": "SecureDoc Demo CA",
-  "publicKeyPem": "-----BEGIN PUBLIC KEY-----...",
-  "signatureAlgorithm": "RSA-PSS-SHA256"
-}
-```
-
-## GET /api/crypto/hash-algorithms
-
-Trả về các thuật toán hash demo hỗ trợ. `SHA-256` vẫn là mặc định, các lựa chọn khác giúp mô phỏng profile bảo mật cao hơn hoặc SHA-3.
-
-Response:
-
-```json
-{
-  "default": "SHA-256",
-  "algorithms": [
-    {
-      "name": "SHA-256",
-      "digestBits": 256,
-      "securityStrengthBits": 128,
-      "family": "SHA-2"
-    }
-  ]
+  "allowedHashAlgorithms": ["SHA-256", "SHA-384", "SHA-512", "SHA3-256"],
+  "rejectedHashAlgorithms": ["MD5", "SHA-1"],
+  "allowedSignatureAlgorithms": ["RSA-PSS"],
+  "minimumRsaKeyBits": 2048,
+  "defaultRsaKeyBits": 3072
 }
 ```
 
 ## POST /api/keys/generate
 
-Tạo RSA key pair và certificate được Demo CA ký.
+Tao RSA key pair va legacy-demo certificate JSON duoc SecureDoc Demo CA ky.
 
-Request JSON:
+Request:
 
 ```json
 {
@@ -49,35 +49,18 @@ Request JSON:
 }
 ```
 
-Response:
+Response gom `privateKeyPem`, `publicKeyPem`, `certificate`.
 
-```json
-{
-  "privateKeyPem": "-----BEGIN PRIVATE KEY-----...",
-  "publicKeyPem": "-----BEGIN PUBLIC KEY-----...",
-  "certificate": {
-    "serialNumber": "A1B2C3",
-    "ownerName": "Nguyen Van A",
-    "email": "student@example.com",
-    "publicKeyPem": "-----BEGIN PUBLIC KEY-----...",
-    "issuer": "SecureDoc Demo CA",
-    "issuedAt": "2026-06-05T10:00:00+00:00",
-    "expiresAt": "2027-06-05T10:00:00+00:00",
-    "status": "valid",
-    "caSignatureAlgorithm": "RSA-PSS-SHA256",
-    "caSignatureBase64": "nXk..."
-  }
-}
-```
+Canh bao: endpoint nay tra private key ve client de phuc vu demo local. Production can dung key store, smart card, USB token, HSM hoac signing service bao ve khoa.
+
+Audit event: `certificate_created`. Audit khong ghi private key.
 
 ## POST /api/documents/hash
 
-Tính SHA-256 của file upload.
+Request `multipart/form-data`:
 
-Request: `multipart/form-data`
-
-- `file`: document cần băm.
-- `hashAlgorithm`: optional, một trong `SHA-256`, `SHA-384`, `SHA-512`, `SHA3-256`. Mặc định là `SHA-256`.
+- `file`: document.
+- `hashAlgorithm`: `SHA-256`, `SHA-384`, `SHA-512`, `SHA3-256`. Mac dinh `SHA-256`.
 
 Response:
 
@@ -89,52 +72,135 @@ Response:
 }
 ```
 
-## POST /api/sign
+## POST /api/sign/v2/prepare
 
-Ký document bằng private key. Backend yêu cầu certificate phải có chữ ký hợp lệ của Demo CA, tồn tại trong DB và chưa bị thu hồi.
+Tao signing request va canonical signing payload. Backend tra signer info tu certificate record trong DB.
 
-Request: `multipart/form-data`
-
-- `file`: document cần ký.
-- `privateKeyPem`: private key PEM.
-- `certificate`: certificate JSON string.
-- `hashAlgorithm`: optional, một trong `SHA-256`, `SHA-384`, `SHA-512`, `SHA3-256`. Mặc định là `SHA-256`.
-
-Response:
+Request:
 
 ```json
 {
   "documentName": "demo.txt",
   "documentHash": "b94d27b9934d3e08...",
   "hashAlgorithm": "SHA-256",
-  "signatureAlgorithm": "RSA-PSS",
-  "signatureBase64": "nXk...",
-  "signedAt": "2026-06-05T10:05:00+00:00",
-  "certificate": {
-    "serialNumber": "A1B2C3",
-    "ownerName": "Nguyen Van A",
-    "email": "student@example.com",
-    "publicKeyPem": "-----BEGIN PUBLIC KEY-----...",
-    "issuer": "SecureDoc Demo CA",
-    "issuedAt": "2026-06-05T10:00:00+00:00",
-    "expiresAt": "2027-06-05T10:00:00+00:00",
-    "status": "valid",
-    "caSignatureAlgorithm": "RSA-PSS-SHA256",
-    "caSignatureBase64": "nXk..."
-  }
+  "certificateSerialNumber": "A1B2C3",
+  "signingPurpose": "approve_document"
 }
 ```
 
-## POST /api/verify
+Response:
 
-Xác minh document và signed package.
+```json
+{
+  "requestId": "0f9a...",
+  "nonce": "d3c1...",
+  "signingPayload": {
+    "documentName": "demo.txt",
+    "documentHash": "b94d27b9934d3e08...",
+    "hashAlgorithm": "SHA-256",
+    "signatureAlgorithm": "RSA-PSS",
+    "signerName": "Nguyen Van A",
+    "signerEmail": "student@example.com",
+    "certificateSerialNumber": "A1B2C3",
+    "certificateFingerprint": "7b8c...",
+    "signingPurpose": "approve_document",
+    "createdAt": "2026-06-16T00:00:00+00:00",
+    "nonce": "d3c1...",
+    "requestId": "0f9a...",
+    "payloadVersion": "1.0"
+  },
+  "canonicalPayloadBase64": "eyJjZXJ0...",
+  "warnings": [
+    "Certificate is a legacy-demo JSON certificate, not X.509.",
+    "SecureDoc Demo CA is local demo trust only."
+  ]
+}
+```
 
-Request: `multipart/form-data`
+Audit event: `signing_request_created`.
 
-- `file`: document cần verify.
-- `signedPackage`: signed package JSON string.
+## POST /api/sign/v2/submit
 
-Response valid:
+Nhan signed package da duoc client ky. Backend verify package va luu signature record.
+
+Request:
+
+```json
+{
+  "packageVersion": "2.0",
+  "signingPayload": {},
+  "payloadCanonicalization": "JSON-canonical-sorted-keys",
+  "signatureAlgorithm": "RSA-PSS",
+  "signatureBase64": "nXk...",
+  "signerCertificate": {},
+  "signedAtClient": "2026-06-16T00:01:00+00:00"
+}
+```
+
+Response:
+
+```json
+{
+  "accepted": true,
+  "requestId": "0f9a...",
+  "receivedAtServer": "2026-06-16T00:01:05+00:00",
+  "verificationReport": {
+    "documentIntegrity": "passed",
+    "signingPayloadValid": "passed",
+    "signatureValid": "passed",
+    "certificateTrusted": "passed",
+    "certificateValidityPeriod": "passed",
+    "certificateRevocationStatus": "valid",
+    "algorithmPolicyValid": "passed",
+    "replayCheck": "passed",
+    "finalDecision": "valid",
+    "warnings": [],
+    "verificationSteps": []
+  },
+  "signedPackage": {
+    "packageVersion": "2.0",
+    "signingPayload": {},
+    "payloadCanonicalization": "JSON-canonical-sorted-keys",
+    "signatureAlgorithm": "RSA-PSS",
+    "signatureBase64": "nXk...",
+    "signerCertificate": {},
+    "signedAtClient": "2026-06-16T00:01:00+00:00",
+    "receivedAtServer": "2026-06-16T00:01:05+00:00"
+  },
+  "warnings": []
+}
+```
+
+Backend kiem tra:
+
+- requestId ton tai va dang pending.
+- nonce chua dung.
+- payload khop signing request.
+- algorithm policy.
+- certificate do Demo CA ky.
+- certificate khop DB record theo serial.
+- revocation status tu DB.
+- thoi han certificate.
+- RSA key size theo policy.
+- RSA-PSS signature tren canonical JSON cua `signingPayload`.
+
+Audit event: `signature_submitted` voi `success` hoac `failed`.
+
+## POST /api/verify/v2
+
+Verify document hash va signed package, tra report chi tiet.
+
+Request:
+
+```json
+{
+  "documentHash": "b94d27b9934d3e08...",
+  "hashAlgorithm": "SHA-256",
+  "signedPackage": {}
+}
+```
+
+Response:
 
 ```json
 {
@@ -146,80 +212,51 @@ Response valid:
     "serialNumber": "A1B2C3"
   },
   "documentHash": "b94d27b9934d3e08...",
-  "signedAt": "2026-06-05T10:05:00+00:00",
-  "details": {
-    "hashMatches": true,
-    "certificateStatusInPackage": "valid",
-    "certificateStatusFromServer": "valid",
-    "caSignatureValid": true,
-    "revocationSource": "server database",
-    "signatureValid": true,
+  "signedAt": "2026-06-16T00:01:00+00:00",
+  "report": {
+    "documentIntegrity": "passed",
+    "signingPayloadValid": "passed",
+    "signatureValid": "passed",
+    "certificateParsed": "passed",
+    "certificateTrusted": "passed",
+    "certificateType": "legacy-demo",
+    "certificateChainValid": "not_available",
+    "certificateValidityPeriod": "passed",
+    "certificateRevocationStatus": "valid",
+    "keyUsageValid": "not_available",
+    "algorithmPolicyValid": "passed",
+    "replayCheck": "passed",
+    "timestampStatus": "client-declared-time",
+    "finalDecision": "valid",
+    "warnings": [
+      "Certificate is a legacy-demo JSON certificate, not X.509."
+    ],
     "verificationSteps": [
       {
-        "step": "Check declared algorithms",
+        "step": "Document integrity",
         "status": "passed",
-        "message": "Using SHA-256 for the document digest and RSA-PSS for the signature."
+        "message": "Document hash matches signed payload."
       }
     ]
   }
 }
 ```
 
-Response invalid:
+Neu that bai, endpoint van tra HTTP 200 voi `valid=false` va report neu signedPackage parse duoc. Malformed request/package co the tra HTTP 400.
+
+Audit event: `signature_verified` voi `success` hoac `failed`.
+
+## POST /api/certificates/revoke/v2
+
+Thu hoi certificate theo serialNumber tu DB.
+
+Request:
 
 ```json
 {
-  "valid": false,
-  "reason": "certificate revoked",
-  "signer": {
-    "name": "Nguyen Van A",
-    "email": "student@example.com",
-    "serialNumber": "A1B2C3"
-  },
-  "documentHash": "b94d27b9934d3e08...",
-  "signedAt": "2026-06-05T10:05:00+00:00",
-  "details": {
-    "hashMatches": true,
-    "certificateStatusInPackage": "valid",
-    "certificateStatusFromServer": "revoked",
-    "caSignatureValid": true
-  }
-}
-```
-
-Possible reasons:
-
-- `document modified`
-- `certificate not issued by demo CA`
-- `unknown certificate serial number`
-- `certificate record mismatch`
-- `certificate expired`
-- `certificate revoked`
-- `invalid signature or public key mismatch`
-- `malformed certificate`
-- `unsupported algorithm`
-- `Malformed signed package`
-
-## POST /api/certificates/revoke
-
-Đánh dấu certificate là revoked trong server DB. Verify sẽ tra trạng thái từ DB theo `serialNumber`, không tin riêng trường `status` trong signed package.
-
-Request JSON:
-
-```json
-{
-  "certificate": {
-    "serialNumber": "A1B2C3",
-    "ownerName": "Nguyen Van A",
-    "email": "student@example.com",
-    "publicKeyPem": "-----BEGIN PUBLIC KEY-----...",
-    "issuer": "SecureDoc Demo CA",
-    "issuedAt": "2026-06-05T10:00:00+00:00",
-    "expiresAt": "2027-06-05T10:00:00+00:00",
-    "status": "valid",
-    "caSignatureAlgorithm": "RSA-PSS-SHA256",
-    "caSignatureBase64": "nXk..."
-  }
+  "serialNumber": "A1B2C3",
+  "reason": "key_compromise",
+  "revokedBy": "admin@example.com"
 }
 ```
 
@@ -227,36 +264,46 @@ Response:
 
 ```json
 {
-  "certificate": {
-    "serialNumber": "A1B2C3",
-    "status": "revoked"
-  }
+  "serialNumber": "A1B2C3",
+  "status": "revoked",
+  "reason": "key_compromise",
+  "revokedAt": "2026-06-16T00:02:00+00:00"
 }
 ```
 
-## POST /api/blind-signature/demo
+Audit event: `certificate_revoked`.
 
-Mô phỏng chữ ký mù RSA cho mục tiêu học thuật.
+## GET /api/certificates/status/{serial_number}
 
-Request JSON:
+Tra status, reason, revokedAt va expiresAt tu DB.
 
-```json
-{
-  "message": "Phieu binh chon an danh so 01"
-}
-```
+## GET /api/certificates/revocation-list
 
-Response:
+Tra danh sach certificate dang bi revoke trong DB.
 
-```json
-{
-  "message": "Phieu binh chon an danh so 01",
-  "hashAlgorithm": "SHA-256",
-  "messageHash": "ead43965...",
-  "scheme": "Educational RSA blind signature demo",
-  "blindedMessageBase64": "Q9JS...",
-  "blindSignatureBase64": "FXu...",
-  "unblindedSignatureBase64": "kpT...",
-  "valid": true
-}
-```
+## Legacy endpoints
+
+### POST /api/sign
+
+Legacy insecure demo. Endpoint nay nhan `privateKeyPem` tu frontend va backend ky document hash.
+
+Khong dung endpoint nay cho UI chinh. No chi duoc giu de tuong thich va minh hoa rui ro: private key roi khoi client va di vao backend.
+
+### POST /api/verify
+
+Legacy verify cho `signed_package.json` cu. Luong nay verify chu ky tren document hash rieng le, khong ky full canonical `signingPayload`.
+
+### POST /api/certificates/revoke
+
+Legacy revoke nhan full certificate JSON. V2 nen dung `/api/certificates/revoke/v2` theo serialNumber.
+
+## Gioi han con lai
+
+- Certificate van la legacy-demo JSON certificate, chua phai X.509.
+- SecureDoc Demo CA la CA local, khong co chain of trust that.
+- Chua co HSM, smart card, USB token, key isolation production, TSA, OCSP/CRL that.
+- Chua co PAdES, XAdES, CAdES.
+- `signedAtClient` chi la thoi gian client khai bao, khong phai trusted timestamp.
+- Replay check chi co y nghia trong server DB local da nhan submit.
+- Chua co authentication, authorization, rate limit, HTTPS bat buoc hay hardening production.
+- Phan chu ky mu giu nguyen demo giao duc, khong nam trong pham vi cai tien lan nay.
