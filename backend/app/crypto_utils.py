@@ -1,3 +1,12 @@
+"""Cryptographic utilities for SecureDoc — legacy + v2 functions.
+
+All legacy functions are preserved.  New v2 functions added:
+- canonicalize_signing_payload()
+- verify_canonical_signature()
+- record_audit_log()
+- ALGORITHM_POLICY
+"""
+
 import base64
 import binascii
 import hashlib
@@ -6,7 +15,7 @@ import math
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -16,6 +25,7 @@ ISSUER = "SecureDoc Demo CA"
 CA_PRIVATE_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_ca_private.pem"
 CA_PUBLIC_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_ca_public.pem"
 CERTIFICATE_SIGNATURE_ALGORITHM = "RSA-PSS-SHA256"
+
 HASH_ALGORITHM_PROFILES = {
     "SHA-256": {
         "name": "SHA-256",
@@ -47,6 +57,28 @@ HASH_ALGORITHM_PROFILES = {
     },
 }
 
+# ── Algorithm policy ──────────────────────────────────────────────────────
+
+ALGORITHM_POLICY = {
+    "allowedHashAlgorithms": ["SHA-256", "SHA-384", "SHA-512", "SHA3-256"],
+    "rejectedHashAlgorithms": ["MD5", "SHA-1"],
+    "allowedSignatureAlgorithms": ["RSA-PSS"],
+    "minimumRsaKeyBits": 2048,
+    "defaultRsaKeyBits": 3072,
+    "defaultHashAlgorithm": "SHA-256",
+    "defaultSignatureAlgorithm": "RSA-PSS",
+}
+
+ALLOWED_SIGNING_PURPOSES = [
+    "approve_document",
+    "confirm_reading",
+    "sign_contract",
+    "certify_copy",
+    "acknowledge_receipt",
+]
+
+
+# ── Time helpers ──────────────────────────────────────────────────────────
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -62,6 +94,8 @@ def parse_iso_datetime(value: str) -> datetime:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
+
+# ── Hash helpers ──────────────────────────────────────────────────────────
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -108,8 +142,23 @@ def hash_bytes(data: bytes, hash_algorithm: str = "SHA-256") -> str:
     return hashlib.new(_hashlib_name(hash_algorithm), data).hexdigest()
 
 
-def generate_key_pair() -> Tuple[str, str]:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+def check_algorithm_policy(hash_alg: str, sig_alg: str) -> Tuple[bool, str]:
+    """Check whether the given algorithms comply with the policy."""
+    if hash_alg in ALGORITHM_POLICY["rejectedHashAlgorithms"]:
+        return False, f"{hash_alg} is rejected by algorithm policy"
+    if hash_alg not in ALGORITHM_POLICY["allowedHashAlgorithms"]:
+        return False, f"{hash_alg} is not in the allowed list"
+    if sig_alg not in ALGORITHM_POLICY["allowedSignatureAlgorithms"]:
+        return False, f"{sig_alg} is not in the allowed list"
+    return True, "Algorithm policy satisfied"
+
+
+# ── Key generation ────────────────────────────────────────────────────────
+
+def generate_key_pair(key_size: int = 3072) -> Tuple[str, str]:
+    if key_size < ALGORITHM_POLICY["minimumRsaKeyBits"]:
+        raise ValueError(f"Key size must be >= {ALGORITHM_POLICY['minimumRsaKeyBits']} bits")
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
     private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -121,6 +170,23 @@ def generate_key_pair() -> Tuple[str, str]:
     ).decode("utf-8")
     return private_pem, public_pem
 
+
+def get_public_key_size(public_key_pem: str) -> int:
+    """Return key size in bits from a PEM public key."""
+    try:
+        pub = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+        return pub.key_size  # type: ignore[union-attr]
+    except Exception:
+        return 0
+
+
+def compute_certificate_fingerprint(certificate: Dict[str, Any]) -> str:
+    """SHA-256 fingerprint of the canonical certificate payload."""
+    payload = certificate_payload_for_signature(certificate)
+    return hashlib.sha256(payload).hexdigest()
+
+
+# ── Demo CA ───────────────────────────────────────────────────────────────
 
 def ensure_demo_ca_keys() -> Tuple[str, str]:
     if CA_PRIVATE_KEY_PATH.exists():
@@ -149,6 +215,8 @@ def get_demo_ca_public_key() -> str:
     _, public_key_pem = ensure_demo_ca_keys()
     return public_key_pem
 
+
+# ── Certificate signing (legacy demo CA) ──────────────────────────────────
 
 def certificate_payload_for_signature(certificate: Dict[str, Any]) -> bytes:
     payload = {
@@ -221,6 +289,8 @@ def create_demo_certificate(name: str, email: str, public_key_pem: str) -> Dict[
     return certificate
 
 
+# ── Document signing (legacy) ─────────────────────────────────────────────
+
 def sign_hash(document_hash_hex: str, private_key_pem: str, hash_algorithm: str = "SHA-256") -> str:
     private_key = serialization.load_pem_private_key(
         private_key_pem.encode("utf-8"),
@@ -261,6 +331,76 @@ def verify_signature(
     except (InvalidSignature, ValueError, binascii.Error):
         return False
 
+
+# ── V2: Canonical signing payload ─────────────────────────────────────────
+
+def canonicalize_signing_payload(payload_dict: Dict[str, Any]) -> bytes:
+    """Deterministic JSON serialization with sorted keys for signing."""
+    return json.dumps(
+        payload_dict,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def verify_canonical_signature(
+    canonical_bytes: bytes,
+    signature_base64: str,
+    public_key_pem: str,
+    hash_algorithm: str = "SHA-256",
+) -> bool:
+    """Verify RSA-PSS signature over canonical JSON bytes.
+
+    V2 uses saltLength = hash digest size so browser Web Crypto clients can
+    interoperate. Legacy document-hash signing keeps its original PSS profile.
+    """
+    public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+    algorithm = _cryptography_hash_algorithm(hash_algorithm)
+    try:
+        public_key.verify(
+            base64.b64decode(signature_base64),
+            canonical_bytes,
+            padding.PSS(
+                mgf=padding.MGF1(algorithm),
+                salt_length=algorithm.digest_size,
+            ),
+            algorithm,
+        )
+        return True
+    except (InvalidSignature, ValueError, binascii.Error):
+        return False
+
+
+# ── V2: Audit log hash chain ─────────────────────────────────────────────
+
+def compute_audit_hash(event_json: str, previous_hash: Optional[str]) -> str:
+    data = event_json.encode("utf-8")
+    if previous_hash:
+        data += previous_hash.encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def build_audit_event_json(
+    event_id: str,
+    event_type: str,
+    actor: Optional[str],
+    result: str,
+    details: Optional[str],
+    created_at: str,
+) -> str:
+    event = {
+        "eventId": event_id,
+        "eventType": event_type,
+        "actor": actor or "",
+        "result": result,
+        "details": details or "",
+        "createdAt": created_at,
+    }
+    return json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+# ── Blind signature demo (unchanged) ─────────────────────────────────────
 
 def _int_to_base64(value: int, length: int) -> str:
     return base64.b64encode(value.to_bytes(length, "big")).decode("ascii")
@@ -303,4 +443,3 @@ def rsa_blind_signature_demo(message: str) -> Dict[str, Any]:
         "verificationValueHex": hex(verification_value),
         "valid": verification_value == message_int,
     }
-

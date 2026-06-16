@@ -1,4 +1,5 @@
 import json
+import secrets
 from datetime import timezone
 from typing import Any, Dict
 
@@ -9,10 +10,14 @@ from sqlalchemy.orm import Session
 from .crypto_utils import (
     CERTIFICATE_SIGNATURE_ALGORITHM,
     ISSUER,
+    build_audit_event_json,
+    compute_audit_hash,
+    compute_certificate_fingerprint,
     create_demo_certificate,
     ensure_demo_ca_keys,
     generate_key_pair,
     get_demo_ca_public_key,
+    get_public_key_size,
     hash_bytes,
     isoformat,
     normalize_hash_algorithm,
@@ -25,7 +30,8 @@ from .crypto_utils import (
     verify_signature,
 )
 from .database import SessionLocal, init_db
-from .models import CertificateRecord
+from .models import AuditLog, CertificateRecord, CertificateRevocation
+from .routes_v2 import router as v2_router
 from .schemas import (
     BlindSignatureDemoRequest,
     CaPublicKeyResponse,
@@ -46,6 +52,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(v2_router)
 
 
 @app.on_event("startup")
@@ -72,6 +80,37 @@ def read_json_form(value: str, field_name: str) -> Dict[str, Any]:
     return parsed
 
 
+def log_audit(
+    db: Session,
+    event_type: str,
+    actor: str | None,
+    result: str,
+    details: str | None = None,
+    document_hash: str | None = None,
+    certificate_serial: str | None = None,
+) -> None:
+    now = utc_now()
+    event_id = secrets.token_hex(16)
+    last = db.query(AuditLog).order_by(AuditLog.id.desc()).first()
+    previous_hash = last.current_log_hash if last else None
+    event_json = build_audit_event_json(event_id, event_type, actor, result, details, isoformat(now))
+    db.add(
+        AuditLog(
+            event_id=event_id,
+            event_type=event_type,
+            actor=actor,
+            document_hash=document_hash,
+            certificate_serial=certificate_serial,
+            result=result,
+            details=details,
+            created_at=now.replace(tzinfo=None),
+            previous_log_hash=previous_hash,
+            current_log_hash=compute_audit_hash(event_json, previous_hash),
+        )
+    )
+    db.flush()
+
+
 @app.get("/api/ca/public-key", response_model=CaPublicKeyResponse)
 def get_ca_public_key():
     return {
@@ -86,7 +125,11 @@ def get_hash_algorithms():
     return {"algorithms": supported_hash_algorithm_profiles(), "default": "SHA-256"}
 
 
-@app.post("/api/keys/generate", response_model=KeyGenerateResponse)
+@app.post(
+    "/api/keys/generate",
+    response_model=KeyGenerateResponse,
+    summary="Generate RSA key pair (demo - returns private key to client)",
+)
 def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
     private_key_pem, public_key_pem = generate_key_pair()
     certificate = create_demo_certificate(payload.name, payload.email, public_key_pem)
@@ -99,8 +142,19 @@ def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
         issued_at=parse_iso_datetime(certificate["issuedAt"]).replace(tzinfo=None),
         expires_at=parse_iso_datetime(certificate["expiresAt"]).replace(tzinfo=None),
         status=certificate["status"],
+        certificate_type="legacy-demo",
+        fingerprint_sha256=compute_certificate_fingerprint(certificate),
+        key_size_bits=get_public_key_size(public_key_pem),
     )
     db.add(record)
+    log_audit(
+        db,
+        "certificate_created",
+        payload.email,
+        "success",
+        details="legacy-demo certificate generated",
+        certificate_serial=certificate["serialNumber"],
+    )
     db.commit()
     return {
         "privateKeyPem": private_key_pem,
@@ -124,7 +178,12 @@ async def hash_document(file: UploadFile = File(...), hashAlgorithm: str = Form(
     }
 
 
-@app.post("/api/sign", response_model=SignedPackage)
+@app.post(
+    "/api/sign",
+    response_model=SignedPackage,
+    summary="[LEGACY INSECURE DEMO] Sign document - backend receives private key",
+    description="This endpoint receives the user's private key. Use /api/sign/v2/* for client-side signing.",
+)
 async def sign_document(
     file: UploadFile = File(...),
     privateKeyPem: str = Form(...),
@@ -383,8 +442,25 @@ def revoke_certificate(payload: RevokeCertificateRequest, db: Session = Depends(
 
     certificate["status"] = "revoked"
     record.status = "revoked"
+    now = utc_now()
+    db.add(
+        CertificateRevocation(
+            serial_number=certificate["serialNumber"],
+            reason=payload.reason,
+            revoked_at=now.replace(tzinfo=None),
+            revoked_by=payload.revokedBy,
+        )
+    )
+    log_audit(
+        db,
+        "certificate_revoked",
+        payload.revokedBy or certificate.get("email"),
+        "success",
+        details=f"reason={payload.reason}",
+        certificate_serial=certificate["serialNumber"],
+    )
     db.commit()
-    return {"certificate": certificate}
+    return {"certificate": certificate, "reason": payload.reason, "revokedAt": isoformat(now)}
 
 
 @app.post("/api/blind-signature/demo")

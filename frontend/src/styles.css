@@ -369,6 +369,14 @@ textarea {
   white-space: nowrap;
 }
 
+.heroActions,
+.buttonRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-start;
+}
+
 .secondary {
   background: #dff3ef;
   color: #0b5f58;
@@ -532,6 +540,11 @@ pre {
   border-color: #fca5a5;
 }
 
+.verifySteps li.warning {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
 .verifySteps strong {
   color: #17202a;
   font-size: 13px;
@@ -546,6 +559,77 @@ pre {
 .errorText {
   color: #b91c1c;
   font-weight: 750;
+}
+
+.warningBanner {
+  align-items: flex-start;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 10px;
+  color: #9a3412;
+  display: flex;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 8px;
+  line-height: 1.45;
+  padding: 11px 12px;
+}
+
+.warningBanner svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.reviewPanel h3 {
+  font-size: 18px;
+}
+
+.reportPanel {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.reportGrid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.reportCell {
+  border: 1px solid #dbe6e9;
+  border-radius: 10px;
+  display: grid;
+  gap: 5px;
+  padding: 11px 12px;
+}
+
+.reportCell dt {
+  color: #4b5f6d;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.reportCell dd {
+  color: #17202a;
+  font-size: 13px;
+  font-weight: 800;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.reportCell.ok {
+  background: #f0fdf8;
+  border-color: #86efac;
+}
+
+.reportCell.bad {
+  background: #fff5f5;
+  border-color: #fca5a5;
+}
+
+.reportCell.warn {
+  background: #f8fbfc;
 }
 
 @media (max-width: 980px) {
@@ -609,5 +693,19 @@ pre {
   .primary,
   .secondary {
     justify-self: stretch;
+  }
+
+  .heroActions,
+  .buttonRow {
+    width: 100%;
+  }
+
+  .heroActions > *,
+  .buttonRow > * {
+    flex: 1 1 100%;
+  }
+
+  .reportGrid {
+    grid-template-columns: 1fr;
   }
 }

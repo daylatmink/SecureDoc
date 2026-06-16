@@ -13,12 +13,15 @@ skills-lock.json
 backend/.venv/
 backend/securedoc.db
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
+backend/.testdata/
 __pycache__/
 **/__pycache__/
 *.py[cod]
 .pytest_cache/
+pytest-cache-files-*/
 .mypy_cache/
 .ruff_cache/
 
