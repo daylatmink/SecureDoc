@@ -33,6 +33,9 @@ def _ensure_sqlite_columns() -> None:
         "certificate_type": "VARCHAR DEFAULT 'legacy-demo' NOT NULL",
         "fingerprint_sha256": "VARCHAR",
         "key_size_bits": "INTEGER",
+        "user_certificate_pem": "TEXT",
+        "intermediate_certificate_pem": "TEXT",
+        "root_certificate_pem": "TEXT",
     }
     with engine.begin() as connection:
         for column_name, column_type in additions.items():

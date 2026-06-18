@@ -11,6 +11,7 @@ import {
   EyeOff,
   FileCheck,
   FileSignature,
+  FileText,
   Fingerprint,
   Hash,
   KeyRound,
@@ -21,8 +22,10 @@ import {
 import {
   browserSigningHashSupported,
   canonicalizePayload,
+  generateBrowserSigningKeyPair,
   hashDocument,
   importPrivateKey,
+  issueX509Certificate,
   prepareSigningRequest,
   signPayload,
   submitSignature,
@@ -34,7 +37,8 @@ import {
   type SubmitResponse,
   type VerificationReport,
   type VerificationStep,
-  type VerifyV2Response
+  type VerifyV2Response,
+  type X509IssueResponse
 } from "./signing-v2";
 import "./styles.css";
 
@@ -69,31 +73,73 @@ type LegacyVerifyResult = {
   details: VerifyDetails;
 };
 
-type BlindSignatureResult = {
-  message: string;
-  hashAlgorithm: string;
-  messageHash: string;
-  scheme: string;
-  publicKey: { modulusHex: string; publicExponent: number };
-  blindedMessageBase64: string;
-  blindSignatureBase64: string;
-  unblindedSignatureBase64: string;
-  verificationValueHex: string;
-  valid: boolean;
+type BlindPurpose = "anonymous_access_token" | "e_voting_demo" | "e_cash_demo";
+
+type BlindToken = {
+  tokenId: string;
+  purpose: BlindPurpose;
+  createdAt: string;
+  expiresAt: string;
+  nonce: string;
+  tokenVersion: string;
 };
 
-type Tab = "home" | "hash" | "keys" | "signv2" | "verifyv2" | "sign" | "verify" | "revoke" | "blind";
+type BlindSessionResponse = {
+  sessionId: string;
+  tokenId: string;
+  purpose: BlindPurpose;
+  token: BlindToken;
+  tokenHash: string;
+  blindedMessageBase64: string;
+  blindingFactorBase64?: string;
+  blindSignatureBase64?: string | null;
+  finalSignatureBase64?: string | null;
+  status: string;
+  createdAt: string;
+  expiresAt: string;
+  scheme: string;
+  publicKey: { modulusBase64: string; publicExponent: number };
+  warnings: string[];
+  demoWarning?: string;
+};
+
+type BlindSignResponse = {
+  sessionId: string;
+  blindSignatureBase64: string;
+  scheme: string;
+  warning: string;
+};
+
+type BlindVerifyResponse = {
+  valid: boolean;
+  reason: string;
+  sessionId: string;
+  tokenId: string;
+  purpose?: BlindPurpose;
+};
+
+type BlindRedeemResponse = {
+  redeemed: boolean;
+  reason: string;
+  sessionId: string;
+  tokenId: string;
+  status: string;
+  spentAt?: string;
+};
+
+type Tab = "home" | "documents" | "hash" | "keys" | "signv2" | "verifyv2" | "sign" | "verify" | "revoke" | "blind";
 
 const tabs: Array<{ tab: Tab; label: string; helper: string; icon: React.ReactNode }> = [
   { tab: "home", label: "Tong quan", helper: "V2 flow", icon: <BadgeCheck size={18} /> },
+  { tab: "documents", label: "Documents", helper: "Main flow", icon: <FileText size={18} /> },
   { tab: "hash", label: "Bam file", helper: "SHA-2/SHA-3", icon: <Hash size={18} /> },
-  { tab: "keys", label: "Tao khoa", helper: "RSA 3072", icon: <KeyRound size={18} /> },
+  { tab: "keys", label: "Tao khoa", helper: "X.509 demo", icon: <KeyRound size={18} /> },
   { tab: "signv2", label: "Ky v2", helper: "Client-side", icon: <FileSignature size={18} /> },
   { tab: "verifyv2", label: "Xac minh v2", helper: "Report", icon: <ClipboardCheck size={18} /> },
   { tab: "revoke", label: "Thu hoi", helper: "By serial", icon: <RotateCcw size={18} /> },
   { tab: "sign", label: "Ky legacy", helper: "Insecure", icon: <AlertTriangle size={18} /> },
   { tab: "verify", label: "Verify legacy", helper: "Old package", icon: <FileCheck size={18} /> },
-  { tab: "blind", label: "Chu ky mu", helper: "Unchanged", icon: <EyeOff size={18} /> }
+  { tab: "blind", label: "Chu ky mu", helper: "Privacy token", icon: <EyeOff size={18} /> }
 ];
 
 const hashAlgorithmOptions: Array<{ value: HashAlgorithm; label: string; helper: string }> = [
@@ -133,12 +179,13 @@ function App() {
         </nav>
         <div className="sidebarNote">
           <ShieldCheck size={18} />
-          <p>Main flow is v2: the browser signs a canonical payload; the API verifies and stores the signed package.</p>
+          <p>Main flow is Documents: browser key generation, x509-demo certificate, payload review, demo PIN, browser signing, verify report, and revocation demo.</p>
         </div>
       </aside>
 
       <main>
         {activeTab === "home" && <Home setActiveTab={setActiveTab} />}
+        {activeTab === "documents" && <DocumentsWorkflow />}
         {activeTab === "hash" && <HashDocument />}
         {activeTab === "keys" && <GenerateKeys />}
         {activeTab === "signv2" && <SignDocumentV2 />}
@@ -182,8 +229,8 @@ function Home({ setActiveTab }: { setActiveTab: (tab: Tab) => void }) {
           <h2>SecureDoc v2 signs canonical payloads in the browser</h2>
           <p>
             The main flow no longer sends a private key to the API. SecureDoc creates a signing payload,
-            the client signs that canonical JSON, and the server verifies certificate trust, revocation,
-            replay status, algorithm policy, document integrity, and the RSA-PSS signature.
+            the client signs that canonical JSON, and the server verifies X.509 demo certificate trust,
+            revocation, replay status, algorithm policy, document integrity, and the RSA-PSS signature.
           </p>
         </div>
         <div className="heroActions">
@@ -191,24 +238,24 @@ function Home({ setActiveTab }: { setActiveTab: (tab: Tab) => void }) {
             <KeyRound size={18} />
             Create keys
           </button>
-          <button className="secondary heroAction" onClick={() => setActiveTab("signv2")}>
-            <FileSignature size={18} />
-            Sign v2
+          <button className="secondary heroAction" onClick={() => setActiveTab("documents")}>
+            <ClipboardCheck size={18} />
+            Open Documents
           </button>
         </div>
       </div>
 
       <div className="workflowGrid" aria-label="V2 workflow">
-        <StepCard number="01" title="Create demo cert" text="Generate RSA 3072-bit keys and a legacy-demo JSON certificate signed by SecureDoc Demo CA." />
-        <StepCard number="02" title="Review payload" text="Review file name, hash, signer, certificate serial, purpose, requestId, and nonce before signing." />
-        <StepCard number="03" title="Verify report" text="Get a detailed report instead of a single boolean: integrity, signature, certificate, revocation, replay, and warnings." />
+        <StepCard number="01" title="Key and certificate" text="Generate the RSA key in the browser, then request an x509-demo certificate from Demo Root CA -> Demo Intermediate CA." />
+        <StepCard number="02" title="Review and PIN" text="Upload a document, create the signing request, inspect every signingPayload field, then enter demo PIN 123456." />
+        <StepCard number="03" title="Verify and revoke" text="Submit the signedPackage, inspect the report, revoke the certificate, then verify again to show failure." />
       </div>
 
       <div className="metricGrid">
         <InfoBox title="No server-side private key" text="The v2 signing endpoint receives only a signed package, never a private key." />
         <InfoBox title="Canonical JSON" text="The signature covers the full signingPayload, not only a detached document hash." />
         <InfoBox title="DB revocation" text="Revocation is checked by serialNumber from the server DB, not from package status." />
-        <InfoBox title="Demo boundaries" text="Certificates are still legacy-demo JSON; no real CA, HSM, TSA, or PAdES profile is implemented." />
+        <InfoBox title="Demo boundaries" text="The CA chain is local demo trust only; no public CA, HSM, TSA, or PAdES profile is implemented." />
       </div>
     </section>
   );
@@ -230,6 +277,454 @@ function InfoBox({ title, text }: { title: string; text: string }) {
       <h3>{title}</h3>
       <p>{text}</p>
     </article>
+  );
+}
+
+type DocumentStatus = "draft" | "pending_signature" | "signed" | "verification_failed" | "certificate_revoked";
+
+type AuditChainResult = {
+  valid: boolean;
+  totalEvents: number;
+  brokenAt: null | { index: number; id: number; eventId: string };
+};
+
+function DocumentsWorkflow() {
+  const [name, setName] = useState("Nguyen Van A");
+  const [email, setEmail] = useState("student@example.com");
+  const [privateKeyPem, setPrivateKeyPem] = useState("");
+  const [certificate, setCertificate] = useState<Certificate | null>(null);
+  const [file, setFile] = useState<File | null>(null);
+  const [hashAlgorithm, setHashAlgorithm] = useState<HashAlgorithm>("SHA-256");
+  const [purpose, setPurpose] = useState("approve_document");
+  const [hashResult, setHashResult] = useState<HashResult | null>(null);
+  const [prepareResult, setPrepareResult] = useState<PrepareResponse | null>(null);
+  const [pin, setPin] = useState("");
+  const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
+  const [verifyResult, setVerifyResult] = useState<VerifyV2Response | null>(null);
+  const [revokeResult, setRevokeResult] = useState<{ serialNumber: string; status: string; reason: string; revokedAt: string } | null>(null);
+  const [auditResult, setAuditResult] = useState<AuditChainResult | null>(null);
+  const [status, setStatus] = useState<DocumentStatus>("draft");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const signer = certificate ? `${certificate.ownerName} (${certificate.email})` : "-";
+  const purposeLabel = signingPurposes.find((item) => item.value === purpose)?.label ?? purpose;
+
+  async function createCertificate() {
+    setError("");
+    setLoading(true);
+    try {
+      const keyPair = await generateBrowserSigningKeyPair();
+      const issued = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem });
+      setPrivateKeyPem(keyPair.privateKeyPem);
+      setCertificate(issued.certificate);
+      setStatus("draft");
+      setPrepareResult(null);
+      setSubmitResult(null);
+      setVerifyResult(null);
+      setRevokeResult(null);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot create browser key and X.509 demo certificate."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createSigningRequest() {
+    if (!file) {
+      setError("Choose a document first.");
+      return;
+    }
+    if (!certificate) {
+      setError("Generate an X.509 demo certificate first.");
+      return;
+    }
+    setError("");
+    setLoading(true);
+    try {
+      const hash = await hashDocument(file, hashAlgorithm);
+      const prepared = await prepareSigningRequest({
+        documentName: file.name,
+        documentHash: hash.documentHash,
+        hashAlgorithm: hash.hashAlgorithm,
+        certificateSerialNumber: certificate.serialNumber,
+        signingPurpose: purpose
+      });
+      setHashResult(hash);
+      setPrepareResult(prepared);
+      setSubmitResult(null);
+      setVerifyResult(null);
+      setStatus("pending_signature");
+    } catch (err) {
+      setError(errorMessage(err, "Cannot create signing request."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function signAndSubmit() {
+    if (!prepareResult || !certificate) return;
+    if (pin !== "123456") {
+      setError("Demo PIN must be 123456.");
+      return;
+    }
+    if (!privateKeyPem.trim()) {
+      setError("Private key PEM is missing. Generate the key pair in this browser again.");
+      return;
+    }
+    if (!certificate.userCertificatePem || !certificate.intermediateCertificatePem || !certificate.rootCertificatePem) {
+      setError("X.509 demo certificate is missing PEM chain fields.");
+      return;
+    }
+    const signingHash = prepareResult.signingPayload.hashAlgorithm;
+    if (!browserSigningHashSupported(signingHash)) {
+      setError("Browser Web Crypto cannot RSA-PSS sign with SHA3-256.");
+      return;
+    }
+
+    setError("");
+    setLoading(true);
+    try {
+      const canonicalPayload = canonicalizePayload(prepareResult.signingPayload);
+      const key = await importPrivateKey(privateKeyPem, signingHash);
+      const signatureBase64 = await signPayload(key, canonicalPayload, signingHash);
+      const signedPackage: SignedPackageV2 = {
+        packageVersion: "2.0",
+        signingPayload: prepareResult.signingPayload,
+        payloadCanonicalization: "JSON-canonical-sorted-keys",
+        signatureAlgorithm: "RSA-PSS",
+        signatureBase64,
+        userCertificatePem: certificate.userCertificatePem,
+        intermediateCertificatePem: certificate.intermediateCertificatePem,
+        rootCertificatePem: certificate.rootCertificatePem,
+        trustedRootId: "securedoc-demo-root",
+        signerCertificate: certificate,
+        signedAtClient: new Date().toISOString()
+      };
+      const submitted = await submitSignature(signedPackage);
+      setSubmitResult(submitted);
+      setVerifyResult(null);
+      setStatus("signed");
+    } catch (err) {
+      setStatus("verification_failed");
+      setError(errorMessage(err, "Cannot sign or submit signedPackage."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function verifyCurrentPackage() {
+    if (!file || !submitResult) {
+      setError("Sign a package first.");
+      return;
+    }
+    setError("");
+    setLoading(true);
+    try {
+      const algorithm = submitResult.signedPackage.signingPayload.hashAlgorithm;
+      const hash = await hashDocument(file, algorithm);
+      const result = await verifyV2({
+        documentHash: hash.documentHash,
+        hashAlgorithm: hash.hashAlgorithm,
+        signedPackage: submitResult.signedPackage
+      });
+      setVerifyResult(result);
+      setStatus(result.valid ? "signed" : "verification_failed");
+    } catch (err) {
+      setStatus("verification_failed");
+      setError(errorMessage(err, "Cannot verify signedPackage."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function revokeAndVerifyAgain() {
+    if (!certificate || !file || !submitResult) {
+      setError("Sign a package with an X.509 demo certificate first.");
+      return;
+    }
+    setError("");
+    setLoading(true);
+    try {
+      const revokeResponse = await fetch(`${API_BASE}/api/certificates/revoke/v2`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ serialNumber: certificate.serialNumber, reason: "classroom_demo_revoke", revokedBy: "local-demo-user" })
+      });
+      const revoked = await parseResponse<{ serialNumber: string; status: string; reason: string; revokedAt: string }>(revokeResponse);
+      setRevokeResult(revoked);
+
+      const algorithm = submitResult.signedPackage.signingPayload.hashAlgorithm;
+      const hash = await hashDocument(file, algorithm);
+      const result = await verifyV2({
+        documentHash: hash.documentHash,
+        hashAlgorithm: hash.hashAlgorithm,
+        signedPackage: submitResult.signedPackage
+      });
+      setVerifyResult(result);
+      setStatus(result.valid ? "signed" : "certificate_revoked");
+    } catch (err) {
+      setError(errorMessage(err, "Cannot revoke certificate or verify again."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function checkAuditChain() {
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/audit/verify-chain`);
+      setAuditResult(await parseResponse<AuditChainResult>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Cannot verify audit chain."));
+    }
+  }
+
+  return (
+    <section className="page documentsPage">
+      <PageHeader title="Documents workflow" description="Main digital-signature demo flow: browser key, X.509 demo certificate, signing request, payload review, demo PIN, browser signing, verification report, revocation, and audit chain." />
+
+      <div className="flowStrip" aria-label="Main demo flow">
+        {[
+          "Generate key in browser",
+          "Request X.509 demo certificate",
+          "Upload document",
+          "Create signing request",
+          "Review signingPayload",
+          "Enter demo PIN",
+          "Sign in browser",
+          "Submit signedPackage",
+          "Verify report",
+          "Revoke and verify again"
+        ].map((item, index) => (
+          <div key={item} className="flowStep">
+            <span>{String(index + 1).padStart(2, "0")}</span>
+            <strong>{item}</strong>
+          </div>
+        ))}
+      </div>
+
+      <div className="documentTableWrap">
+        <table className="documentTable">
+          <thead>
+            <tr>
+              <th>Document name</th>
+              <th>Signer</th>
+              <th>Purpose</th>
+              <th>Certificate serial</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>{file?.name ?? "No document selected"}</td>
+              <td>{signer}</td>
+              <td>{purposeLabel}</td>
+              <td>{certificate?.serialNumber ?? "-"}</td>
+              <td><StatusBadge status={status} /></td>
+              <td>
+                <div className="tableActions">
+                  <button className="secondary" onClick={verifyCurrentPackage} disabled={!submitResult || loading}>Verify</button>
+                  <button className="secondary" onClick={() => submitResult && downloadText("signed_package_v2.json", JSON.stringify(submitResult.signedPackage, null, 2))} disabled={!submitResult}>
+                    Export
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="workflowPanels">
+        <div className="surface">
+          <h3>1. Key and X.509 demo certificate</h3>
+          <div className="successBanner">
+            <ShieldCheck size={16} />
+            Browser generates the private key. The API receives publicKeyPem only.
+          </div>
+          <div className="formGrid">
+            <label>
+              Full name
+              <input value={name} onChange={(event) => setName(event.target.value)} />
+            </label>
+            <label>
+              Email
+              <input value={email} onChange={(event) => setEmail(event.target.value)} />
+            </label>
+          </div>
+          <button className="primary" onClick={createCertificate} disabled={loading}>
+            <KeyRound size={18} />
+            {loading ? "Working..." : "Generate key and request certificate"}
+          </button>
+          {certificate && (
+            <dl className="detailList">
+              <DetailItem label="Certificate type" value={certificate.certificateType} />
+              <DetailItem label="Certificate serial" value={certificate.serialNumber} />
+              <DetailItem label="Fingerprint" value={certificate.certificateFingerprint ?? "-"} />
+            </dl>
+          )}
+        </div>
+
+        <div className="surface">
+          <h3>2. Document and signing request</h3>
+          <FileInput label="Document" onFile={(selected) => {
+            setFile(selected);
+            setHashResult(null);
+            setPrepareResult(null);
+            setSubmitResult(null);
+            setVerifyResult(null);
+            setStatus("draft");
+          }} />
+          <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />
+          <label>
+            Signing purpose
+            <select value={purpose} onChange={(event) => setPurpose(event.target.value)}>
+              {signingPurposes.map((item) => (
+                <option key={item.value} value={item.value}>{item.label}</option>
+              ))}
+            </select>
+          </label>
+          <button className="primary" onClick={createSigningRequest} disabled={!certificate || !file || loading}>
+            <Eye size={18} />
+            Create signing request
+          </button>
+          {hashResult && (
+            <dl className="detailList">
+              <DetailItem label="Document hash" value={hashResult.documentHash} />
+              <DetailItem label="Hash algorithm" value={hashResult.hashAlgorithm} />
+            </dl>
+          )}
+        </div>
+      </div>
+
+      {prepareResult && (
+        <div className="surface reviewPanel">
+          <h3>3. Review signingPayload before signing</h3>
+          <div className="warningBanner">
+            <AlertTriangle size={16} />
+            Check these fields before signing.
+          </div>
+          <dl className="detailList">
+            <DetailItem label="documentName" value={prepareResult.signingPayload.documentName} />
+            <DetailItem label="documentHash" value={prepareResult.signingPayload.documentHash} />
+            <DetailItem label="signerName" value={prepareResult.signingPayload.signerName} />
+            <DetailItem label="signerEmail" value={prepareResult.signingPayload.signerEmail} />
+            <DetailItem label="certificateSerialNumber" value={prepareResult.signingPayload.certificateSerialNumber} />
+            <DetailItem label="certificateFingerprint" value={prepareResult.signingPayload.certificateFingerprint} />
+            <DetailItem label="signingPurpose" value={prepareResult.signingPayload.signingPurpose} />
+            <DetailItem label="requestId" value={prepareResult.requestId} />
+            <DetailItem label="nonce" value={prepareResult.nonce} />
+          </dl>
+          <div className="pinPanel">
+            <label>
+              Demo PIN
+              <input value={pin} onChange={(event) => setPin(event.target.value)} placeholder="123456" inputMode="numeric" />
+              <small className="fieldHint">Demo PIN only, not production authentication.</small>
+            </label>
+            <button className="primary" onClick={signAndSubmit} disabled={loading || !prepareResult}>
+              <FileSignature size={18} />
+              {loading ? "Signing..." : "Sign in browser and submit"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {submitResult && (
+        <div className="resultPanel">
+          <div className="resultHeader">
+            <CheckCircle2 size={22} />
+            <div>
+              <h3>signedPackage accepted</h3>
+              <p>Backend issued a demo timestamp token and returned a verification report.</p>
+            </div>
+          </div>
+          <ReportPanel report={submitResult.verificationReport} />
+          <PdfVisualStampPreview certificate={certificate} signedPackage={submitResult.signedPackage} purpose={purposeLabel} />
+          <div className="buttonRow">
+            <button className="secondary" onClick={verifyCurrentPackage}>
+              <ClipboardCheck size={18} />
+              Verify report
+            </button>
+            <button className="secondary" onClick={revokeAndVerifyAgain}>
+              <RotateCcw size={18} />
+              Revoke certificate and verify again
+            </button>
+            <button className="secondary" onClick={() => downloadText("signed_package_v2.json", JSON.stringify(submitResult.signedPackage, null, 2))}>
+              <Download size={18} />
+              Export signedPackage
+            </button>
+          </div>
+        </div>
+      )}
+
+      {verifyResult && (
+        <div className={verifyResult.valid ? "verifyBox valid" : "verifyBox invalid"} role="status" aria-live="polite">
+          <div className="statusIcon" aria-hidden="true">
+            {verifyResult.valid ? <BadgeCheck size={24} /> : <Ban size={24} />}
+          </div>
+          <div>
+            <h3>{verifyResult.valid ? "Verification passed" : "Verification failed"}</h3>
+            <p>{verifyResult.reason}</p>
+            <ReportPanel report={verifyResult.report} />
+          </div>
+        </div>
+      )}
+
+      {revokeResult && (
+        <div className="warningBanner">
+          <Ban size={16} />
+          Certificate {revokeResult.serialNumber} was revoked for reason {revokeResult.reason}. Verifying the old package should now fail with certificate_revoked.
+        </div>
+      )}
+
+      <div className="surface">
+        <h3>Audit chain</h3>
+        <button className="secondary" onClick={checkAuditChain}>
+          <ShieldCheck size={18} />
+          Verify audit hash chain
+        </button>
+        {auditResult && (
+          <dl className="detailList">
+            <DetailItem label="Audit chain valid" value={String(auditResult.valid)} />
+            <DetailItem label="Total events" value={String(auditResult.totalEvents)} />
+            <DetailItem label="Broken at" value={auditResult.brokenAt ? JSON.stringify(auditResult.brokenAt) : "none"} />
+          </dl>
+        )}
+      </div>
+
+      {error && <p className="errorText" role="alert">{error}</p>}
+    </section>
+  );
+}
+
+function StatusBadge({ status }: { status: DocumentStatus }) {
+  return <span className={`statusBadge ${status}`}>{status}</span>;
+}
+
+function PdfVisualStampPreview({
+  certificate,
+  signedPackage,
+  purpose
+}: {
+  certificate: Certificate | null;
+  signedPackage: SignedPackageV2;
+  purpose: string;
+}) {
+  return (
+    <div className="visualStampPanel">
+      <div>
+        <h3>PDF visual stamp demo</h3>
+        <p>Visual stamp is not PAdES.</p>
+      </div>
+      <div className="visualStamp">
+        <strong>Signed by {certificate?.ownerName ?? signedPackage.signingPayload.signerName}</strong>
+        <span>Email: {certificate?.email ?? signedPackage.signingPayload.signerEmail}</span>
+        <span>Certificate serial: {certificate?.serialNumber ?? signedPackage.signingPayload.certificateSerialNumber}</span>
+        <span>Signing time: {signedPackage.signedAtClient ?? "client time not provided"}</span>
+        <span>Reason: {purpose}</span>
+      </div>
+    </div>
   );
 }
 
@@ -287,31 +782,32 @@ function HashDocument() {
 function GenerateKeys() {
   const [name, setName] = useState("Nguyen Van A");
   const [email, setEmail] = useState("student@example.com");
-  const [result, setResult] = useState<{ privateKeyPem: string; publicKeyPem: string; certificate: Certificate } | null>(null);
+  const [result, setResult] = useState<(X509IssueResponse & { privateKeyPem: string; publicKeyPem: string }) | null>(null);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
   async function submit() {
     setError("");
     setResult(null);
+    setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/api/keys/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, email })
-      });
-      setResult(await parseResponse<{ privateKeyPem: string; publicKeyPem: string; certificate: Certificate }>(response));
+      const keyPair = await generateBrowserSigningKeyPair();
+      const certificateResponse = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem });
+      setResult({ ...certificateResponse, ...keyPair });
     } catch (err) {
-      setError(errorMessage(err, "Cannot generate keys."));
+      setError(errorMessage(err, "Cannot generate browser keys or issue X.509 certificate."));
+    } finally {
+      setLoading(false);
     }
   }
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Create keys and demo certificate" description="Generate an RSA 3072-bit key pair and a SecureDoc legacy-demo JSON certificate." />
+      <PageHeader title="Create browser key pair and X.509 certificate" description="Generate an RSA 3072-bit key pair in the browser, then send only the public key to the SecureDoc demo CA." />
       <div className="surface">
-        <div className="warningBanner">
-          <AlertTriangle size={16} />
-          This demo returns the private key to the browser so you can test v2 client-side signing. Do not use these demo keys in production.
+        <div className="successBanner">
+          <ShieldCheck size={16} />
+          The private key is generated locally by Web Crypto. The API receives publicKeyPem only and issues an x509-demo certificate.
         </div>
         <div className="formGrid">
           <label>
@@ -323,9 +819,9 @@ function GenerateKeys() {
             <input value={email} onChange={(event) => setEmail(event.target.value)} />
           </label>
         </div>
-        <button className="primary" onClick={submit}>
+        <button className="primary" onClick={submit} disabled={loading}>
           <KeyRound size={18} />
-          Create key pair
+          {loading ? "Creating..." : "Create browser key pair"}
         </button>
         {error && <p className="errorText" role="alert">{error}</p>}
       </div>
@@ -333,7 +829,10 @@ function GenerateKeys() {
         <div className="outputStack" aria-label="Key generation result">
           <PemBlock title="Private key PEM" value={result.privateKeyPem} filename="private_key.pem" />
           <PemBlock title="Public key PEM" value={result.publicKeyPem} filename="public_key.pem" />
-          <PemBlock title="Legacy-demo certificate JSON" value={JSON.stringify(result.certificate, null, 2)} filename="certificate.json" />
+          <PemBlock title="User signing certificate PEM" value={result.userCertificatePem} filename="user_certificate.pem" />
+          <PemBlock title="Demo intermediate CA PEM" value={result.intermediateCertificatePem} filename="demo_intermediate_ca.pem" />
+          <PemBlock title="Demo root CA PEM" value={result.rootCertificatePem} filename="demo_root_ca.pem" />
+          <PemBlock title="X.509 demo signer certificate JSON" value={JSON.stringify(result.certificate, null, 2)} filename="x509_demo_certificate.json" />
         </div>
       )}
     </section>
@@ -351,6 +850,7 @@ function SignDocumentV2() {
   const [purpose, setPurpose] = useState("approve_document");
   const [prepareResult, setPrepareResult] = useState<PrepareResponse | null>(null);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
+  const [pin, setPin] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -384,6 +884,10 @@ function SignDocumentV2() {
 
   async function sign() {
     if (!prepareResult) return;
+    if (pin !== "123456") {
+      setError("Demo PIN must be 123456.");
+      return;
+    }
     if (!privateKeyPem.trim()) {
       setError("Paste or upload the private key PEM.");
       return;
@@ -392,6 +896,10 @@ function SignDocumentV2() {
     if (!certificate) return;
     if (certificate.serialNumber !== prepareResult.signingPayload.certificateSerialNumber) {
       setError("Certificate serial changed after prepare.");
+      return;
+    }
+    if (!certificate.userCertificatePem || !certificate.intermediateCertificatePem || !certificate.rootCertificatePem) {
+      setError("X.509 demo certificate JSON is missing PEM chain fields.");
       return;
     }
     const signingHash = prepareResult.signingPayload.hashAlgorithm;
@@ -412,6 +920,10 @@ function SignDocumentV2() {
         payloadCanonicalization: "JSON-canonical-sorted-keys",
         signatureAlgorithm: "RSA-PSS",
         signatureBase64,
+        userCertificatePem: certificate.userCertificatePem,
+        intermediateCertificatePem: certificate.intermediateCertificatePem,
+        rootCertificatePem: certificate.rootCertificatePem,
+        trustedRootId: "securedoc-demo-root",
         signerCertificate: certificate,
         signedAtClient: new Date().toISOString()
       };
@@ -429,6 +941,7 @@ function SignDocumentV2() {
     setStep("input");
     setPrepareResult(null);
     setSubmitResult(null);
+    setPin("");
     setError("");
   }
 
@@ -452,7 +965,7 @@ function SignDocumentV2() {
               ))}
             </select>
           </label>
-          <TextOrFile label="Certificate JSON" value={certificateText} setValue={setCertificateText} />
+          <TextOrFile label="X.509 demo signer certificate JSON" value={certificateText} setValue={setCertificateText} />
           <TextOrFile label="Private key PEM (local browser use only)" value={privateKeyPem} setValue={setPrivateKeyPem} />
           <button className="primary" onClick={prepare} disabled={loading}>
             <Eye size={18} />
@@ -465,18 +978,28 @@ function SignDocumentV2() {
       {step === "review" && prepareResult && (
         <div className="surface reviewPanel">
           <h3>Review before signing</h3>
+          <div className="warningBanner">
+            <AlertTriangle size={16} />
+            Check these fields before signing.
+          </div>
           <dl className="detailList">
             <DetailItem label="Document" value={prepareResult.signingPayload.documentName} />
             <DetailItem label="Document hash" value={prepareResult.signingPayload.documentHash} />
             <DetailItem label="Hash algorithm" value={prepareResult.signingPayload.hashAlgorithm} />
             <DetailItem label="Signer" value={`${prepareResult.signingPayload.signerName} (${prepareResult.signingPayload.signerEmail})`} />
             <DetailItem label="Certificate serial" value={prepareResult.signingPayload.certificateSerialNumber} />
+            <DetailItem label="Certificate fingerprint" value={prepareResult.signingPayload.certificateFingerprint} />
             <DetailItem label="Signing purpose" value={prepareResult.signingPayload.signingPurpose} />
             <DetailItem label="Request ID" value={prepareResult.requestId} />
             <DetailItem label="Nonce" value={prepareResult.nonce} />
             <DetailItem label="Canonicalization" value="JSON-canonical-sorted-keys" />
           </dl>
           {prepareResult.warnings.length > 0 && <WarningList warnings={prepareResult.warnings} />}
+          <label>
+            Demo PIN
+            <input value={pin} onChange={(event) => setPin(event.target.value)} placeholder="123456" inputMode="numeric" />
+            <small className="fieldHint">Demo PIN only, not production authentication.</small>
+          </label>
           <div className="buttonRow">
             <button className="primary" onClick={sign} disabled={loading}>
               <FileSignature size={18} />
@@ -671,16 +1194,16 @@ function SignDocumentLegacy() {
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Legacy sign endpoint" description="This insecure demo endpoint sends the private key to the backend. It is kept only for compatibility." />
+      <PageHeader title="Insecure legacy demo sign endpoint" description="This compatibility endpoint sends privateKeyPem and a legacy-demo JSON certificate to the backend." />
       <div className="surface">
         <div className="warningBanner">
           <AlertTriangle size={16} />
-          Legacy flow is insecure because the API receives privateKeyPem. Use Sign v2 for the main flow.
+          Insecure legacy demo: backend receives privateKeyPem. Use Documents for the main flow.
         </div>
         <FileInput label="Document" onFile={setFile} />
         <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />
         <TextOrFile label="Private key PEM" value={privateKey} setValue={setPrivateKey} />
-        <TextOrFile label="Certificate JSON" value={certificate} setValue={setCertificate} />
+        <TextOrFile label="Legacy-demo JSON certificate" value={certificate} setValue={setCertificate} />
         <button className="primary" onClick={submit}>
           <FileSignature size={18} />
           Sign with legacy API
@@ -767,55 +1290,228 @@ function VerifyDocumentLegacy() {
 }
 
 function BlindSignatureDemo() {
-  const [message, setMessage] = useState("Anonymous ballot demo 01");
-  const [result, setResult] = useState<BlindSignatureResult | null>(null);
+  const [purpose, setPurpose] = useState<BlindPurpose>("anonymous_access_token");
+  const [session, setSession] = useState<BlindSessionResponse | null>(null);
+  const [signResult, setSignResult] = useState<BlindSignResponse | null>(null);
+  const [finalSignatureBase64, setFinalSignatureBase64] = useState("");
+  const [verifyResult, setVerifyResult] = useState<BlindVerifyResponse | null>(null);
+  const [redeemResult, setRedeemResult] = useState<BlindRedeemResponse | null>(null);
+  const [redeemAgainResult, setRedeemAgainResult] = useState<BlindRedeemResponse | null>(null);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  async function submit() {
+  async function createSession() {
     setError("");
-    setResult(null);
+    setSession(null);
+    setSignResult(null);
+    setFinalSignatureBase64("");
+    setVerifyResult(null);
+    setRedeemResult(null);
+    setRedeemAgainResult(null);
+    setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/api/blind-signature/demo`, {
+      const response = await fetch(`${API_BASE}/api/blind-signature/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message })
+        body: JSON.stringify({ purpose, ttlSeconds: 600 })
       });
-      setResult(await parseResponse<BlindSignatureResult>(response));
+      setSession(await parseResponse<BlindSessionResponse>(response));
     } catch (err) {
-      setError(errorMessage(err, "Cannot run blind signature demo."));
+      setError(errorMessage(err, "Cannot create blind signature session."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function signBlinded() {
+    if (!session) return;
+    setError("");
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/blind-signature/sign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          blindedMessageBase64: session.blindedMessageBase64
+        })
+      });
+      setSignResult(await parseResponse<BlindSignResponse>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Cannot sign blinded token."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function unblind() {
+    if (!session?.blindingFactorBase64 || !signResult?.blindSignatureBase64) {
+      setError("Create session and sign blinded token first.");
+      return;
+    }
+    try {
+      setFinalSignatureBase64(
+        unblindSignatureInBrowser(
+          signResult.blindSignatureBase64,
+          session.blindingFactorBase64,
+          session.publicKey.modulusBase64
+        )
+      );
+      setError("");
+    } catch (err) {
+      setError(errorMessage(err, "Cannot unblind signature in browser."));
+    }
+  }
+
+  async function verifyFinal() {
+    if (!session || !finalSignatureBase64) return;
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/blind-signature/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          token: session.token,
+          finalSignatureBase64
+        })
+      });
+      setVerifyResult(await parseResponse<BlindVerifyResponse>(response));
+    } catch (err) {
+      setError(errorMessage(err, "Cannot verify final blind signature."));
+    }
+  }
+
+  async function redeem(again = false) {
+    if (!session || !finalSignatureBase64) return;
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/blind-signature/redeem`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          token: session.token,
+          finalSignatureBase64
+        })
+      });
+      const data = await parseResponse<BlindRedeemResponse>(response);
+      if (again) setRedeemAgainResult(data);
+      else setRedeemResult(data);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot redeem blind token."));
     }
   }
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Blind signature demo" description="Existing educational RSA blind signature demo. It was not expanded in this change." />
+      <PageHeader title="Blind signature token demo" description="Privacy-oriented flow: create token, blind it, signer signs only the blinded token, browser unblinds, verifies, redeems, then shows double-spend failure." />
       <div className="surface">
+        <div className="warningBanner">
+          <AlertTriangle size={16} />
+          Educational demo only. Blind signatures are for privacy/anonymous-token problems, not document identity signing.
+        </div>
         <label>
-          Message
-          <textarea value={message} onChange={(event) => setMessage(event.target.value)} />
+          Purpose
+          <select value={purpose} onChange={(event) => setPurpose(event.target.value as BlindPurpose)}>
+            <option value="anonymous_access_token">anonymous_access_token</option>
+            <option value="e_voting_demo">e_voting_demo</option>
+            <option value="e_cash_demo">e_cash_demo</option>
+          </select>
         </label>
-        <button className="primary" onClick={submit}>
+        <button className="primary" onClick={createSession} disabled={loading}>
           <EyeOff size={18} />
-          Run demo
+          {loading ? "Creating..." : "1. Create token and blind it"}
         </button>
         {error && <p className="errorText" role="alert">{error}</p>}
       </div>
-      {result && (
-        <div className={result.valid ? "verifyBox valid" : "verifyBox invalid"} role="status" aria-live="polite">
-          <div className="statusIcon" aria-hidden="true">
-            {result.valid ? <BadgeCheck size={24} /> : <Ban size={24} />}
+
+      {session && (
+        <div className="resultPanel">
+          <div className="resultHeader">
+            <CheckCircle2 size={22} />
+            <div>
+              <h3>Token created and blinded</h3>
+              <p>Signer cannot see the raw token; it receives only blindedMessageBase64.</p>
+            </div>
           </div>
+          <dl className="detailList">
+            <DetailItem label="tokenId" value={session.token.tokenId} />
+            <DetailItem label="purpose" value={session.token.purpose} />
+            <DetailItem label="createdAt" value={session.token.createdAt} />
+            <DetailItem label="expiresAt" value={session.token.expiresAt} />
+            <DetailItem label="nonce" value={session.token.nonce} />
+            <DetailItem label="tokenVersion" value={session.token.tokenVersion} />
+            <DetailItem label="tokenHash" value={session.tokenHash} />
+            <DetailItem label="blindedMessageBase64" value={`${session.blindedMessageBase64.slice(0, 180)}...`} />
+          </dl>
+          <div className="warningBanner">
+            <AlertTriangle size={16} />
+            Demo reveals blindingFactorBase64 so the browser can show unblind step. Do not expose this in production.
+          </div>
+          <div className="buttonRow">
+            <button className="primary" onClick={signBlinded} disabled={loading}>
+              <FileSignature size={18} />
+              2. Sign blinded token
+            </button>
+          </div>
+        </div>
+      )}
+
+      {signResult && (
+        <div className="resultPanel">
+          <h3>Blinded token signed</h3>
+          <dl className="detailList">
+            <DetailItem label="blindSignatureBase64" value={`${signResult.blindSignatureBase64.slice(0, 180)}...`} />
+            <DetailItem label="signer warning" value={signResult.warning} />
+          </dl>
+          <button className="primary" onClick={unblind}>
+            <Eye size={18} />
+            3. Unblind in browser
+          </button>
+        </div>
+      )}
+
+      {finalSignatureBase64 && session && (
+        <div className="resultPanel">
+          <h3>Final signature ready</h3>
+          <dl className="detailList">
+            <DetailItem label="finalSignatureBase64" value={`${finalSignatureBase64.slice(0, 180)}...`} />
+          </dl>
+          <div className="buttonRow">
+            <button className="primary" onClick={verifyFinal}>
+              <ClipboardCheck size={18} />
+              4. Verify final signature
+            </button>
+            <button className="secondary" onClick={() => redeem(false)}>
+              <CheckCircle2 size={18} />
+              5. Redeem token
+            </button>
+            <button className="secondary" onClick={() => redeem(true)}>
+              <Ban size={18} />
+              6. Redeem again
+            </button>
+          </div>
+        </div>
+      )}
+
+      {verifyResult && (
+        <div className={verifyResult.valid ? "verifyBox valid" : "verifyBox invalid"}>
+          <div className="statusIcon">{verifyResult.valid ? <BadgeCheck size={24} /> : <Ban size={24} />}</div>
           <div>
-            <h3>{result.valid ? "Blind signature valid" : "Blind signature invalid"}</h3>
-            <p>{result.scheme}</p>
-            <dl className="detailList">
-              <DetailItem label="Message hash" value={result.messageHash} />
-              <DetailItem label="Public exponent" value={String(result.publicKey.publicExponent)} />
-              <DetailItem label="Blinded message" value={`${result.blindedMessageBase64.slice(0, 140)}...`} />
-              <DetailItem label="Blind signature" value={`${result.blindSignatureBase64.slice(0, 140)}...`} />
-              <DetailItem label="Unblinded signature" value={`${result.unblindedSignatureBase64.slice(0, 140)}...`} />
-            </dl>
+            <h3>{verifyResult.valid ? "Final blind signature valid" : "Final blind signature invalid"}</h3>
+            <p>{verifyResult.reason}</p>
           </div>
+        </div>
+      )}
+
+      {(redeemResult || redeemAgainResult) && (
+        <div className="resultPanel">
+          <h3>Redeem results</h3>
+          <dl className="detailList">
+            {redeemResult && <DetailItem label="First redeem" value={`${redeemResult.redeemed ? "success" : "failed"}: ${redeemResult.reason}`} />}
+            {redeemAgainResult && <DetailItem label="Second redeem" value={`${redeemAgainResult.redeemed ? "success" : "failed"}: ${redeemAgainResult.reason}`} />}
+          </dl>
         </div>
       )}
     </section>
@@ -833,6 +1529,7 @@ function ReportPanel({ report }: { report: VerificationReport }) {
     ["Chain", report.certificateChainValid],
     ["Validity period", report.certificateValidityPeriod],
     ["Revocation", report.certificateRevocationStatus],
+    ["Revocation source", report.revocationSource],
     ["Key usage", report.keyUsageValid],
     ["Algorithm policy", report.algorithmPolicyValid],
     ["Replay", report.replayCheck],
@@ -997,6 +1694,63 @@ function downloadText(filename: string, content: string) {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function unblindSignatureInBrowser(
+  blindSignatureBase64: string,
+  blindingFactorBase64: string,
+  modulusBase64: string,
+) {
+  const modulusBytes = base64ToBytes(modulusBase64);
+  const n = bytesToBigInt(modulusBytes);
+  const blindSignature = bytesToBigInt(base64ToBytes(blindSignatureBase64));
+  const blindingFactor = bytesToBigInt(base64ToBytes(blindingFactorBase64));
+  const finalSignature = (blindSignature * modInverse(blindingFactor, n)) % n;
+  return bytesToBase64(bigIntToBytes(finalSignature, modulusBytes.length));
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+function bytesToBigInt(bytes: Uint8Array): bigint {
+  let result = 0n;
+  for (const byte of bytes) {
+    result = (result << 8n) + BigInt(byte);
+  }
+  return result;
+}
+
+function bigIntToBytes(value: bigint, length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  let current = value;
+  for (let index = length - 1; index >= 0; index -= 1) {
+    bytes[index] = Number(current & 0xffn);
+    current >>= 8n;
+  }
+  return bytes;
+}
+
+function modInverse(value: bigint, modulus: bigint): bigint {
+  let t = 0n;
+  let nextT = 1n;
+  let r = modulus;
+  let nextR = value % modulus;
+  while (nextR !== 0n) {
+    const quotient = r / nextR;
+    [t, nextT] = [nextT, t - quotient * nextT];
+    [r, nextR] = [nextR, r - quotient * nextR];
+  }
+  if (r > 1n) throw new Error("Value is not invertible.");
+  return t < 0n ? t + modulus : t;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

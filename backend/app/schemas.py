@@ -21,6 +21,11 @@ class Certificate(BaseModel):
     issuedAt: str
     expiresAt: str
     status: str
+    certificateType: str = "legacy-demo"
+    certificateFingerprint: Optional[str] = None
+    userCertificatePem: Optional[str] = None
+    intermediateCertificatePem: Optional[str] = None
+    rootCertificatePem: Optional[str] = None
     caSignatureAlgorithm: Optional[str] = None
     caSignatureBase64: Optional[str] = None
 
@@ -66,6 +71,22 @@ class BlindSignatureDemoRequest(BaseModel):
     message: str
 
 
+class X509CertificateIssueRequest(BaseModel):
+    name: str
+    email: EmailStr
+    publicKeyPem: str
+
+
+class X509CertificateIssueResponse(BaseModel):
+    userCertificatePem: str
+    intermediateCertificatePem: str
+    rootCertificatePem: str
+    certificateSerialNumber: str
+    certificateFingerprint: str
+    certificateType: str = "x509-demo"
+    certificate: Certificate
+
+
 # ── V2 schemas ────────────────────────────────────────────────────────────
 
 class SigningPayloadV2(BaseModel):
@@ -77,6 +98,7 @@ class SigningPayloadV2(BaseModel):
     signerEmail: str
     certificateSerialNumber: str
     certificateFingerprint: str
+    certificateType: str = "x509-demo"
     signingPurpose: str = "approve_document"
     createdAt: str
     nonce: str
@@ -106,7 +128,12 @@ class SignedPackageV2(BaseModel):
     payloadCanonicalization: str = "JSON-canonical-sorted-keys"
     signatureAlgorithm: str = "RSA-PSS"
     signatureBase64: str
-    signerCertificate: Certificate
+    userCertificatePem: Optional[str] = None
+    intermediateCertificatePem: Optional[str] = None
+    rootCertificatePem: Optional[str] = None
+    trustedRootId: Optional[str] = None
+    timestampToken: Optional[Dict[str, Any]] = None
+    signerCertificate: Optional[Certificate] = None
     signedAtClient: Optional[str] = None
 
 
@@ -120,6 +147,7 @@ class VerificationReportV2(BaseModel):
     certificateChainValid: str
     certificateValidityPeriod: str
     certificateRevocationStatus: str
+    revocationSource: str
     keyUsageValid: str
     algorithmPolicyValid: str
     replayCheck: str

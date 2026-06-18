@@ -84,3 +84,31 @@ SecureDoc có endpoint và tab mô phỏng RSA blind signature:
 6. Verify: `s^e mod n == m`.
 
 Phần này dùng để minh họa nguyên lý chữ ký mù, chưa phải giao thức production.
+## X.509 demo certificate flow
+
+Flow chinh hien nay khong tao private key o backend. Browser dung Web Crypto de tao RSA key pair 3072-bit. Browser chi gui `publicKeyPem` len `/api/certificates/x509/issue`.
+
+Backend dung Demo Root CA va Demo Intermediate CA local de cap User Signing Certificate dang PEM X.509. User certificate co subject, issuer, serial number, validity, SubjectPublicKeyInfo, BasicConstraints CA=false, KeyUsage digitalSignature/contentCommitment, SubjectKeyIdentifier va AuthorityKeyIdentifier. CA certificates co BasicConstraints CA=true va KeyUsage keyCertSign/cRLSign.
+
+Day la demo CA local, khong phai public CA, khong co gia tri phap ly, va chua co HSM/USB token/smart card de bao ve private key production.
+
+## Blind signature token flow
+
+Chu ky so tai lieu va chu ky mu phuc vu hai bai toan khac nhau.
+
+- Chu ky so tai lieu can dinh danh nguoi ky va rang buoc nguoi ky voi noi dung tai lieu.
+- Chu ky mu dung khi can rieng tu/an danh: signer cap phep cho token da bi lam mu ma khong thay token goc.
+
+Flow moi cua tab `Chu ky mu`:
+
+1. Create token: `tokenId`, `purpose`, `createdAt`, `expiresAt`, `nonce`, `tokenVersion`.
+2. Blind token hash trong browser/demo requester.
+3. Signer chi ky `blindedMessageBase64`, khong ky raw token.
+4. Browser unblind de co final signature.
+5. Verify final signature tren token goc.
+6. Redeem token lan dau thanh cong.
+7. Redeem lan hai that bai vi token da `spent`.
+
+Purpose hop le: `anonymous_access_token`, `e_voting_demo`, `e_cash_demo`.
+
+Gioi han: educational demo only, khong phai production e-voting/e-cash, khong phai chu ky so phap ly, va khong thay the document signing flow.

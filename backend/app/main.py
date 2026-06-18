@@ -22,7 +22,6 @@ from .crypto_utils import (
     isoformat,
     normalize_hash_algorithm,
     parse_iso_datetime,
-    rsa_blind_signature_demo,
     sign_hash,
     supported_hash_algorithm_profiles,
     utc_now,
@@ -31,9 +30,9 @@ from .crypto_utils import (
 )
 from .database import SessionLocal, init_db
 from .models import AuditLog, CertificateRecord, CertificateRevocation
+from .routes_blind import router as blind_router
 from .routes_v2 import router as v2_router
 from .schemas import (
-    BlindSignatureDemoRequest,
     CaPublicKeyResponse,
     Certificate,
     KeyGenerateRequest,
@@ -42,6 +41,8 @@ from .schemas import (
     SignedPackage,
     VerifyResponse,
 )
+from .x509_utils import ensure_demo_x509_ca
+from .blind_signature import ensure_blind_signer_key
 
 app = FastAPI(title="SecureDoc API", version="0.1.0")
 
@@ -54,12 +55,15 @@ app.add_middleware(
 )
 
 app.include_router(v2_router)
+app.include_router(blind_router)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
     ensure_demo_ca_keys()
+    ensure_demo_x509_ca()
+    ensure_blind_signer_key()
 
 
 def get_db():
@@ -128,7 +132,11 @@ def get_hash_algorithms():
 @app.post(
     "/api/keys/generate",
     response_model=KeyGenerateResponse,
-    summary="Generate RSA key pair (demo - returns private key to client)",
+    summary="[LEGACY DEBUG ONLY] Generate RSA key pair and legacy-demo JSON certificate",
+    description=(
+        "Legacy/debug endpoint. It creates a private key in the backend and returns it to the browser. "
+        "The main flow should generate keys in the browser and call /api/certificates/x509/issue with only publicKeyPem."
+    ),
 )
 def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
     private_key_pem, public_key_pem = generate_key_pair()
@@ -462,10 +470,4 @@ def revoke_certificate(payload: RevokeCertificateRequest, db: Session = Depends(
     db.commit()
     return {"certificate": certificate, "reason": payload.reason, "revokedAt": isoformat(now)}
 
-
-@app.post("/api/blind-signature/demo")
-def blind_signature_demo(payload: BlindSignatureDemoRequest):
-    if not payload.message.strip():
-        raise HTTPException(status_code=400, detail="Message must not be empty")
-    return rsa_blind_signature_demo(payload.message)
 
