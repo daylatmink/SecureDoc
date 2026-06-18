@@ -20,6 +20,7 @@ from .crypto_utils import (
     compute_audit_hash,
     compute_certificate_fingerprint,
     get_public_key_size,
+    hash_bytes,
     isoformat,
     normalize_hash_algorithm,
     parse_iso_datetime,
@@ -43,6 +44,20 @@ from .schemas import (
     SigningPayloadV2,
     SigningRequestCreateV2,
     SigningRequestResponseV2,
+    X509CertificateIssueRequest,
+    X509CertificateIssueResponse,
+)
+from .x509_utils import (
+    TRUSTED_DEMO_ROOT_ID,
+    X509_CERTIFICATE_TYPE,
+    build_signed_demo_crl,
+    ensure_demo_x509_ca,
+    issue_user_x509_certificate,
+    issue_timestamp_token,
+    parse_user_x509_details,
+    verify_demo_x509_chain,
+    verify_signed_demo_crl,
+    verify_timestamp_token,
 )
 
 router = APIRouter()
@@ -108,7 +123,7 @@ def _step(steps: list[dict[str, str]], name: str, status: str, message: str) -> 
 
 
 def _record_certificate_payload(record: CertificateRecord) -> dict[str, Any]:
-    return {
+    payload = {
         "serialNumber": record.serial_number,
         "ownerName": record.owner_name,
         "email": record.email,
@@ -116,20 +131,135 @@ def _record_certificate_payload(record: CertificateRecord) -> dict[str, Any]:
         "issuer": record.issuer,
         "issuedAt": _db_iso(record.issued_at),
         "expiresAt": _db_iso(record.expires_at),
+        "status": record.status,
+        "certificateType": record.certificate_type or "legacy-demo",
     }
+    if (record.certificate_type or "legacy-demo") == X509_CERTIFICATE_TYPE:
+        payload.update(
+            {
+                "certificateFingerprint": record.fingerprint_sha256,
+                "userCertificatePem": record.user_certificate_pem,
+                "intermediateCertificatePem": record.intermediate_certificate_pem,
+                "rootCertificatePem": record.root_certificate_pem,
+            }
+        )
+    return payload
 
 
 def _record_fingerprint(record: CertificateRecord) -> str:
+    if (record.certificate_type or "legacy-demo") == X509_CERTIFICATE_TYPE and record.fingerprint_sha256:
+        return record.fingerprint_sha256
     return compute_certificate_fingerprint(_record_certificate_payload(record))
 
 
+def _certificate_type(cert: Certificate | None, record: CertificateRecord | None = None) -> str:
+    if cert and cert.certificateType:
+        return cert.certificateType
+    if record and record.certificate_type:
+        return record.certificate_type
+    return "legacy-demo"
+
+
+def _root_pem_from_package(body: SignedPackageV2) -> str | None:
+    if body.rootCertificatePem:
+        return body.rootCertificatePem
+    if body.trustedRootId == TRUSTED_DEMO_ROOT_ID:
+        _, root_pem = ensure_demo_x509_ca()
+        return root_pem
+    return None
+
+
+def _certificate_from_package(body: SignedPackageV2) -> Certificate:
+    if body.signerCertificate:
+        cert = body.signerCertificate.model_copy(deep=True)
+        if body.userCertificatePem:
+            cert.userCertificatePem = body.userCertificatePem
+        if body.intermediateCertificatePem:
+            cert.intermediateCertificatePem = body.intermediateCertificatePem
+        root_pem = _root_pem_from_package(body)
+        if root_pem:
+            cert.rootCertificatePem = root_pem
+        return cert
+
+    if not body.userCertificatePem or not body.intermediateCertificatePem:
+        raise ValueError("X.509 signed package requires userCertificatePem and intermediateCertificatePem")
+    root_pem = _root_pem_from_package(body)
+    if not root_pem:
+        raise ValueError("X.509 signed package requires rootCertificatePem or trustedRootId")
+
+    details = parse_user_x509_details(body.userCertificatePem)
+    return Certificate(
+        serialNumber=details.serial_number,
+        ownerName=details.owner_name,
+        email=details.email,
+        publicKeyPem=details.public_key_pem,
+        issuer=details.issuer,
+        issuedAt=isoformat(details.issued_at),
+        expiresAt=isoformat(details.expires_at),
+        status="valid",
+        certificateType=X509_CERTIFICATE_TYPE,
+        certificateFingerprint=details.fingerprint_sha256,
+        userCertificatePem=body.userCertificatePem,
+        intermediateCertificatePem=body.intermediateCertificatePem,
+        rootCertificatePem=root_pem,
+    )
+
+
+def _certificate_fingerprint(cert: Certificate) -> str:
+    if cert.certificateType == X509_CERTIFICATE_TYPE:
+        details = parse_user_x509_details(cert.userCertificatePem or "")
+        return details.fingerprint_sha256
+    return compute_certificate_fingerprint(cert.model_dump())
+
+
+def _x509_pems(cert: Certificate) -> tuple[str, str, str]:
+    if not cert.userCertificatePem or not cert.intermediateCertificatePem or not cert.rootCertificatePem:
+        raise ValueError("X.509 certificate chain PEMs are required")
+    return cert.userCertificatePem, cert.intermediateCertificatePem, cert.rootCertificatePem
+
+
+def _verify_certificate_trust(cert: Certificate) -> tuple[bool, str]:
+    if cert.certificateType == X509_CERTIFICATE_TYPE:
+        try:
+            return verify_demo_x509_chain(*_x509_pems(cert))
+        except ValueError as exc:
+            return False, str(exc)
+    if verify_certificate_signature(cert.model_dump()):
+        return True, "Certificate is signed by SecureDoc legacy-demo CA."
+    return False, "Certificate is not signed by SecureDoc Demo CA."
+
+
 def _certificate_matches_record(cert: Certificate, record: CertificateRecord) -> bool:
+    certificate_type = _certificate_type(cert, record)
+    if certificate_type != (record.certificate_type or "legacy-demo"):
+        return False
     if cert.serialNumber != record.serial_number:
         return False
     if cert.ownerName != record.owner_name or cert.email != record.email:
         return False
     if cert.publicKeyPem != record.public_key_pem or cert.issuer != record.issuer:
         return False
+    if certificate_type == X509_CERTIFICATE_TYPE:
+        try:
+            details = parse_user_x509_details(cert.userCertificatePem or "")
+            issued = _db_time(parse_iso_datetime(cert.issuedAt))
+            expires = _db_time(parse_iso_datetime(cert.expiresAt))
+        except ValueError:
+            return False
+        return (
+            details.serial_number == record.serial_number
+            and details.owner_name == record.owner_name
+            and details.email == record.email
+            and details.public_key_pem == record.public_key_pem
+            and details.issuer == record.issuer
+            and details.fingerprint_sha256 == record.fingerprint_sha256
+            and cert.certificateFingerprint == record.fingerprint_sha256
+            and cert.userCertificatePem == record.user_certificate_pem
+            and cert.intermediateCertificatePem == record.intermediate_certificate_pem
+            and cert.rootCertificatePem == record.root_certificate_pem
+            and issued == record.issued_at
+            and expires == record.expires_at
+        )
     try:
         issued = _db_time(parse_iso_datetime(cert.issuedAt))
         expires = _db_time(parse_iso_datetime(cert.expiresAt))
@@ -166,6 +296,7 @@ def _base_report(steps: list[dict[str, str]], warnings: list[str], decision: str
         "certificateChainValid": "not_available",
         "certificateValidityPeriod": "not_checked",
         "certificateRevocationStatus": "not_checked",
+        "revocationSource": "not_checked",
         "keyUsageValid": "not_available",
         "algorithmPolicyValid": "not_checked",
         "replayCheck": "not_checked",
@@ -205,6 +336,14 @@ def _verification_response(
     }
 
 
+def _signature_message_imprint(signature_base64: str) -> str:
+    try:
+        signature_bytes = base64.b64decode(signature_base64)
+    except (ValueError, TypeError):
+        signature_bytes = signature_base64.encode("utf-8")
+    return hash_bytes(signature_bytes, "SHA-256")
+
+
 def _reject_submit(
     db: Session,
     message: str,
@@ -222,6 +361,43 @@ def _reject_submit(
     )
     db.commit()
     raise HTTPException(status_code=400, detail=message)
+
+
+@router.post("/api/certificates/x509/issue", response_model=X509CertificateIssueResponse)
+def issue_x509_certificate(body: X509CertificateIssueRequest, db: Session = Depends(get_db)):
+    try:
+        issued = issue_user_x509_certificate(body.name, body.email, body.publicKeyPem)
+        certificate = issued["certificate"]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    record = CertificateRecord(
+        serial_number=certificate["serialNumber"],
+        owner_name=certificate["ownerName"],
+        email=certificate["email"],
+        public_key_pem=certificate["publicKeyPem"],
+        issuer=certificate["issuer"],
+        issued_at=_db_time(parse_iso_datetime(certificate["issuedAt"])),
+        expires_at=_db_time(parse_iso_datetime(certificate["expiresAt"])),
+        status=certificate["status"],
+        certificate_type=X509_CERTIFICATE_TYPE,
+        fingerprint_sha256=certificate["certificateFingerprint"],
+        key_size_bits=get_public_key_size(certificate["publicKeyPem"]),
+        user_certificate_pem=certificate["userCertificatePem"],
+        intermediate_certificate_pem=certificate["intermediateCertificatePem"],
+        root_certificate_pem=certificate["rootCertificatePem"],
+    )
+    db.add(record)
+    _log_audit(
+        db,
+        "certificate_issued",
+        certificate["email"],
+        "success",
+        details="x509-demo certificate issued from browser-generated public key",
+        certificate_serial=certificate["serialNumber"],
+    )
+    db.commit()
+    return issued
 
 
 @router.post("/api/sign/v2/prepare", response_model=SigningRequestResponseV2)
@@ -256,6 +432,8 @@ def prepare_signing_request(body: SigningRequestCreateV2, db: Session = Depends(
     warnings: list[str] = []
     if (record.certificate_type or "legacy-demo") == "legacy-demo":
         warnings.append("Certificate is a legacy-demo JSON certificate, not X.509.")
+    else:
+        warnings.append("X.509 certificate is issued by SecureDoc local demo CA, not a public CA.")
     warnings.append("SecureDoc Demo CA is local demo trust only.")
 
     now = utc_now()
@@ -270,6 +448,7 @@ def prepare_signing_request(body: SigningRequestCreateV2, db: Session = Depends(
         signerEmail=record.email,
         certificateSerialNumber=record.serial_number,
         certificateFingerprint=fingerprint,
+        certificateType=record.certificate_type or "legacy-demo",
         signingPurpose=body.signingPurpose,
         createdAt=isoformat(now),
         nonce=nonce,
@@ -316,7 +495,10 @@ def prepare_signing_request(body: SigningRequestCreateV2, db: Session = Depends(
 @router.post("/api/sign/v2/submit")
 def submit_signature(body: SignedPackageV2, db: Session = Depends(get_db)):
     payload = body.signingPayload
-    cert = body.signerCertificate
+    try:
+        cert = _certificate_from_package(body)
+    except ValueError as exc:
+        _reject_submit(db, str(exc), payload, None)
     warnings: list[str] = []
     steps: list[dict[str, str]] = []
 
@@ -368,15 +550,22 @@ def submit_signature(body: SignedPackageV2, db: Session = Depends(get_db)):
 
     if cert.serialNumber != payload.certificateSerialNumber:
         _reject_submit(db, "Certificate serial does not match payload", payload, cert)
+    if cert.certificateType != payload.certificateType:
+        _reject_submit(db, "Certificate type does not match payload", payload, cert)
     if cert.ownerName != payload.signerName or cert.email != payload.signerEmail:
         _reject_submit(db, "Certificate signer identity does not match payload", payload, cert)
-    if compute_certificate_fingerprint(cert.model_dump()) != payload.certificateFingerprint:
+    try:
+        certificate_fingerprint = _certificate_fingerprint(cert)
+    except ValueError as exc:
+        _reject_submit(db, str(exc), payload, cert)
+    if certificate_fingerprint != payload.certificateFingerprint:
         _reject_submit(db, "Certificate fingerprint does not match payload", payload, cert)
     _step(steps, "Payload-certificate consistency", "passed", "Signer and certificate fields match.")
 
-    if not verify_certificate_signature(cert.model_dump()):
-        _reject_submit(db, "Certificate is not signed by SecureDoc Demo CA", payload, cert)
-    _step(steps, "Certificate trust", "passed", "Certificate is signed by SecureDoc Demo CA.")
+    trust_ok, trust_message = _verify_certificate_trust(cert)
+    if not trust_ok:
+        _reject_submit(db, trust_message, payload, cert)
+    _step(steps, "Certificate trust", "passed", trust_message)
 
     record = db.get(CertificateRecord, cert.serialNumber)
     if not record:
@@ -415,9 +604,32 @@ def submit_signature(body: SignedPackageV2, db: Session = Depends(get_db)):
     request.status = "completed"
     request.completed_at = _db_time(now)
 
-    if (record.certificate_type or "legacy-demo") == "legacy-demo":
+    certificate_type = _certificate_type(cert, record)
+    if certificate_type == "legacy-demo":
         warnings.append("Legacy-demo JSON certificate is not X.509.")
-    warnings.append("No real CA chain, OCSP/CRL, TSA, HSM, PAdES, XAdES, or CAdES is used.")
+    else:
+        warnings.append("X.509 demo chain is local trust only, not public CA trust.")
+    warnings.append("No public CA validation, OCSP/CRL, production TSA, HSM, PAdES, XAdES, or CAdES is used.")
+
+    timestamp_token = body.timestampToken
+    timestamp_imprint = _signature_message_imprint(body.signatureBase64)
+    if timestamp_token:
+        timestamp_ok, timestamp_message = verify_timestamp_token(timestamp_token, timestamp_imprint)
+        if not timestamp_ok:
+            _reject_submit(db, timestamp_message, payload, cert)
+        _step(steps, "Timestamp token", "passed", timestamp_message)
+    else:
+        timestamp_token = issue_timestamp_token(timestamp_imprint, "SHA-256")
+        _log_audit(
+            db,
+            "timestamp_issued",
+            payload.signerEmail,
+            "success",
+            details=f"serialNumber={timestamp_token['serialNumber']}",
+            document_hash=payload.documentHash.lower(),
+            certificate_serial=cert.serialNumber,
+        )
+        _step(steps, "Timestamp token", "passed", "Demo TSA token issued for signature hash.")
 
     report = _base_report(steps, warnings, "valid")
     report.update(
@@ -427,17 +639,25 @@ def submit_signature(body: SignedPackageV2, db: Session = Depends(get_db)):
             "signatureValid": "passed",
             "certificateParsed": "passed",
             "certificateTrusted": "passed",
-            "certificateType": record.certificate_type or "legacy-demo",
+            "certificateType": certificate_type,
+            "certificateChainValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
             "certificateValidityPeriod": "passed",
             "certificateRevocationStatus": "valid",
-            "keyUsageValid": "not_available",
+            "revocationSource": "server-db",
+            "keyUsageValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
             "algorithmPolicyValid": "passed",
             "replayCheck": "passed",
-            "timestampStatus": "client-declared-time" if body.signedAtClient else "not_available",
+            "timestampStatus": "demo-tsa-valid",
         }
     )
 
     package_dict = body.model_dump()
+    package_dict["userCertificatePem"] = cert.userCertificatePem
+    package_dict["intermediateCertificatePem"] = cert.intermediateCertificatePem
+    package_dict["rootCertificatePem"] = cert.rootCertificatePem
+    package_dict["trustedRootId"] = body.trustedRootId or TRUSTED_DEMO_ROOT_ID
+    package_dict["timestampToken"] = timestamp_token
+    package_dict["signerCertificate"] = cert.model_dump()
     package_dict["receivedAtServer"] = isoformat(now)
     package_dict["verificationReport"] = report
 
@@ -522,7 +742,15 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Malformed signedPackage") from exc
 
     payload = package.signingPayload
-    cert = package.signerCertificate
+    try:
+        cert = _certificate_from_package(package)
+    except ValueError as exc:
+        _step(steps, "Certificate parsing", "failed", str(exc))
+        report = _base_report(steps, warnings, "invalid")
+        report.update({"certificateParsed": "failed"})
+        _log_audit(db, "signature_verified", payload.signerEmail, "failed", details=str(exc), document_hash=payload.documentHash)
+        db.commit()
+        return _verification_response(False, "malformed certificate", report, document_hash, payload, None, package.signedAtClient)
     signed_at = package.signedAtClient
 
     if package.packageVersion != "2.0":
@@ -591,7 +819,27 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
             cert,
             signed_at,
         )
-    if compute_certificate_fingerprint(cert.model_dump()) != payload.certificateFingerprint:
+    if cert.certificateType != payload.certificateType:
+        _step(steps, "Signing payload", "failed", "Certificate type differs from payload.")
+        return fail(
+            "certificate type mismatch",
+            {"documentIntegrity": "passed", "signingPayloadValid": "failed", "algorithmPolicyValid": "passed"},
+            payload,
+            cert,
+            signed_at,
+        )
+    try:
+        certificate_fingerprint = _certificate_fingerprint(cert)
+    except ValueError as exc:
+        _step(steps, "Signing payload", "failed", str(exc))
+        return fail(
+            "certificate fingerprint missing",
+            {"documentIntegrity": "passed", "signingPayloadValid": "failed", "algorithmPolicyValid": "passed"},
+            payload,
+            cert,
+            signed_at,
+        )
+    if certificate_fingerprint != payload.certificateFingerprint:
         _step(steps, "Signing payload", "failed", "Certificate fingerprint differs from payload.")
         return fail(
             "certificate fingerprint mismatch",
@@ -602,9 +850,16 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         )
     _step(steps, "Signing payload", "passed", "Payload fields are consistent with certificate.")
 
-    _step(steps, "Certificate parsing", "passed", "Certificate JSON parsed.")
-    if not verify_certificate_signature(cert.model_dump()):
-        _step(steps, "Certificate trust", "failed", "Certificate is not signed by SecureDoc Demo CA.")
+    certificate_type = _certificate_type(cert)
+    _step(
+        steps,
+        "Certificate parsing",
+        "passed",
+        "X.509 certificate PEM parsed." if certificate_type == X509_CERTIFICATE_TYPE else "Legacy certificate JSON parsed.",
+    )
+    trust_ok, trust_message = _verify_certificate_trust(cert)
+    if not trust_ok:
+        _step(steps, "Certificate trust", "failed", trust_message)
         return fail(
             "certificate not trusted",
             {
@@ -612,13 +867,16 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "signingPayloadValid": "passed",
                 "certificateParsed": "passed",
                 "certificateTrusted": "failed",
+                "certificateType": certificate_type,
+                "certificateChainValid": "failed",
+                "keyUsageValid": "failed" if "KeyUsage" in trust_message else "not_available",
                 "algorithmPolicyValid": "passed",
             },
             payload,
             cert,
             signed_at,
         )
-    _step(steps, "Certificate trust", "passed", "Certificate is signed by SecureDoc Demo CA.")
+    _step(steps, "Certificate trust", "passed", trust_message)
     warnings.append("SecureDoc Demo CA is local demo trust only.")
 
     record = db.get(CertificateRecord, cert.serialNumber)
@@ -632,6 +890,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateParsed": "passed",
                 "certificateTrusted": "failed",
                 "certificateRevocationStatus": "unknown",
+                "revocationSource": "server-db",
                 "algorithmPolicyValid": "passed",
             },
             payload,
@@ -639,7 +898,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
             signed_at,
         )
 
-    certificate_type = record.certificate_type or "legacy-demo"
+    certificate_type = _certificate_type(cert, record)
     if certificate_type == "legacy-demo":
         warnings.append("Certificate is a legacy-demo JSON certificate, not X.509.")
     if not _certificate_matches_record(cert, record):
@@ -691,6 +950,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
                 "certificateRevocationStatus": "revoked",
+                "revocationSource": "server-db",
                 "algorithmPolicyValid": "passed",
             },
             payload,
@@ -712,6 +972,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
                 "certificateRevocationStatus": "valid",
+                "revocationSource": "server-db",
                 "certificateValidityPeriod": "failed",
                 "algorithmPolicyValid": "passed",
             },
@@ -730,6 +991,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
                 "certificateRevocationStatus": "valid",
+                "revocationSource": "server-db",
                 "certificateValidityPeriod": "failed",
                 "algorithmPolicyValid": "passed",
             },
@@ -751,6 +1013,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
                 "certificateRevocationStatus": "valid",
+                "revocationSource": "server-db",
                 "certificateValidityPeriod": "passed",
                 "keyUsageValid": "failed",
                 "algorithmPolicyValid": "passed",
@@ -781,9 +1044,11 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateParsed": "passed",
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
+                "certificateChainValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
                 "certificateRevocationStatus": "valid",
+                "revocationSource": "server-db",
                 "certificateValidityPeriod": "passed",
-                "keyUsageValid": "not_available",
+                "keyUsageValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
                 "algorithmPolicyValid": "passed",
                 "replayCheck": replay_status,
             },
@@ -794,7 +1059,40 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
     _step(steps, "Signature verification", "passed", "RSA-PSS signature is valid over canonical payload.")
 
     timestamp_status = "not_available"
-    if signed_at:
+    if package.timestampToken:
+        timestamp_ok, timestamp_message = verify_timestamp_token(
+            package.timestampToken,
+            _signature_message_imprint(package.signatureBase64),
+        )
+        if timestamp_ok:
+            timestamp_status = "demo-tsa-valid"
+            _step(steps, "Timestamp token", "passed", timestamp_message)
+        else:
+            timestamp_status = "failed"
+            _step(steps, "Timestamp token", "failed", timestamp_message)
+            return fail(
+                "invalid timestamp token",
+                {
+                    "documentIntegrity": "passed",
+                    "signingPayloadValid": "passed",
+                    "signatureValid": "passed",
+                    "certificateParsed": "passed",
+                    "certificateTrusted": "passed",
+                    "certificateType": certificate_type,
+                    "certificateChainValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
+                    "certificateValidityPeriod": "passed",
+                    "certificateRevocationStatus": "valid",
+                    "revocationSource": "server-db",
+                    "keyUsageValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
+                    "algorithmPolicyValid": "passed",
+                    "replayCheck": replay_status,
+                    "timestampStatus": timestamp_status,
+                },
+                payload,
+                cert,
+                signed_at,
+            )
+    elif signed_at:
         try:
             parse_iso_datetime(signed_at)
             timestamp_status = "client-declared-time"
@@ -811,9 +1109,11 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
             "certificateParsed": "passed",
             "certificateTrusted": "passed",
             "certificateType": certificate_type,
+            "certificateChainValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
             "certificateValidityPeriod": "passed",
             "certificateRevocationStatus": "valid",
-            "keyUsageValid": "not_available",
+            "revocationSource": "server-db",
+            "keyUsageValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
             "algorithmPolicyValid": "passed",
             "replayCheck": replay_status,
             "timestampStatus": timestamp_status,
@@ -903,6 +1203,61 @@ def revocation_list(db: Session = Depends(get_db)):
         "revokedCertificates": items,
         "totalRevoked": len(items),
     }
+
+
+@router.get("/api/certificates/crl")
+def certificate_crl(db: Session = Depends(get_db)):
+    revoked_records = db.query(CertificateRecord).filter_by(status="revoked").all()
+    revoked_certificates = []
+    for record in revoked_records:
+        revocation = _latest_revocation(db, record.serial_number)
+        revoked_certificates.append(
+            {
+                "serialNumber": record.serial_number,
+                "certificateFingerprint": record.fingerprint_sha256,
+                "reason": revocation.reason if revocation else "unspecified",
+                "revokedAt": _db_iso(revocation.revoked_at) if revocation else None,
+            }
+        )
+    crl = build_signed_demo_crl(revoked_certificates)
+    valid, message = verify_signed_demo_crl(crl)
+    _log_audit(
+        db,
+        "crl_generated",
+        None,
+        "success" if valid else "failed",
+        details=message,
+    )
+    db.commit()
+    return crl
+
+
+@router.get("/api/audit/verify-chain")
+def verify_audit_chain(db: Session = Depends(get_db)):
+    events = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+    previous_hash = None
+    for index, event in enumerate(events, start=1):
+        event_json = build_audit_event_json(
+            event.event_id,
+            event.event_type,
+            event.actor,
+            event.result,
+            event.details,
+            _db_iso(event.created_at),
+        )
+        expected_hash = compute_audit_hash(event_json, previous_hash)
+        if event.previous_log_hash != previous_hash or event.current_log_hash != expected_hash:
+            return {
+                "valid": False,
+                "totalEvents": len(events),
+                "brokenAt": {
+                    "index": index,
+                    "id": event.id,
+                    "eventId": event.event_id,
+                },
+            }
+        previous_hash = event.current_log_hash
+    return {"valid": True, "totalEvents": len(events), "brokenAt": None}
 
 
 @router.get("/api/algorithm-policy")

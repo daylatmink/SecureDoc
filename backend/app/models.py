@@ -1,5 +1,7 @@
 """SQLAlchemy models for SecureDoc — legacy + v2 tables."""
 
+import json
+
 from sqlalchemy import Column, DateTime, Integer, String, Text
 
 from .database import Base
@@ -20,6 +22,9 @@ class CertificateRecord(Base):
     certificate_type = Column(String, nullable=False, default="legacy-demo")
     fingerprint_sha256 = Column(String, nullable=True)
     key_size_bits = Column(Integer, nullable=True)
+    user_certificate_pem = Column(Text, nullable=True)
+    intermediate_certificate_pem = Column(Text, nullable=True)
+    root_certificate_pem = Column(Text, nullable=True)
 
 
 class SigningRequest(Base):
@@ -92,3 +97,28 @@ class UsedNonce(Base):
     nonce = Column(String, primary_key=True, index=True)
     request_id = Column(String, nullable=False)
     used_at = Column(DateTime, nullable=False)
+
+
+class BlindSignatureSession(Base):
+    __tablename__ = "blind_signature_sessions"
+
+    session_id = Column(String, primary_key=True, index=True)
+    token_id = Column(String, nullable=False, unique=True, index=True)
+    purpose = Column(String, nullable=False, index=True)
+    token_json = Column(Text, nullable=False)
+    token_hash = Column(String, nullable=False)
+    blinded_message_base64 = Column(Text, nullable=False)
+    blind_signature_base64 = Column(Text, nullable=True)
+    final_signature_base64 = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="created")
+    created_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    spent_at = Column(DateTime, nullable=True)
+
+    @staticmethod
+    def dumps_token(token: dict) -> str:
+        return json.dumps(token, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @property
+    def token_json_as_dict(self) -> dict:
+        return json.loads(self.token_json)

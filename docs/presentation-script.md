@@ -56,13 +56,20 @@ Các endpoint/API chính:
 
 ```text
 POST /api/documents/hash
-POST /api/keys/generate
+POST /api/certificates/x509/issue
 GET  /api/ca/public-key
-POST /api/sign
-POST /api/verify
-POST /api/certificates/revoke
-POST /api/blind-signature/demo
+POST /api/sign/v2/prepare
+POST /api/sign/v2/submit
+POST /api/verify/v2
+POST /api/certificates/revoke/v2
+POST /api/blind-signature/sessions
+POST /api/blind-signature/sign
+POST /api/blind-signature/verify
+POST /api/blind-signature/redeem
+GET  /api/blind-signature/sessions/{sessionId}
 ```
+
+Cap nhat flow chinh: browser tao key pair, chi gui `publicKeyPem` len `/api/certificates/x509/issue`, nhan `x509-demo` certificate PEM, sau do ky v2 o client. `/api/keys/generate` chi con la legacy/debug only; `/api/sign` la insecure legacy demo vi nhan `privateKeyPem`.
 
 ## 3. Kịch bản tổng thể của hệ thống
 

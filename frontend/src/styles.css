@@ -167,6 +167,10 @@ main {
   max-width: 980px;
 }
 
+.documentsPage {
+  max-width: 1180px;
+}
+
 .heroPanel {
   align-items: end;
   background: #ffffff;
@@ -225,6 +229,111 @@ p {
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.flowStrip {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.flowStep {
+  background: #ffffff;
+  border: 1px solid #d6e1e4;
+  border-radius: 10px;
+  display: grid;
+  gap: 6px;
+  min-height: 78px;
+  padding: 12px;
+}
+
+.flowStep span {
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.flowStep strong {
+  color: #17202a;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.documentTableWrap {
+  background: #ffffff;
+  border: 1px solid #d6e1e4;
+  border-radius: 12px;
+  overflow-x: auto;
+}
+
+.documentTable {
+  border-collapse: collapse;
+  min-width: 920px;
+  width: 100%;
+}
+
+.documentTable th,
+.documentTable td {
+  border-bottom: 1px solid #e3ebee;
+  color: #17202a;
+  font-size: 13px;
+  padding: 12px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.documentTable th {
+  background: #f8fbfc;
+  color: #4b5f6d;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.documentTable tr:last-child td {
+  border-bottom: 0;
+}
+
+.tableActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workflowPanels {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.statusBadge {
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  padding: 7px 9px;
+  white-space: nowrap;
+}
+
+.statusBadge.draft {
+  background: #eef4f5;
+  color: #4b5f6d;
+}
+
+.statusBadge.pending_signature {
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.statusBadge.signed {
+  background: #f0fdf8;
+  color: #047857;
+}
+
+.statusBadge.verification_failed,
+.statusBadge.certificate_revoked {
+  background: #fff5f5;
+  color: #b91c1c;
 }
 
 .stepCard,
@@ -561,12 +670,10 @@ pre {
   font-weight: 750;
 }
 
-.warningBanner {
+.warningBanner,
+.successBanner {
   align-items: flex-start;
-  background: #fff7ed;
-  border: 1px solid #fed7aa;
   border-radius: 10px;
-  color: #9a3412;
   display: flex;
   font-size: 13px;
   font-weight: 700;
@@ -575,13 +682,61 @@ pre {
   padding: 11px 12px;
 }
 
-.warningBanner svg {
+.warningBanner {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #9a3412;
+}
+
+.successBanner {
+  background: #f0fdf8;
+  border: 1px solid #86efac;
+  color: #047857;
+}
+
+.warningBanner svg,
+.successBanner svg {
   flex: 0 0 auto;
   margin-top: 1px;
 }
 
 .reviewPanel h3 {
   font-size: 18px;
+}
+
+.pinPanel {
+  align-items: end;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 280px) auto;
+}
+
+.visualStampPanel {
+  border-top: 1px solid #e3ebee;
+  display: grid;
+  gap: 14px;
+  padding-top: 16px;
+}
+
+.visualStamp {
+  background: #f8fbfc;
+  border: 2px solid #0f766e;
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  max-width: 460px;
+  padding: 14px;
+}
+
+.visualStamp strong {
+  color: #0f766e;
+  font-size: 15px;
+}
+
+.visualStamp span {
+  color: #253244;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .reportPanel {
@@ -661,6 +816,14 @@ pre {
   .metricGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .flowStrip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workflowPanels {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 720px) {
@@ -674,6 +837,7 @@ pre {
 
   .navList,
   .workflowGrid,
+  .flowStrip,
   .metricGrid,
   .formGrid,
   .heroPanel {
@@ -706,6 +870,10 @@ pre {
   }
 
   .reportGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .pinPanel {
     grid-template-columns: 1fr;
   }
 }
