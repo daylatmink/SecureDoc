@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from .auth_utils import create_signing_email_otp, verify_enabled_totp_for_email, verify_signing_email_otp
 from .crypto_utils import (
     ALGORITHM_POLICY,
     ALLOWED_SIGNING_PURPOSES,
@@ -41,12 +42,16 @@ from .schemas import (
     Certificate,
     RevokeBySerialRequest,
     SignedPackageV2,
+    SigningConfirmRequest,
+    SigningConfirmResponse,
+    SigningOtpRequestResponse,
     SigningPayloadV2,
     SigningRequestCreateV2,
     SigningRequestResponseV2,
     X509CertificateIssueRequest,
     X509CertificateIssueResponse,
 )
+from .routes_auth import _send_otp_email
 from .security import AUDITOR, CA_OFFICER, SIGNER, VERIFIER, require_roles
 from .x509_utils import (
     TRUSTED_DEMO_ROOT_ID,
@@ -64,6 +69,7 @@ from .x509_utils import (
 router = APIRouter()
 
 CANONICALIZATION_METHOD = "JSON-canonical-sorted-keys"
+CONFIRMED_SIGNING_REQUEST_STATUSES = {"mfa_confirmed", "completed"}
 
 
 def get_db():
@@ -294,6 +300,8 @@ def _base_report(steps: list[dict[str, str]], warnings: list[str], decision: str
         "revocationValid": False,
         "timestampValid": False,
         "serverAccepted": False,
+        "signingRequestConfirmed": False,
+        "confirmationMethod": None,
         "legalReady": False,
         "documentIntegrity": "not_checked",
         "signingPayloadValid": "not_checked",
@@ -370,6 +378,42 @@ def _reject_submit(
     )
     db.commit()
     raise HTTPException(status_code=400, detail=message)
+
+
+def _actor_email(actor: dict[str, str]) -> str:
+    return actor["user"].strip().lower()
+
+
+def _require_signing_request_owner(request: SigningRequest, actor: dict[str, str]) -> None:
+    if _actor_email(actor) != request.signer_email.strip().lower():
+        raise HTTPException(status_code=403, detail="Authenticated signer does not own this signing request")
+
+
+def _request_context_matches_payload(request: SigningRequest, payload: SigningPayloadV2, hash_algorithm: str) -> bool:
+    expected = {
+        "document_name": payload.documentName,
+        "document_hash": payload.documentHash.lower(),
+        "hash_algorithm": hash_algorithm,
+        "signer_name": payload.signerName,
+        "signer_email": payload.signerEmail,
+        "certificate_serial": payload.certificateSerialNumber,
+        "signing_purpose": payload.signingPurpose,
+        "nonce": payload.nonce,
+    }
+    return all(getattr(request, attr) == expected_value for attr, expected_value in expected.items())
+
+
+def _confirmation_state(
+    db: Session,
+    payload: SigningPayloadV2,
+    hash_algorithm: str,
+) -> tuple[SigningRequest | None, bool, str | None, bool]:
+    request = db.get(SigningRequest, payload.requestId)
+    if not request:
+        return None, False, None, False
+    context_matches = _request_context_matches_payload(request, payload, hash_algorithm)
+    confirmed = context_matches and request.status in CONFIRMED_SIGNING_REQUEST_STATUSES
+    return request, confirmed, request.confirmation_method, context_matches
 
 
 @router.post("/api/certificates/x509/issue", response_model=X509CertificateIssueResponse)
@@ -509,6 +553,116 @@ def prepare_signing_request(
     )
 
 
+@router.post("/api/v2/signing-requests/{request_id}/otp/request", response_model=SigningOtpRequestResponse)
+def request_signing_email_otp(
+    request_id: str,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    request = db.get(SigningRequest, request_id)
+    if not request:
+        raise HTTPException(status_code=404, detail="Signing request not found")
+    _require_signing_request_owner(request, actor)
+    if request.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Signing request is {request.status}")
+
+    token, otp = create_signing_email_otp(
+        db,
+        email=request.signer_email,
+        signing_request_id=request.request_id,
+        document_hash=request.document_hash,
+        certificate_serial=request.certificate_serial,
+        signing_purpose=request.signing_purpose,
+        nonce=request.nonce,
+    )
+    delivery = _send_otp_email(token.email, "SIGNING_CONFIRMATION", otp)
+    _log_audit(
+        db,
+        "signing_confirmation_otp_requested",
+        request.signer_email,
+        "success",
+        details=f"requestId={request.request_id}",
+        document_hash=request.document_hash,
+        certificate_serial=request.certificate_serial,
+    )
+    db.commit()
+    return {
+        "otpId": token.id,
+        "requestId": request.request_id,
+        "email": token.email,
+        "expiresAt": token.expires_at.isoformat(),
+        "delivery": delivery,
+        "warning": "OTP is bound to this signing request and is not returned by this API.",
+    }
+
+
+@router.post("/api/v2/signing-requests/{request_id}/confirm", response_model=SigningConfirmResponse)
+def confirm_signing_request(
+    request_id: str,
+    body: SigningConfirmRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    request = db.get(SigningRequest, request_id)
+    if not request:
+        raise HTTPException(status_code=404, detail="Signing request not found")
+    _require_signing_request_owner(request, actor)
+    if request.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Signing request is {request.status}")
+
+    method = body.method.strip().upper()
+    if method == "EMAIL_OTP":
+        ok, message = verify_signing_email_otp(
+            db,
+            email=request.signer_email,
+            signing_request_id=request.request_id,
+            document_hash=request.document_hash,
+            certificate_serial=request.certificate_serial,
+            signing_purpose=request.signing_purpose,
+            nonce=request.nonce,
+            otp=body.code,
+        )
+    elif method == "TOTP":
+        ok, message = verify_enabled_totp_for_email(db, request.signer_email, body.code)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported confirmation method")
+
+    if not ok:
+        _log_audit(
+            db,
+            "signing_request_confirmed",
+            request.signer_email,
+            "failed",
+            details=f"requestId={request.request_id}; method={method}; reason={message}",
+            document_hash=request.document_hash,
+            certificate_serial=request.certificate_serial,
+        )
+        db.commit()
+        raise HTTPException(status_code=400, detail=message)
+
+    now = utc_now()
+    request.status = "mfa_confirmed"
+    request.confirmation_method = method
+    request.confirmed_at = _db_time(now)
+    _log_audit(
+        db,
+        "signing_request_confirmed",
+        request.signer_email,
+        "success",
+        details=f"requestId={request.request_id}; method={method}",
+        document_hash=request.document_hash,
+        certificate_serial=request.certificate_serial,
+    )
+    db.commit()
+    return {
+        "confirmed": True,
+        "requestId": request.request_id,
+        "status": request.status,
+        "confirmationMethod": method,
+        "confirmedAt": isoformat(now),
+    }
+
+
 @router.post("/api/sign/v2/submit")
 def submit_signature(
     body: SignedPackageV2,
@@ -546,27 +700,18 @@ def submit_signature(
     request = db.get(SigningRequest, payload.requestId)
     if not request:
         _reject_submit(db, "Unknown signing request ID", payload, cert)
-    if request.status != "pending":
+    if request.status == "pending":
+        _reject_submit(db, "Signing request has not been OTP/TOTP confirmed", payload, cert)
+    if request.status != "mfa_confirmed":
         _reject_submit(db, f"Signing request already {request.status}", payload, cert)
-    _step(steps, "Signing request", "passed", "Request exists and is pending.")
+    _step(steps, "Signing request", "passed", "Request exists and is MFA-confirmed.")
 
     if db.get(UsedNonce, payload.nonce):
         _reject_submit(db, "Nonce already used", payload, cert)
     _step(steps, "Replay check", "passed", "Nonce has not been used before.")
 
-    expected = {
-        "document_name": payload.documentName,
-        "document_hash": payload.documentHash.lower(),
-        "hash_algorithm": hash_algorithm,
-        "signer_name": payload.signerName,
-        "signer_email": payload.signerEmail,
-        "certificate_serial": payload.certificateSerialNumber,
-        "signing_purpose": payload.signingPurpose,
-        "nonce": payload.nonce,
-    }
-    for attr, expected_value in expected.items():
-        if getattr(request, attr) != expected_value:
-            _reject_submit(db, f"Signing payload mismatch: {attr}", payload, cert)
+    if not _request_context_matches_payload(request, payload, hash_algorithm):
+        _reject_submit(db, "Signing payload mismatch with confirmed request", payload, cert)
     _step(steps, "Payload-request consistency", "passed", "Payload matches server request.")
 
     if cert.serialNumber != payload.certificateSerialNumber:
@@ -675,6 +820,8 @@ def submit_signature(
             "revocationValid": True,
             "timestampValid": True,
             "serverAccepted": True,
+            "signingRequestConfirmed": True,
+            "confirmationMethod": request.confirmation_method,
             "legalReady": False,
         }
     )
@@ -1061,6 +1208,23 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         _step(steps, "Replay check", "warning", "Nonce was not recorded by this server.")
         warnings.append("Replay check is not authoritative for packages submitted elsewhere.")
 
+    request, signing_request_confirmed, confirmation_method, request_context_matches = _confirmation_state(
+        db,
+        payload,
+        payload_hash_algorithm,
+    )
+    if not request:
+        _step(steps, "Signing confirmation", "warning", "Signing request is not present in this server DB.")
+        warnings.append("Signing request confirmation could not be checked on this server.")
+    elif not request_context_matches:
+        _step(steps, "Signing confirmation", "warning", "Signing payload does not match the server signing request.")
+        warnings.append("Signing request context does not match this signed package.")
+    elif signing_request_confirmed:
+        _step(steps, "Signing confirmation", "passed", f"Signing request was confirmed with {confirmation_method}.")
+    else:
+        _step(steps, "Signing confirmation", "warning", f"Signing request status is {request.status}, not confirmed.")
+        warnings.append("Signing request has not been OTP/TOTP confirmed.")
+
     canonical = canonicalize_signing_payload(payload.model_dump())
     if not verify_canonical_signature(canonical, package.signatureBase64, cert.publicKeyPem, payload_hash_algorithm):
         _step(steps, "Signature verification", "failed", "RSA-PSS verification failed over canonical payload.")
@@ -1129,7 +1293,9 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
             timestamp_status = "malformed-client-time"
             warnings.append("signedAtClient is malformed and is not trusted.")
 
-    report = _base_report(steps, warnings, "valid")
+    server_accepted = used_nonce is not None and signing_request_confirmed
+    final_decision = "valid" if server_accepted else "crypto_valid_server_rejected"
+    report = _base_report(steps, warnings, final_decision)
     report.update(
         {
             "documentIntegrity": "passed",
@@ -1151,7 +1317,9 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
             "trustedChainValid": True,
             "revocationValid": True,
             "timestampValid": timestamp_status == "demo-tsa-valid",
-            "serverAccepted": used_nonce is not None,
+            "serverAccepted": server_accepted,
+            "signingRequestConfirmed": signing_request_confirmed,
+            "confirmationMethod": confirmation_method,
             "legalReady": False,
         }
     )
@@ -1166,7 +1334,8 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
     )
     db.commit()
 
-    return _verification_response(True, "signature valid", report, document_hash, payload, cert, signed_at)
+    reason = "signature valid" if server_accepted else "signature valid but not accepted by server"
+    return _verification_response(True, reason, report, document_hash, payload, cert, signed_at)
 
 
 @router.post("/api/certificates/revoke/v2")

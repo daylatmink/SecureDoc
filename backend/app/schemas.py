@@ -144,6 +144,8 @@ class VerificationReportV2(BaseModel):
     revocationValid: bool = False
     timestampValid: bool = False
     serverAccepted: bool = False
+    signingRequestConfirmed: bool = False
+    confirmationMethod: Optional[str] = None
     legalReady: bool = False
     documentIntegrity: str
     signingPayloadValid: str
@@ -172,6 +174,28 @@ class VerifyResponseV2(BaseModel):
     documentHash: str
     signedAt: Optional[str]
     report: VerificationReportV2
+
+
+class SigningOtpRequestResponse(BaseModel):
+    otpId: int
+    requestId: str
+    email: EmailStr
+    expiresAt: str
+    delivery: str
+    warning: str
+
+
+class SigningConfirmRequest(BaseModel):
+    method: str
+    code: str
+
+
+class SigningConfirmResponse(BaseModel):
+    confirmed: bool
+    requestId: str
+    status: str
+    confirmationMethod: str
+    confirmedAt: str
 
 
 class RevokeBySerialRequest(BaseModel):

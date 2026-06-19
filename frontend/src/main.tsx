@@ -24,25 +24,25 @@ import {
 import {
   browserSigningHashSupported,
   canonicalizePayload,
+  confirmSigningRequest,
   demoAuthHeaders,
   generateBrowserSigningKeyPair,
   hashDocument,
   importPrivateKey,
   issueX509Certificate,
   prepareSigningRequest,
-  requestEmailOtp,
+  requestSigningEmailOtp,
   signPayload,
   setupTotp,
   submitSignature,
-  verifyEmailOtp,
   verifyTotpSetup,
   verifyV2,
   type Certificate,
-  type EmailOtpRequestResponse,
-  type EmailOtpVerifyResponse,
   type HashAlgorithm,
   type PrepareResponse,
   type SignedPackageV2,
+  type SigningConfirmResponse,
+  type SigningOtpRequestResponse,
   type SubmitResponse,
   type TotpSetupResponse,
   type TotpVerifyResponse,
@@ -143,7 +143,7 @@ type Tab = "home" | "documents" | "mfa" | "hash" | "keys" | "signv2" | "verifyv2
 const tabs: Array<{ tab: Tab; label: string; helper: string; icon: React.ReactNode }> = [
   { tab: "home", label: "Tong quan", helper: "V2 flow", icon: <BadgeCheck size={18} /> },
   { tab: "documents", label: "Documents", helper: "Main flow", icon: <FileText size={18} /> },
-  { tab: "mfa", label: "MFA", helper: "OTP/TOTP", icon: <Smartphone size={18} /> },
+  { tab: "mfa", label: "Security", helper: "TOTP", icon: <Smartphone size={18} /> },
   { tab: "hash", label: "Bam file", helper: "SHA-2/SHA-3", icon: <Hash size={18} /> },
   { tab: "keys", label: "Tao khoa", helper: "X.509 demo", icon: <KeyRound size={18} /> },
   { tab: "signv2", label: "Ky v2", helper: "Client-side", icon: <FileSignature size={18} /> },
@@ -292,42 +292,11 @@ function InfoBox({ title, text }: { title: string; text: string }) {
 
 function MfaOtpSetup() {
   const [email, setEmail] = useState("student@example.com");
-  const [purpose, setPurpose] = useState("SENSITIVE_ACTION");
-  const [otpCode, setOtpCode] = useState("");
-  const [otpRequest, setOtpRequest] = useState<EmailOtpRequestResponse | null>(null);
-  const [otpVerify, setOtpVerify] = useState<EmailOtpVerifyResponse | null>(null);
   const [totpSetupResult, setTotpSetupResult] = useState<TotpSetupResponse | null>(null);
   const [totpCode, setTotpCode] = useState("");
   const [totpVerify, setTotpVerify] = useState<TotpVerifyResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-
-  async function requestOtp() {
-    setError("");
-    setOtpVerify(null);
-    setLoading(true);
-    try {
-      const response = await requestEmailOtp({ email, purpose });
-      setOtpRequest(response);
-    } catch (err) {
-      setError(errorMessage(err, "Cannot request Email OTP."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function verifyOtp() {
-    setError("");
-    setLoading(true);
-    try {
-      const response = await verifyEmailOtp({ email, purpose, otp: otpCode });
-      setOtpVerify(response);
-    } catch (err) {
-      setError(errorMessage(err, "Cannot verify Email OTP."));
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function setupAuthenticator() {
     setError("");
@@ -364,54 +333,18 @@ function MfaOtpSetup() {
   return (
     <section className="page taskPage">
       <PageHeader
-        title="Email OTP and TOTP MFA"
-        description="Phase 1 stabilization UI for short-lived Email OTP and Authenticator-based TOTP setup. This is not a full production login system."
+        title="Security settings"
+        description="Set up Authenticator-based TOTP for step-up confirmation in the signing flow."
       />
 
       <div className="toolGrid">
         <div className="surface">
-          <h3>Email OTP</h3>
+          <h3>TOTP Authenticator</h3>
+          <p className="fieldHint">Use the signer email, then add the secret or otpauth URI to an Authenticator app.</p>
           <label>
-            Email
+            Signer email
             <input value={email} onChange={(event) => setEmail(event.target.value)} />
           </label>
-          <label>
-            Purpose
-            <select value={purpose} onChange={(event) => setPurpose(event.target.value)}>
-              <option value="REGISTER">REGISTER</option>
-              <option value="RESET_PASSWORD">RESET_PASSWORD</option>
-              <option value="CHANGE_EMAIL">CHANGE_EMAIL</option>
-              <option value="SENSITIVE_ACTION">SENSITIVE_ACTION</option>
-              <option value="LOGIN_MFA">LOGIN_MFA</option>
-            </select>
-          </label>
-          <button className="primary" onClick={requestOtp} disabled={loading}>
-            <Mail size={18} />
-            Request Email OTP
-          </button>
-
-          {otpRequest && (
-            <dl className="detailList">
-              <DetailItem label="OTP ID" value={String(otpRequest.otpId)} />
-              <DetailItem label="Delivery" value={otpRequest.delivery} />
-              <DetailItem label="Expires at" value={otpRequest.expiresAt} />
-              <DetailItem label="Warning" value={otpRequest.warning} />
-            </dl>
-          )}
-
-          <label>
-            OTP code
-            <input value={otpCode} onChange={(event) => setOtpCode(event.target.value)} inputMode="numeric" placeholder="6 digits from email" />
-          </label>
-          <button className="secondary" onClick={verifyOtp} disabled={loading || !otpRequest}>
-            Verify Email OTP
-          </button>
-          {otpVerify && <StatusLine ok={otpVerify.verified} text={otpVerify.reason} />}
-        </div>
-
-        <div className="surface">
-          <h3>TOTP Authenticator</h3>
-          <p className="fieldHint">Use the same email, then add the secret or otpauth URI to an Authenticator app.</p>
           <button className="primary" onClick={setupAuthenticator} disabled={loading}>
             <Smartphone size={18} />
             Start TOTP setup
@@ -447,6 +380,7 @@ function StatusLine({ ok, text }: { ok: boolean; text: string }) {
 }
 
 type DocumentStatus = "draft" | "pending_signature" | "signed" | "verification_failed" | "certificate_revoked";
+type SigningConfirmationMethod = "EMAIL_OTP" | "TOTP";
 
 type AuditChainResult = {
   valid: boolean;
@@ -465,6 +399,10 @@ function DocumentsWorkflow() {
   const [hashResult, setHashResult] = useState<HashResult | null>(null);
   const [prepareResult, setPrepareResult] = useState<PrepareResponse | null>(null);
   const [signingConfirmed, setSigningConfirmed] = useState(false);
+  const [confirmationMethod, setConfirmationMethod] = useState<SigningConfirmationMethod>("EMAIL_OTP");
+  const [confirmationCode, setConfirmationCode] = useState("");
+  const [otpRequest, setOtpRequest] = useState<SigningOtpRequestResponse | null>(null);
+  const [confirmationResult, setConfirmationResult] = useState<SigningConfirmResponse | null>(null);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
   const [verifyResult, setVerifyResult] = useState<VerifyV2Response | null>(null);
   const [revokeResult, setRevokeResult] = useState<{ serialNumber: string; status: string; reason: string; revokedAt: string } | null>(null);
@@ -489,6 +427,10 @@ function DocumentsWorkflow() {
       setSubmitResult(null);
       setVerifyResult(null);
       setRevokeResult(null);
+      setSigningConfirmed(false);
+      setConfirmationCode("");
+      setOtpRequest(null);
+      setConfirmationResult(null);
     } catch (err) {
       setError(errorMessage(err, "Cannot create browser key and X.509 demo certificate."));
     } finally {
@@ -521,9 +463,47 @@ function DocumentsWorkflow() {
       setSubmitResult(null);
       setVerifyResult(null);
       setSigningConfirmed(false);
+      setConfirmationCode("");
+      setOtpRequest(null);
+      setConfirmationResult(null);
       setStatus("pending_signature");
     } catch (err) {
       setError(errorMessage(err, "Cannot create signing request."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function requestSigningOtp() {
+    if (!prepareResult) return;
+    setError("");
+    setLoading(true);
+    try {
+      const response = await requestSigningEmailOtp(prepareResult.requestId, prepareResult.signingPayload.signerEmail);
+      setOtpRequest(response);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot request signing OTP."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function confirmSigningIntent() {
+    if (!prepareResult) return;
+    setError("");
+    setLoading(true);
+    try {
+      const response = await confirmSigningRequest({
+        requestId: prepareResult.requestId,
+        signerEmail: prepareResult.signingPayload.signerEmail,
+        method: confirmationMethod,
+        code: confirmationCode
+      });
+      setConfirmationResult(response);
+      setSigningConfirmed(response.confirmed);
+    } catch (err) {
+      setSigningConfirmed(false);
+      setError(errorMessage(err, "Cannot confirm signing request."));
     } finally {
       setLoading(false);
     }
@@ -649,7 +629,7 @@ function DocumentsWorkflow() {
 
   return (
     <section className="page documentsPage">
-      <PageHeader title="Documents workflow" description="Main digital-signature demo flow: browser key, X.509 demo certificate, signing request, payload review, demo PIN, browser signing, verification report, revocation, and audit chain." />
+      <PageHeader title="Documents workflow" description="Main digital-signature demo flow: browser key, X.509 demo certificate, signing request, signing confirmation, browser signing, verification report, revocation, and audit chain." />
 
       <div className="flowStrip" aria-label="Main demo flow">
         {[
@@ -658,7 +638,7 @@ function DocumentsWorkflow() {
           "Upload document",
           "Create signing request",
           "Review signingPayload",
-          "Enter demo PIN",
+          "Confirm signing",
           "Sign in browser",
           "Submit signedPackage",
           "Verify report",
@@ -741,6 +721,10 @@ function DocumentsWorkflow() {
             setPrepareResult(null);
             setSubmitResult(null);
             setVerifyResult(null);
+            setSigningConfirmed(false);
+            setConfirmationCode("");
+            setOtpRequest(null);
+            setConfirmationResult(null);
             setStatus("draft");
           }} />
           <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />
@@ -784,15 +768,42 @@ function DocumentsWorkflow() {
             <DetailItem label="nonce" value={prepareResult.nonce} />
           </dl>
           <div className="pinPanel">
+            <h3>4. Xac nhan ky</h3>
             <label>
-              <input
-                type="checkbox"
-                checked={signingConfirmed}
-                onChange={(event) => setSigningConfirmed(event.target.checked)}
-              />
-              I reviewed the signing payload and intend to sign it.
+              Method
+              <select value={confirmationMethod} onChange={(event) => {
+                setConfirmationMethod(event.target.value as SigningConfirmationMethod);
+                setConfirmationCode("");
+                setSigningConfirmed(false);
+                setConfirmationResult(null);
+              }}>
+                <option value="EMAIL_OTP">Email OTP fallback</option>
+                <option value="TOTP">Authenticator TOTP</option>
+              </select>
             </label>
-            <button className="primary" onClick={signAndSubmit} disabled={loading || !prepareResult}>
+            {confirmationMethod === "EMAIL_OTP" && (
+              <button className="secondary" onClick={requestSigningOtp} disabled={loading || signingConfirmed}>
+                <Mail size={18} />
+                Request signing OTP
+              </button>
+            )}
+            {otpRequest && confirmationMethod === "EMAIL_OTP" && (
+              <dl className="detailList">
+                <DetailItem label="OTP ID" value={String(otpRequest.otpId)} />
+                <DetailItem label="Delivery" value={otpRequest.delivery} />
+                <DetailItem label="Expires at" value={otpRequest.expiresAt} />
+              </dl>
+            )}
+            <label>
+              Confirmation code
+              <input value={confirmationCode} onChange={(event) => setConfirmationCode(event.target.value)} inputMode="numeric" placeholder="6 digits" />
+            </label>
+            <button className="secondary" onClick={confirmSigningIntent} disabled={loading || !confirmationCode || signingConfirmed}>
+              <ShieldCheck size={18} />
+              Confirm signing request
+            </button>
+            {confirmationResult && <StatusLine ok={confirmationResult.confirmed} text={`${confirmationResult.confirmationMethod} confirmed at ${confirmationResult.confirmedAt}`} />}
+            <button className="primary" onClick={signAndSubmit} disabled={loading || !prepareResult || !signingConfirmed}>
               <FileSignature size={18} />
               {loading ? "Signing..." : "Sign in browser and submit"}
             </button>
@@ -1021,6 +1032,10 @@ function SignDocumentV2() {
   const [prepareResult, setPrepareResult] = useState<PrepareResponse | null>(null);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
   const [signingConfirmed, setSigningConfirmed] = useState(false);
+  const [confirmationMethod, setConfirmationMethod] = useState<SigningConfirmationMethod>("EMAIL_OTP");
+  const [confirmationCode, setConfirmationCode] = useState("");
+  const [otpRequest, setOtpRequest] = useState<SigningOtpRequestResponse | null>(null);
+  const [confirmationResult, setConfirmationResult] = useState<SigningConfirmResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -1045,9 +1060,46 @@ function SignDocumentV2() {
       });
       setPrepareResult(response);
       setSigningConfirmed(false);
+      setConfirmationCode("");
+      setOtpRequest(null);
+      setConfirmationResult(null);
       setStep("review");
     } catch (err) {
       setError(errorMessage(err, "Cannot create signing request."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function requestOtpForSigning() {
+    if (!prepareResult) return;
+    setError("");
+    setLoading(true);
+    try {
+      setOtpRequest(await requestSigningEmailOtp(prepareResult.requestId, prepareResult.signingPayload.signerEmail));
+    } catch (err) {
+      setError(errorMessage(err, "Cannot request signing OTP."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function confirmIntent() {
+    if (!prepareResult) return;
+    setError("");
+    setLoading(true);
+    try {
+      const response = await confirmSigningRequest({
+        requestId: prepareResult.requestId,
+        signerEmail: prepareResult.signingPayload.signerEmail,
+        method: confirmationMethod,
+        code: confirmationCode
+      });
+      setConfirmationResult(response);
+      setSigningConfirmed(response.confirmed);
+    } catch (err) {
+      setSigningConfirmed(false);
+      setError(errorMessage(err, "Cannot confirm signing request."));
     } finally {
       setLoading(false);
     }
@@ -1113,12 +1165,15 @@ function SignDocumentV2() {
     setPrepareResult(null);
     setSubmitResult(null);
     setSigningConfirmed(false);
+    setConfirmationCode("");
+    setOtpRequest(null);
+    setConfirmationResult(null);
     setError("");
   }
 
   return (
     <section className="page taskPage">
-      <PageHeader title="Sign v2 - client-side" description="Create a signing request, review it, sign canonical JSON in the browser, then submit the signed package." />
+      <PageHeader title="Sign v2 - client-side" description="Create a signing request, confirm the signing intent, sign canonical JSON in the browser, then submit the signed package." />
 
       {step === "input" && (
         <div className="surface">
@@ -1166,16 +1221,45 @@ function SignDocumentV2() {
             <DetailItem label="Canonicalization" value="JSON-canonical-sorted-keys" />
           </dl>
           {prepareResult.warnings.length > 0 && <WarningList warnings={prepareResult.warnings} />}
-          <label>
-            <input
-              type="checkbox"
-              checked={signingConfirmed}
-              onChange={(event) => setSigningConfirmed(event.target.checked)}
-            />
-            I reviewed the signing payload and intend to sign it.
-          </label>
+          <div className="pinPanel">
+            <h3>Xac nhan ky</h3>
+            <label>
+              Method
+              <select value={confirmationMethod} onChange={(event) => {
+                setConfirmationMethod(event.target.value as SigningConfirmationMethod);
+                setConfirmationCode("");
+                setSigningConfirmed(false);
+                setConfirmationResult(null);
+              }}>
+                <option value="EMAIL_OTP">Email OTP fallback</option>
+                <option value="TOTP">Authenticator TOTP</option>
+              </select>
+            </label>
+            {confirmationMethod === "EMAIL_OTP" && (
+              <button className="secondary" onClick={requestOtpForSigning} disabled={loading || signingConfirmed}>
+                <Mail size={18} />
+                Request signing OTP
+              </button>
+            )}
+            {otpRequest && confirmationMethod === "EMAIL_OTP" && (
+              <dl className="detailList">
+                <DetailItem label="OTP ID" value={String(otpRequest.otpId)} />
+                <DetailItem label="Delivery" value={otpRequest.delivery} />
+                <DetailItem label="Expires at" value={otpRequest.expiresAt} />
+              </dl>
+            )}
+            <label>
+              Confirmation code
+              <input value={confirmationCode} onChange={(event) => setConfirmationCode(event.target.value)} inputMode="numeric" placeholder="6 digits" />
+            </label>
+            <button className="secondary" onClick={confirmIntent} disabled={loading || !confirmationCode || signingConfirmed}>
+              <ShieldCheck size={18} />
+              Confirm signing request
+            </button>
+            {confirmationResult && <StatusLine ok={confirmationResult.confirmed} text={`${confirmationResult.confirmationMethod} confirmed at ${confirmationResult.confirmedAt}`} />}
+          </div>
           <div className="buttonRow">
-            <button className="primary" onClick={sign} disabled={loading}>
+            <button className="primary" onClick={sign} disabled={loading || !signingConfirmed}>
               <FileSignature size={18} />
               {loading ? "Signing..." : "Sign in browser"}
             </button>
@@ -1700,6 +1784,8 @@ function ReportPanel({ report }: { report: VerificationReport }) {
     ["Revocation valid", formatBoolean(report.revocationValid)],
     ["Timestamp valid", formatBoolean(report.timestampValid)],
     ["Server accepted", formatBoolean(report.serverAccepted)],
+    ["Request confirmed", formatBoolean(report.signingRequestConfirmed)],
+    ["Confirmation method", report.confirmationMethod ?? "none"],
     ["Legal ready", formatBoolean(report.legalReady)],
     ["Document integrity", report.documentIntegrity],
     ["Signing payload", report.signingPayloadValid],

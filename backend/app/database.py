@@ -25,11 +25,12 @@ def _ensure_sqlite_columns() -> None:
         return
 
     inspector = inspect(engine)
-    if "certificates" not in inspector.get_table_names():
+    table_names = inspector.get_table_names()
+    if "certificates" not in table_names:
         return
 
-    existing = {column["name"] for column in inspector.get_columns("certificates")}
-    additions = {
+    certificate_existing = {column["name"] for column in inspector.get_columns("certificates")}
+    certificate_additions = {
         "certificate_type": "VARCHAR DEFAULT 'legacy-demo' NOT NULL",
         "fingerprint_sha256": "VARCHAR",
         "key_size_bits": "INTEGER",
@@ -38,7 +39,30 @@ def _ensure_sqlite_columns() -> None:
         "root_certificate_pem": "TEXT",
     }
     with engine.begin() as connection:
-        for column_name, column_type in additions.items():
-            if column_name not in existing:
+        for column_name, column_type in certificate_additions.items():
+            if column_name not in certificate_existing:
                 connection.execute(text(f"ALTER TABLE certificates ADD COLUMN {column_name} {column_type}"))
+
+        if "signing_requests" in table_names:
+            signing_request_existing = {column["name"] for column in inspector.get_columns("signing_requests")}
+            signing_request_additions = {
+                "confirmation_method": "VARCHAR",
+                "confirmed_at": "DATETIME",
+            }
+            for column_name, column_type in signing_request_additions.items():
+                if column_name not in signing_request_existing:
+                    connection.execute(text(f"ALTER TABLE signing_requests ADD COLUMN {column_name} {column_type}"))
+
+        if "email_otp_tokens" in table_names:
+            otp_existing = {column["name"] for column in inspector.get_columns("email_otp_tokens")}
+            otp_additions = {
+                "signing_request_id": "VARCHAR",
+                "document_hash": "VARCHAR",
+                "certificate_serial": "VARCHAR",
+                "signing_purpose": "VARCHAR",
+                "nonce": "VARCHAR",
+            }
+            for column_name, column_type in otp_additions.items():
+                if column_name not in otp_existing:
+                    connection.execute(text(f"ALTER TABLE email_otp_tokens ADD COLUMN {column_name} {column_type}"))
 

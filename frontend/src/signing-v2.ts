@@ -75,6 +75,8 @@ export type VerificationReport = {
   revocationValid: boolean;
   timestampValid: boolean;
   serverAccepted: boolean;
+  signingRequestConfirmed: boolean;
+  confirmationMethod: string | null;
   legalReady: boolean;
   documentIntegrity: string;
   signingPayloadValid: string;
@@ -160,6 +162,23 @@ export type TotpVerifyResponse = {
   reason: string;
 };
 
+export type SigningOtpRequestResponse = {
+  otpId: number;
+  requestId: string;
+  email: string;
+  expiresAt: string;
+  delivery: string;
+  warning: string;
+};
+
+export type SigningConfirmResponse = {
+  confirmed: boolean;
+  requestId: string;
+  status: string;
+  confirmationMethod: "EMAIL_OTP" | "TOTP";
+  confirmedAt: string;
+};
+
 export async function requestEmailOtp(body: {
   email: string;
   purpose: string;
@@ -207,6 +226,28 @@ export async function verifyTotpSetup(body: {
     body: JSON.stringify(body),
   });
   return handleResponse<TotpVerifyResponse>(response);
+}
+
+export async function requestSigningEmailOtp(requestId: string, signerEmail: string): Promise<SigningOtpRequestResponse> {
+  const response = await fetch(`${API_BASE}/api/v2/signing-requests/${requestId}/otp/request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(signerEmail) },
+  });
+  return handleResponse<SigningOtpRequestResponse>(response);
+}
+
+export async function confirmSigningRequest(body: {
+  requestId: string;
+  signerEmail: string;
+  method: "EMAIL_OTP" | "TOTP";
+  code: string;
+}): Promise<SigningConfirmResponse> {
+  const response = await fetch(`${API_BASE}/api/v2/signing-requests/${body.requestId}/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(body.signerEmail) },
+    body: JSON.stringify({ method: body.method, code: body.code }),
+  });
+  return handleResponse<SigningConfirmResponse>(response);
 }
 
 export async function prepareSigningRequest(body: {
@@ -268,6 +309,10 @@ export async function hashDocument(file: File, hashAlgorithm: HashAlgorithm) {
 }
 
 export const demoAuthHeaders = DEMO_AUTH;
+
+function signerAuthHeaders(signerEmail: string) {
+  return { "X-SecureDoc-User": signerEmail, "X-SecureDoc-Role": "SIGNER" };
+}
 
 export function canonicalizePayload(payload: SigningPayload): string {
   const sorted: Record<string, unknown> = {};
