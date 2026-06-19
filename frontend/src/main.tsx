@@ -319,7 +319,6 @@ function MfaOtpSetup() {
     try {
       const response = await verifyTotpSetup({
         email,
-        secret: totpSetupResult.secret,
         code: totpCode
       });
       setTotpVerify(response);
@@ -456,7 +455,8 @@ function DocumentsWorkflow() {
         documentHash: hash.documentHash,
         hashAlgorithm: hash.hashAlgorithm,
         certificateSerialNumber: certificate.serialNumber,
-        signingPurpose: purpose
+        signingPurpose: purpose,
+        signerEmail: certificate.email
       });
       setHashResult(hash);
       setPrepareResult(prepared);
@@ -1056,7 +1056,8 @@ function SignDocumentV2() {
         documentHash: hash.documentHash,
         hashAlgorithm: hash.hashAlgorithm,
         certificateSerialNumber: certificate.serialNumber,
-        signingPurpose: purpose
+        signingPurpose: purpose,
+        signerEmail: certificate.email
       });
       setPrepareResult(response);
       setSigningConfirmed(false);

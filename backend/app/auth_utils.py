@@ -3,11 +3,13 @@
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 import struct
 import time
 from datetime import timedelta
 
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 
 from .crypto_utils import utc_now
@@ -17,24 +19,60 @@ OTP_PURPOSES = {"REGISTER", "RESET_PASSWORD", "CHANGE_EMAIL", "SENSITIVE_ACTION"
 OTP_TTL_SECONDS = 600
 OTP_MAX_ATTEMPTS = 5
 OTP_CODE_DIGITS = 6
+OTP_RESEND_COOLDOWN_SECONDS = 60
 TOTP_PERIOD_SECONDS = 30
 TOTP_DIGITS = 6
+_RUNTIME_OTP_PEPPER = secrets.token_bytes(32)
+_DEV_TOTP_ENCRYPTION_KEY = Fernet.generate_key()
 
 
 def _hash_secret(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _encode_totp_secret(secret: str) -> str:
-    return "demo-b64:" + base64.b64encode(secret.encode("utf-8")).decode("ascii")
+def _otp_pepper() -> bytes:
+    configured = os.getenv("SECUREDOC_OTP_PEPPER", "")
+    if configured:
+        return configured.encode("utf-8")
+    return _RUNTIME_OTP_PEPPER
 
 
-def _decode_totp_secret(stored: str) -> str | None:
-    if not stored.startswith("demo-b64:"):
+def _totp_fernet() -> tuple[Fernet, str]:
+    configured = os.getenv("SECUREDOC_TOTP_ENCRYPTION_KEY", "").strip()
+    if configured:
+        key_material = configured.encode("utf-8")
+        try:
+            # Accept a native Fernet key when operators provide one.
+            Fernet(key_material)
+            return Fernet(key_material), "fernet"
+        except ValueError:
+            derived = base64.urlsafe_b64encode(hashlib.sha256(key_material).digest())
+            return Fernet(derived), "fernet"
+    return Fernet(_DEV_TOTP_ENCRYPTION_KEY), "fernet-demo-key"
+
+
+def totp_storage_warning() -> str:
+    if os.getenv("SECUREDOC_TOTP_ENCRYPTION_KEY", "").strip():
+        return "TOTP secret is encrypted at rest with SECUREDOC_TOTP_ENCRYPTION_KEY."
+    return "Demo only: TOTP secret is encrypted with a process-local development key. Set SECUREDOC_TOTP_ENCRYPTION_KEY for stable secure storage."
+
+
+def _encrypt_totp_secret(secret: str) -> str:
+    fernet, scheme = _totp_fernet()
+    return f"{scheme}:" + fernet.encrypt(secret.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_totp_secret(stored: str) -> str | None:
+    if stored.startswith("fernet:"):
+        token = stored.removeprefix("fernet:")
+    elif stored.startswith("fernet-demo-key:"):
+        token = stored.removeprefix("fernet-demo-key:")
+    else:
         return None
     try:
-        return base64.b64decode(stored.removeprefix("demo-b64:")).decode("utf-8")
-    except Exception:
+        fernet, _scheme = _totp_fernet()
+        return fernet.decrypt(token.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError, ValueError):
         return None
 
 
@@ -59,7 +97,7 @@ def _otp_hash(
         nonce or "",
         otp,
     ]
-    return hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()
+    return hmac.new(_otp_pepper(), ":".join(parts).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def create_email_otp(db: Session, email: str, purpose: str) -> tuple[EmailOtpToken, str]:
@@ -97,6 +135,28 @@ def create_signing_email_otp(
     normalized_document_hash = document_hash.lower()
     otp = f"{secrets.randbelow(10 ** OTP_CODE_DIGITS):0{OTP_CODE_DIGITS}d}"
     now = utc_now().replace(tzinfo=None)
+    latest = (
+        db.query(EmailOtpToken)
+        .filter_by(purpose=normalized_purpose, signing_request_id=signing_request_id)
+        .order_by(EmailOtpToken.id.desc())
+        .first()
+    )
+    if latest and latest.used_at is None and latest.expires_at > now:
+        seconds_since_last = (now - latest.created_at).total_seconds()
+        if seconds_since_last < OTP_RESEND_COOLDOWN_SECONDS:
+            remaining = int(OTP_RESEND_COOLDOWN_SECONDS - seconds_since_last)
+            raise ValueError(f"OTP resend cooldown active; retry after {remaining} seconds")
+
+    stale_tokens = (
+        db.query(EmailOtpToken)
+        .filter_by(purpose=normalized_purpose, signing_request_id=signing_request_id)
+        .all()
+    )
+    for stale in stale_tokens:
+        if stale.used_at is None:
+            stale.used_at = now
+            stale.expires_at = min(stale.expires_at, now)
+
     token = EmailOtpToken(
         email=normalized_email,
         purpose=normalized_purpose,
@@ -223,8 +283,10 @@ def create_totp_setting(db: Session, email: str) -> tuple[UserMfaSetting, str, s
     secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
     now = utc_now().replace(tzinfo=None)
     setting = db.query(UserMfaSetting).filter_by(email=normalized_email).first()
+    if setting and setting.enabled == 1:
+        raise ValueError("TOTP already enabled; re-authentication is required to reset it")
     if setting:
-        setting.secret_encrypted = _encode_totp_secret(secret)
+        setting.secret_encrypted = _encrypt_totp_secret(secret)
         setting.enabled = 0
         setting.verified_at = None
         setting.updated_at = now
@@ -232,7 +294,7 @@ def create_totp_setting(db: Session, email: str) -> tuple[UserMfaSetting, str, s
         setting = UserMfaSetting(
             email=normalized_email,
             type="TOTP",
-            secret_encrypted=_encode_totp_secret(secret),
+            secret_encrypted=_encrypt_totp_secret(secret),
             enabled=0,
             verified_at=None,
             created_at=now,
@@ -244,18 +306,14 @@ def create_totp_setting(db: Session, email: str) -> tuple[UserMfaSetting, str, s
     return setting, secret, uri
 
 
-def verify_totp_setup(db: Session, email: str, secret: str, code: str) -> tuple[bool, str]:
+def verify_totp_setup(db: Session, email: str, code: str) -> tuple[bool, str]:
     normalized_email = email.strip().lower()
     setting = db.query(UserMfaSetting).filter_by(email=normalized_email).first()
     if not setting:
         return False, "TOTP setup not found"
-    stored_secret = _decode_totp_secret(setting.secret_encrypted)
-    if stored_secret is None:
-        if not hmac.compare_digest(setting.secret_encrypted, _hash_secret(secret)):
-            return False, "TOTP secret mismatch"
-        stored_secret = secret
-    if not hmac.compare_digest(stored_secret, secret):
-        return False, "TOTP secret mismatch"
+    secret = _decrypt_totp_secret(setting.secret_encrypted)
+    if secret is None:
+        return False, "TOTP secret is not decryptable"
     if not verify_totp_code(secret, code):
         return False, "Invalid TOTP code"
     now = utc_now().replace(tzinfo=None)
@@ -272,7 +330,7 @@ def verify_enabled_totp_for_email(db: Session, email: str, code: str) -> tuple[b
     setting = db.query(UserMfaSetting).filter_by(email=normalized_email, type="TOTP").first()
     if not setting or setting.enabled != 1:
         return False, "TOTP is not enabled for signer"
-    secret = _decode_totp_secret(setting.secret_encrypted)
+    secret = _decrypt_totp_secret(setting.secret_encrypted)
     if secret is None:
         return False, "TOTP secret is not available for confirmation"
     if not verify_totp_code(secret, code):
