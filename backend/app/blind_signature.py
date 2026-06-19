@@ -12,21 +12,22 @@ import json
 import math
 import secrets
 from datetime import timedelta
-from pathlib import Path
 from typing import Any
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from .config import ensure_demo_plaintext_keys_allowed, ensure_runtime_secrets_dir
 from .crypto_utils import isoformat, utc_now
 
 ALLOWED_BLIND_PURPOSES = {"anonymous_access_token", "e_voting_demo", "e_cash_demo"}
 BLIND_TOKEN_VERSION = "1.0"
 BLIND_SIGNATURE_SCHEME = "RSA blind signature educational demo"
-BLIND_SIGNER_PRIVATE_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_blind_signer_private.pem"
+BLIND_SIGNER_PRIVATE_KEY_PATH = ensure_runtime_secrets_dir() / "securedoc_blind_signer_private.pem"
 
 
 def ensure_blind_signer_key() -> rsa.RSAPrivateKey:
+    ensure_demo_plaintext_keys_allowed()
     if BLIND_SIGNER_PRIVATE_KEY_PATH.exists():
         key = serialization.load_pem_private_key(BLIND_SIGNER_PRIVATE_KEY_PATH.read_bytes(), password=None)
         if not isinstance(key, rsa.RSAPrivateKey):

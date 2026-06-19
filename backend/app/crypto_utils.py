@@ -14,16 +14,17 @@ import json
 import math
 import secrets
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
 
+from .config import ensure_demo_plaintext_keys_allowed, ensure_runtime_secrets_dir
+
 ISSUER = "SecureDoc Demo CA"
-CA_PRIVATE_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_ca_private.pem"
-CA_PUBLIC_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_ca_public.pem"
+CA_PRIVATE_KEY_PATH = ensure_runtime_secrets_dir() / "securedoc_demo_ca_private.pem"
+CA_PUBLIC_KEY_PATH = ensure_runtime_secrets_dir() / "securedoc_demo_ca_public.pem"
 CERTIFICATE_SIGNATURE_ALGORITHM = "RSA-PSS-SHA256"
 
 HASH_ALGORITHM_PROFILES = {
@@ -189,6 +190,7 @@ def compute_certificate_fingerprint(certificate: Dict[str, Any]) -> str:
 # ── Demo CA ───────────────────────────────────────────────────────────────
 
 def ensure_demo_ca_keys() -> Tuple[str, str]:
+    ensure_demo_plaintext_keys_allowed()
     if CA_PRIVATE_KEY_PATH.exists():
         private_pem = CA_PRIVATE_KEY_PATH.read_bytes()
         private_key = serialization.load_pem_private_key(private_pem, password=None)

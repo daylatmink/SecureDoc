@@ -12,6 +12,7 @@ skills-lock.json
 # Backend runtime and Python cache
 backend/.venv/
 backend/securedoc.db
+.securedoc-runtime/
 *.db
 *.db-journal
 *.sqlite

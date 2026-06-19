@@ -670,6 +670,11 @@ pre {
   font-weight: 750;
 }
 
+.successText {
+  color: #047857;
+  font-weight: 750;
+}
+
 .warningBanner,
 .successBanner {
   align-items: flex-start;

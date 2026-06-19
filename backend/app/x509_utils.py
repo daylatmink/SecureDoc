@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509.oid import ExtensionOID, NameOID
 
+from .config import ensure_demo_plaintext_keys_allowed, ensure_runtime_secrets_dir
 from .crypto_utils import ALGORITHM_POLICY, get_public_key_size, isoformat, utc_now
 
 X509_ROOT_COMMON_NAME = "SecureDoc Demo Root CA"
@@ -27,11 +28,11 @@ X509_INTERMEDIATE_COMMON_NAME = "SecureDoc Demo Intermediate CA"
 X509_CERTIFICATE_TYPE = "x509-demo"
 TRUSTED_DEMO_ROOT_ID = "securedoc-demo-root"
 
-X509_ROOT_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_x509_root_private.pem"
-X509_ROOT_CERT_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_x509_root_cert.pem"
-X509_INTERMEDIATE_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_x509_intermediate_private.pem"
-X509_INTERMEDIATE_CERT_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_x509_intermediate_cert.pem"
-TSA_PRIVATE_KEY_PATH = Path(__file__).resolve().parents[1] / "securedoc_demo_tsa_private.pem"
+X509_ROOT_KEY_PATH = ensure_runtime_secrets_dir() / "securedoc_demo_x509_root_private.pem"
+X509_ROOT_CERT_PATH = ensure_runtime_secrets_dir() / "securedoc_demo_x509_root_cert.pem"
+X509_INTERMEDIATE_KEY_PATH = ensure_runtime_secrets_dir() / "securedoc_demo_x509_intermediate_private.pem"
+X509_INTERMEDIATE_CERT_PATH = ensure_runtime_secrets_dir() / "securedoc_demo_x509_intermediate_cert.pem"
+TSA_PRIVATE_KEY_PATH = ensure_runtime_secrets_dir() / "securedoc_demo_tsa_private.pem"
 
 DEMO_SIGNATURE_ALGORITHM = "RSA-PSS-SHA256"
 DEMO_TSA_NAME = "SecureDoc Demo TSA"
@@ -199,6 +200,7 @@ def _build_intermediate_ca(
 
 
 def ensure_demo_x509_ca() -> tuple[str, str]:
+    ensure_demo_plaintext_keys_allowed()
     if X509_ROOT_KEY_PATH.exists() and X509_ROOT_CERT_PATH.exists():
         root_key = _load_private_key(X509_ROOT_KEY_PATH)
         root_cert = _load_certificate(X509_ROOT_CERT_PATH)
@@ -430,6 +432,7 @@ def verify_signed_demo_crl(crl: dict[str, Any]) -> tuple[bool, str]:
 
 
 def ensure_demo_tsa_key() -> rsa.RSAPrivateKey:
+    ensure_demo_plaintext_keys_allowed()
     if TSA_PRIVATE_KEY_PATH.exists():
         return _load_private_key(TSA_PRIVATE_KEY_PATH)
     private_key = _new_private_key()

@@ -1,5 +1,12 @@
 const API_BASE = "http://127.0.0.1:8000";
 
+const DEMO_AUTH = {
+  caOfficer: { "X-SecureDoc-User": "demo-ca-officer", "X-SecureDoc-Role": "CA_OFFICER" },
+  signer: { "X-SecureDoc-User": "demo-signer", "X-SecureDoc-Role": "SIGNER" },
+  verifier: { "X-SecureDoc-User": "demo-verifier", "X-SecureDoc-Role": "VERIFIER" },
+  auditor: { "X-SecureDoc-User": "demo-auditor", "X-SecureDoc-Role": "AUDITOR" },
+};
+
 export type HashAlgorithm = "SHA-256" | "SHA-384" | "SHA-512" | "SHA3-256";
 
 export type Certificate = {
@@ -62,6 +69,13 @@ export type VerificationStep = {
 };
 
 export type VerificationReport = {
+  cryptoValid: boolean;
+  documentHashValid: boolean;
+  trustedChainValid: boolean;
+  revocationValid: boolean;
+  timestampValid: boolean;
+  serverAccepted: boolean;
+  legalReady: boolean;
   documentIntegrity: string;
   signingPayloadValid: string;
   signatureValid: string;
@@ -78,6 +92,7 @@ export type VerificationReport = {
   timestampStatus: string;
   finalDecision: string;
   warnings: string[];
+  errors: string[];
   verificationSteps: VerificationStep[];
 };
 
@@ -116,6 +131,84 @@ export type VerifyV2Response = {
   report: VerificationReport;
 };
 
+export type EmailOtpRequestResponse = {
+  otpId: number;
+  email: string;
+  purpose: string;
+  expiresAt: string;
+  delivery: string;
+  warning: string;
+};
+
+export type EmailOtpVerifyResponse = {
+  verified: boolean;
+  reason: string;
+};
+
+export type TotpSetupResponse = {
+  mfaId: number;
+  email: string;
+  type: "TOTP";
+  enabled: boolean;
+  secret: string;
+  otpauthUri: string;
+  warning: string;
+};
+
+export type TotpVerifyResponse = {
+  verified: boolean;
+  reason: string;
+};
+
+export async function requestEmailOtp(body: {
+  email: string;
+  purpose: string;
+}): Promise<EmailOtpRequestResponse> {
+  const response = await fetch(`${API_BASE}/api/auth/email-otp/request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<EmailOtpRequestResponse>(response);
+}
+
+export async function verifyEmailOtp(body: {
+  email: string;
+  purpose: string;
+  otp: string;
+}): Promise<EmailOtpVerifyResponse> {
+  const response = await fetch(`${API_BASE}/api/auth/email-otp/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<EmailOtpVerifyResponse>(response);
+}
+
+export async function setupTotp(body: {
+  email: string;
+}): Promise<TotpSetupResponse> {
+  const response = await fetch(`${API_BASE}/api/auth/totp/setup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<TotpSetupResponse>(response);
+}
+
+export async function verifyTotpSetup(body: {
+  email: string;
+  secret: string;
+  code: string;
+}): Promise<TotpVerifyResponse> {
+  const response = await fetch(`${API_BASE}/api/auth/totp/verify-setup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<TotpVerifyResponse>(response);
+}
+
 export async function prepareSigningRequest(body: {
   documentName: string;
   documentHash: string;
@@ -125,7 +218,7 @@ export async function prepareSigningRequest(body: {
 }): Promise<PrepareResponse> {
   const response = await fetch(`${API_BASE}/api/sign/v2/prepare`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...DEMO_AUTH.signer },
     body: JSON.stringify(body),
   });
   return handleResponse<PrepareResponse>(response);
@@ -134,7 +227,7 @@ export async function prepareSigningRequest(body: {
 export async function submitSignature(body: SignedPackageV2): Promise<SubmitResponse> {
   const response = await fetch(`${API_BASE}/api/sign/v2/submit`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...DEMO_AUTH.signer },
     body: JSON.stringify(body),
   });
   return handleResponse<SubmitResponse>(response);
@@ -160,7 +253,7 @@ export async function issueX509Certificate(body: {
 }): Promise<X509IssueResponse> {
   const response = await fetch(`${API_BASE}/api/certificates/x509/issue`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...DEMO_AUTH.caOfficer },
     body: JSON.stringify(body),
   });
   return handleResponse<X509IssueResponse>(response);
@@ -173,6 +266,8 @@ export async function hashDocument(file: File, hashAlgorithm: HashAlgorithm) {
   const response = await fetch(`${API_BASE}/api/documents/hash`, { method: "POST", body: formData });
   return handleResponse<{ documentName: string; hashAlgorithm: HashAlgorithm; documentHash: string }>(response);
 }
+
+export const demoAuthHeaders = DEMO_AUTH;
 
 export function canonicalizePayload(payload: SigningPayload): string {
   const sorted: Record<string, unknown> = {};
