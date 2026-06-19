@@ -138,6 +138,13 @@ class SignedPackageV2(BaseModel):
 
 
 class VerificationReportV2(BaseModel):
+    cryptoValid: bool = False
+    documentHashValid: bool = False
+    trustedChainValid: bool = False
+    revocationValid: bool = False
+    timestampValid: bool = False
+    serverAccepted: bool = False
+    legalReady: bool = False
     documentIntegrity: str
     signingPayloadValid: str
     signatureValid: str
@@ -154,6 +161,7 @@ class VerificationReportV2(BaseModel):
     timestampStatus: str
     finalDecision: str
     warnings: List[str] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
     verificationSteps: List[Dict[str, str]] = Field(default_factory=list)
 
 

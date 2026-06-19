@@ -47,6 +47,7 @@ from .schemas import (
     X509CertificateIssueRequest,
     X509CertificateIssueResponse,
 )
+from .security import AUDITOR, CA_OFFICER, SIGNER, VERIFIER, require_roles
 from .x509_utils import (
     TRUSTED_DEMO_ROOT_ID,
     X509_CERTIFICATE_TYPE,
@@ -287,6 +288,13 @@ def _hash_hex_valid(document_hash: str, hash_algorithm: str) -> bool:
 
 def _base_report(steps: list[dict[str, str]], warnings: list[str], decision: str = "invalid") -> dict[str, Any]:
     return {
+        "cryptoValid": False,
+        "documentHashValid": False,
+        "trustedChainValid": False,
+        "revocationValid": False,
+        "timestampValid": False,
+        "serverAccepted": False,
+        "legalReady": False,
         "documentIntegrity": "not_checked",
         "signingPayloadValid": "not_checked",
         "signatureValid": "not_checked",
@@ -303,6 +311,7 @@ def _base_report(steps: list[dict[str, str]], warnings: list[str], decision: str
         "timestampStatus": "not_checked",
         "finalDecision": decision,
         "warnings": warnings,
+        "errors": [],
         "verificationSteps": steps,
     }
 
@@ -364,7 +373,11 @@ def _reject_submit(
 
 
 @router.post("/api/certificates/x509/issue", response_model=X509CertificateIssueResponse)
-def issue_x509_certificate(body: X509CertificateIssueRequest, db: Session = Depends(get_db)):
+def issue_x509_certificate(
+    body: X509CertificateIssueRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(CA_OFFICER)),
+):
     try:
         issued = issue_user_x509_certificate(body.name, body.email, body.publicKeyPem)
         certificate = issued["certificate"]
@@ -401,7 +414,11 @@ def issue_x509_certificate(body: X509CertificateIssueRequest, db: Session = Depe
 
 
 @router.post("/api/sign/v2/prepare", response_model=SigningRequestResponseV2)
-def prepare_signing_request(body: SigningRequestCreateV2, db: Session = Depends(get_db)):
+def prepare_signing_request(
+    body: SigningRequestCreateV2,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
     try:
         hash_algorithm = normalize_hash_algorithm(body.hashAlgorithm)
     except ValueError as exc:
@@ -493,7 +510,11 @@ def prepare_signing_request(body: SigningRequestCreateV2, db: Session = Depends(
 
 
 @router.post("/api/sign/v2/submit")
-def submit_signature(body: SignedPackageV2, db: Session = Depends(get_db)):
+def submit_signature(
+    body: SignedPackageV2,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
     payload = body.signingPayload
     try:
         cert = _certificate_from_package(body)
@@ -648,6 +669,13 @@ def submit_signature(body: SignedPackageV2, db: Session = Depends(get_db)):
             "algorithmPolicyValid": "passed",
             "replayCheck": "passed",
             "timestampStatus": "demo-tsa-valid",
+            "cryptoValid": True,
+            "documentHashValid": True,
+            "trustedChainValid": True,
+            "revocationValid": True,
+            "timestampValid": True,
+            "serverAccepted": True,
+            "legalReady": False,
         }
     )
 
@@ -717,6 +745,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
     ) -> dict[str, Any]:
         report = _base_report(steps, warnings, "invalid")
         report.update(field_values)
+        report["errors"].append(reason)
         _log_audit(
             db,
             "signature_verified",
@@ -1117,6 +1146,13 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
             "algorithmPolicyValid": "passed",
             "replayCheck": replay_status,
             "timestampStatus": timestamp_status,
+            "cryptoValid": True,
+            "documentHashValid": True,
+            "trustedChainValid": True,
+            "revocationValid": True,
+            "timestampValid": timestamp_status == "demo-tsa-valid",
+            "serverAccepted": used_nonce is not None,
+            "legalReady": False,
         }
     )
     _log_audit(
@@ -1134,7 +1170,11 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
 
 
 @router.post("/api/certificates/revoke/v2")
-def revoke_v2(body: RevokeBySerialRequest, db: Session = Depends(get_db)):
+def revoke_v2(
+    body: RevokeBySerialRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(CA_OFFICER)),
+):
     record = db.get(CertificateRecord, body.serialNumber)
     if not record:
         raise HTTPException(status_code=404, detail="Certificate not found")
@@ -1184,7 +1224,10 @@ def certificate_status(serial_number: str, db: Session = Depends(get_db)):
 
 
 @router.get("/api/certificates/revocation-list")
-def revocation_list(db: Session = Depends(get_db)):
+def revocation_list(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(VERIFIER, AUDITOR, CA_OFFICER)),
+):
     revoked_records = db.query(CertificateRecord).filter_by(status="revoked").all()
     items = []
     for record in revoked_records:
@@ -1206,7 +1249,10 @@ def revocation_list(db: Session = Depends(get_db)):
 
 
 @router.get("/api/certificates/crl")
-def certificate_crl(db: Session = Depends(get_db)):
+def certificate_crl(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(VERIFIER, AUDITOR, CA_OFFICER)),
+):
     revoked_records = db.query(CertificateRecord).filter_by(status="revoked").all()
     revoked_certificates = []
     for record in revoked_records:
@@ -1233,7 +1279,10 @@ def certificate_crl(db: Session = Depends(get_db)):
 
 
 @router.get("/api/audit/verify-chain")
-def verify_audit_chain(db: Session = Depends(get_db)):
+def verify_audit_chain(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(AUDITOR)),
+):
     events = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
     previous_hash = None
     for index, event in enumerate(events, start=1):

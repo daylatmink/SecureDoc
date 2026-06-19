@@ -15,26 +15,37 @@ import {
   Fingerprint,
   Hash,
   KeyRound,
+  Mail,
   RotateCcw,
   ShieldCheck,
+  Smartphone,
   Upload
 } from "lucide-react";
 import {
   browserSigningHashSupported,
   canonicalizePayload,
+  demoAuthHeaders,
   generateBrowserSigningKeyPair,
   hashDocument,
   importPrivateKey,
   issueX509Certificate,
   prepareSigningRequest,
+  requestEmailOtp,
   signPayload,
+  setupTotp,
   submitSignature,
+  verifyEmailOtp,
+  verifyTotpSetup,
   verifyV2,
   type Certificate,
+  type EmailOtpRequestResponse,
+  type EmailOtpVerifyResponse,
   type HashAlgorithm,
   type PrepareResponse,
   type SignedPackageV2,
   type SubmitResponse,
+  type TotpSetupResponse,
+  type TotpVerifyResponse,
   type VerificationReport,
   type VerificationStep,
   type VerifyV2Response,
@@ -127,19 +138,17 @@ type BlindRedeemResponse = {
   spentAt?: string;
 };
 
-type Tab = "home" | "documents" | "hash" | "keys" | "signv2" | "verifyv2" | "sign" | "verify" | "revoke" | "blind";
+type Tab = "home" | "documents" | "mfa" | "hash" | "keys" | "signv2" | "verifyv2" | "sign" | "verify" | "revoke" | "blind";
 
 const tabs: Array<{ tab: Tab; label: string; helper: string; icon: React.ReactNode }> = [
   { tab: "home", label: "Tong quan", helper: "V2 flow", icon: <BadgeCheck size={18} /> },
   { tab: "documents", label: "Documents", helper: "Main flow", icon: <FileText size={18} /> },
+  { tab: "mfa", label: "MFA", helper: "OTP/TOTP", icon: <Smartphone size={18} /> },
   { tab: "hash", label: "Bam file", helper: "SHA-2/SHA-3", icon: <Hash size={18} /> },
   { tab: "keys", label: "Tao khoa", helper: "X.509 demo", icon: <KeyRound size={18} /> },
   { tab: "signv2", label: "Ky v2", helper: "Client-side", icon: <FileSignature size={18} /> },
   { tab: "verifyv2", label: "Xac minh v2", helper: "Report", icon: <ClipboardCheck size={18} /> },
-  { tab: "revoke", label: "Thu hoi", helper: "By serial", icon: <RotateCcw size={18} /> },
-  { tab: "sign", label: "Ky legacy", helper: "Insecure", icon: <AlertTriangle size={18} /> },
-  { tab: "verify", label: "Verify legacy", helper: "Old package", icon: <FileCheck size={18} /> },
-  { tab: "blind", label: "Chu ky mu", helper: "Privacy token", icon: <EyeOff size={18} /> }
+  { tab: "revoke", label: "Thu hoi", helper: "By serial", icon: <RotateCcw size={18} /> }
 ];
 
 const hashAlgorithmOptions: Array<{ value: HashAlgorithm; label: string; helper: string }> = [
@@ -179,13 +188,14 @@ function App() {
         </nav>
         <div className="sidebarNote">
           <ShieldCheck size={18} />
-          <p>Main flow is Documents: browser key generation, x509-demo certificate, payload review, demo PIN, browser signing, verify report, and revocation demo.</p>
+          <p>Main flow is Documents: browser key generation, x509-demo certificate, payload review, browser signing, verify report, and revocation demo.</p>
         </div>
       </aside>
 
       <main>
         {activeTab === "home" && <Home setActiveTab={setActiveTab} />}
         {activeTab === "documents" && <DocumentsWorkflow />}
+        {activeTab === "mfa" && <MfaOtpSetup />}
         {activeTab === "hash" && <HashDocument />}
         {activeTab === "keys" && <GenerateKeys />}
         {activeTab === "signv2" && <SignDocumentV2 />}
@@ -247,7 +257,7 @@ function Home({ setActiveTab }: { setActiveTab: (tab: Tab) => void }) {
 
       <div className="workflowGrid" aria-label="V2 workflow">
         <StepCard number="01" title="Key and certificate" text="Generate the RSA key in the browser, then request an x509-demo certificate from Demo Root CA -> Demo Intermediate CA." />
-        <StepCard number="02" title="Review and PIN" text="Upload a document, create the signing request, inspect every signingPayload field, then enter demo PIN 123456." />
+        <StepCard number="02" title="Review payload" text="Upload a document, create the signing request, inspect every signingPayload field, then confirm the signing intent." />
         <StepCard number="03" title="Verify and revoke" text="Submit the signedPackage, inspect the report, revoke the certificate, then verify again to show failure." />
       </div>
 
@@ -280,6 +290,162 @@ function InfoBox({ title, text }: { title: string; text: string }) {
   );
 }
 
+function MfaOtpSetup() {
+  const [email, setEmail] = useState("student@example.com");
+  const [purpose, setPurpose] = useState("SENSITIVE_ACTION");
+  const [otpCode, setOtpCode] = useState("");
+  const [otpRequest, setOtpRequest] = useState<EmailOtpRequestResponse | null>(null);
+  const [otpVerify, setOtpVerify] = useState<EmailOtpVerifyResponse | null>(null);
+  const [totpSetupResult, setTotpSetupResult] = useState<TotpSetupResponse | null>(null);
+  const [totpCode, setTotpCode] = useState("");
+  const [totpVerify, setTotpVerify] = useState<TotpVerifyResponse | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function requestOtp() {
+    setError("");
+    setOtpVerify(null);
+    setLoading(true);
+    try {
+      const response = await requestEmailOtp({ email, purpose });
+      setOtpRequest(response);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot request Email OTP."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function verifyOtp() {
+    setError("");
+    setLoading(true);
+    try {
+      const response = await verifyEmailOtp({ email, purpose, otp: otpCode });
+      setOtpVerify(response);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot verify Email OTP."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function setupAuthenticator() {
+    setError("");
+    setTotpVerify(null);
+    setLoading(true);
+    try {
+      const response = await setupTotp({ email });
+      setTotpSetupResult(response);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot start TOTP setup."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function verifyAuthenticator() {
+    if (!totpSetupResult) return;
+    setError("");
+    setLoading(true);
+    try {
+      const response = await verifyTotpSetup({
+        email,
+        secret: totpSetupResult.secret,
+        code: totpCode
+      });
+      setTotpVerify(response);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot verify TOTP setup."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="page taskPage">
+      <PageHeader
+        title="Email OTP and TOTP MFA"
+        description="Phase 1 stabilization UI for short-lived Email OTP and Authenticator-based TOTP setup. This is not a full production login system."
+      />
+
+      <div className="toolGrid">
+        <div className="surface">
+          <h3>Email OTP</h3>
+          <label>
+            Email
+            <input value={email} onChange={(event) => setEmail(event.target.value)} />
+          </label>
+          <label>
+            Purpose
+            <select value={purpose} onChange={(event) => setPurpose(event.target.value)}>
+              <option value="REGISTER">REGISTER</option>
+              <option value="RESET_PASSWORD">RESET_PASSWORD</option>
+              <option value="CHANGE_EMAIL">CHANGE_EMAIL</option>
+              <option value="SENSITIVE_ACTION">SENSITIVE_ACTION</option>
+              <option value="LOGIN_MFA">LOGIN_MFA</option>
+            </select>
+          </label>
+          <button className="primary" onClick={requestOtp} disabled={loading}>
+            <Mail size={18} />
+            Request Email OTP
+          </button>
+
+          {otpRequest && (
+            <dl className="detailList">
+              <DetailItem label="OTP ID" value={String(otpRequest.otpId)} />
+              <DetailItem label="Delivery" value={otpRequest.delivery} />
+              <DetailItem label="Expires at" value={otpRequest.expiresAt} />
+              <DetailItem label="Warning" value={otpRequest.warning} />
+            </dl>
+          )}
+
+          <label>
+            OTP code
+            <input value={otpCode} onChange={(event) => setOtpCode(event.target.value)} inputMode="numeric" placeholder="6 digits from email" />
+          </label>
+          <button className="secondary" onClick={verifyOtp} disabled={loading || !otpRequest}>
+            Verify Email OTP
+          </button>
+          {otpVerify && <StatusLine ok={otpVerify.verified} text={otpVerify.reason} />}
+        </div>
+
+        <div className="surface">
+          <h3>TOTP Authenticator</h3>
+          <p className="fieldHint">Use the same email, then add the secret or otpauth URI to an Authenticator app.</p>
+          <button className="primary" onClick={setupAuthenticator} disabled={loading}>
+            <Smartphone size={18} />
+            Start TOTP setup
+          </button>
+
+          {totpSetupResult && (
+            <dl className="detailList">
+              <DetailItem label="MFA ID" value={String(totpSetupResult.mfaId)} />
+              <DetailItem label="Secret" value={totpSetupResult.secret} />
+              <DetailItem label="otpauth URI" value={totpSetupResult.otpauthUri} />
+              <DetailItem label="Warning" value={totpSetupResult.warning} />
+            </dl>
+          )}
+
+          <label>
+            TOTP code
+            <input value={totpCode} onChange={(event) => setTotpCode(event.target.value)} inputMode="numeric" placeholder="6 digits from Authenticator" />
+          </label>
+          <button className="secondary" onClick={verifyAuthenticator} disabled={loading || !totpSetupResult}>
+            Verify TOTP setup
+          </button>
+          {totpVerify && <StatusLine ok={totpVerify.verified} text={totpVerify.reason} />}
+        </div>
+      </div>
+
+      {error && <p className="errorText" role="alert">{error}</p>}
+    </section>
+  );
+}
+
+function StatusLine({ ok, text }: { ok: boolean; text: string }) {
+  return <p className={ok ? "successText" : "errorText"}>{text}</p>;
+}
+
 type DocumentStatus = "draft" | "pending_signature" | "signed" | "verification_failed" | "certificate_revoked";
 
 type AuditChainResult = {
@@ -298,7 +464,7 @@ function DocumentsWorkflow() {
   const [purpose, setPurpose] = useState("approve_document");
   const [hashResult, setHashResult] = useState<HashResult | null>(null);
   const [prepareResult, setPrepareResult] = useState<PrepareResponse | null>(null);
-  const [pin, setPin] = useState("");
+  const [signingConfirmed, setSigningConfirmed] = useState(false);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
   const [verifyResult, setVerifyResult] = useState<VerifyV2Response | null>(null);
   const [revokeResult, setRevokeResult] = useState<{ serialNumber: string; status: string; reason: string; revokedAt: string } | null>(null);
@@ -354,6 +520,7 @@ function DocumentsWorkflow() {
       setPrepareResult(prepared);
       setSubmitResult(null);
       setVerifyResult(null);
+      setSigningConfirmed(false);
       setStatus("pending_signature");
     } catch (err) {
       setError(errorMessage(err, "Cannot create signing request."));
@@ -364,8 +531,8 @@ function DocumentsWorkflow() {
 
   async function signAndSubmit() {
     if (!prepareResult || !certificate) return;
-    if (pin !== "123456") {
-      setError("Demo PIN must be 123456.");
+    if (!signingConfirmed) {
+      setError("Confirm the signing payload before signing.");
       return;
     }
     if (!privateKeyPem.trim()) {
@@ -448,7 +615,7 @@ function DocumentsWorkflow() {
     try {
       const revokeResponse = await fetch(`${API_BASE}/api/certificates/revoke/v2`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...demoAuthHeaders.caOfficer },
         body: JSON.stringify({ serialNumber: certificate.serialNumber, reason: "classroom_demo_revoke", revokedBy: "local-demo-user" })
       });
       const revoked = await parseResponse<{ serialNumber: string; status: string; reason: string; revokedAt: string }>(revokeResponse);
@@ -473,7 +640,7 @@ function DocumentsWorkflow() {
   async function checkAuditChain() {
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/audit/verify-chain`);
+      const response = await fetch(`${API_BASE}/api/audit/verify-chain`, { headers: demoAuthHeaders.auditor });
       setAuditResult(await parseResponse<AuditChainResult>(response));
     } catch (err) {
       setError(errorMessage(err, "Cannot verify audit chain."));
@@ -618,9 +785,12 @@ function DocumentsWorkflow() {
           </dl>
           <div className="pinPanel">
             <label>
-              Demo PIN
-              <input value={pin} onChange={(event) => setPin(event.target.value)} placeholder="123456" inputMode="numeric" />
-              <small className="fieldHint">Demo PIN only, not production authentication.</small>
+              <input
+                type="checkbox"
+                checked={signingConfirmed}
+                onChange={(event) => setSigningConfirmed(event.target.checked)}
+              />
+              I reviewed the signing payload and intend to sign it.
             </label>
             <button className="primary" onClick={signAndSubmit} disabled={loading || !prepareResult}>
               <FileSignature size={18} />
@@ -850,7 +1020,7 @@ function SignDocumentV2() {
   const [purpose, setPurpose] = useState("approve_document");
   const [prepareResult, setPrepareResult] = useState<PrepareResponse | null>(null);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
-  const [pin, setPin] = useState("");
+  const [signingConfirmed, setSigningConfirmed] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -874,6 +1044,7 @@ function SignDocumentV2() {
         signingPurpose: purpose
       });
       setPrepareResult(response);
+      setSigningConfirmed(false);
       setStep("review");
     } catch (err) {
       setError(errorMessage(err, "Cannot create signing request."));
@@ -884,8 +1055,8 @@ function SignDocumentV2() {
 
   async function sign() {
     if (!prepareResult) return;
-    if (pin !== "123456") {
-      setError("Demo PIN must be 123456.");
+    if (!signingConfirmed) {
+      setError("Confirm the signing payload before signing.");
       return;
     }
     if (!privateKeyPem.trim()) {
@@ -941,7 +1112,7 @@ function SignDocumentV2() {
     setStep("input");
     setPrepareResult(null);
     setSubmitResult(null);
-    setPin("");
+    setSigningConfirmed(false);
     setError("");
   }
 
@@ -996,9 +1167,12 @@ function SignDocumentV2() {
           </dl>
           {prepareResult.warnings.length > 0 && <WarningList warnings={prepareResult.warnings} />}
           <label>
-            Demo PIN
-            <input value={pin} onChange={(event) => setPin(event.target.value)} placeholder="123456" inputMode="numeric" />
-            <small className="fieldHint">Demo PIN only, not production authentication.</small>
+            <input
+              type="checkbox"
+              checked={signingConfirmed}
+              onChange={(event) => setSigningConfirmed(event.target.checked)}
+            />
+            I reviewed the signing payload and intend to sign it.
           </label>
           <div className="buttonRow">
             <button className="primary" onClick={sign} disabled={loading}>
@@ -1116,7 +1290,7 @@ function RevokeCertificate() {
     try {
       const response = await fetch(`${API_BASE}/api/certificates/revoke/v2`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...demoAuthHeaders.caOfficer },
         body: JSON.stringify({ serialNumber: serial, reason, revokedBy: "local-demo-user" })
       });
       setResult(await parseResponse<{ serialNumber: string; status: string; reason: string; revokedAt: string }>(response));
@@ -1520,6 +1694,13 @@ function BlindSignatureDemo() {
 
 function ReportPanel({ report }: { report: VerificationReport }) {
   const cells: Array<[string, string]> = [
+    ["Crypto valid", formatBoolean(report.cryptoValid)],
+    ["Document hash valid", formatBoolean(report.documentHashValid)],
+    ["Trusted chain valid", formatBoolean(report.trustedChainValid)],
+    ["Revocation valid", formatBoolean(report.revocationValid)],
+    ["Timestamp valid", formatBoolean(report.timestampValid)],
+    ["Server accepted", formatBoolean(report.serverAccepted)],
+    ["Legal ready", formatBoolean(report.legalReady)],
     ["Document integrity", report.documentIntegrity],
     ["Signing payload", report.signingPayloadValid],
     ["Signature", report.signatureValid],
@@ -1544,10 +1725,15 @@ function ReportPanel({ report }: { report: VerificationReport }) {
           <ReportCell key={label} label={label} value={value} />
         ))}
       </div>
+      {report.errors.length > 0 && <WarningList warnings={report.errors} />}
       {report.warnings.length > 0 && <WarningList warnings={report.warnings} />}
       <StepsList steps={report.verificationSteps} />
     </div>
   );
+}
+
+function formatBoolean(value: boolean): string {
+  return value ? "valid" : "invalid";
 }
 
 function ReportCell({ label, value }: { label: string; value: string }) {

@@ -2,6 +2,7 @@ import base64
 import copy
 import sys
 import os
+import time
 from pathlib import Path
 
 os.environ["SECUREDOC_DATABASE_URL"] = "sqlite:///:memory:"
@@ -12,13 +13,18 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi.testclient import TestClient
 
 from app.crypto_utils import canonicalize_signing_payload, generate_key_pair, get_public_key_size, hash_bytes, parse_iso_datetime
+from app.auth_utils import create_email_otp, create_totp_setting, current_totp_code, verify_email_otp, verify_totp_setup
 from app.database import SessionLocal
-from app.main import app
-from app.models import AuditLog, CertificateRecord
+from app.main import _rate_limit_buckets, app
+from app.models import AuditLog, CertificateRecord, EmailOtpToken, UserMfaSetting
 from app.x509_utils import issue_user_x509_certificate, verify_signed_demo_crl
 
 
 DOCUMENT = b"SecureDoc v2 test document"
+CA_HEADERS = {"X-SecureDoc-User": "pytest-ca", "X-SecureDoc-Role": "CA_OFFICER"}
+SIGNER_HEADERS = {"X-SecureDoc-User": "pytest-signer", "X-SecureDoc-Role": "SIGNER"}
+AUDITOR_HEADERS = {"X-SecureDoc-User": "pytest-auditor", "X-SecureDoc-Role": "AUDITOR"}
+VERIFIER_HEADERS = {"X-SecureDoc-User": "pytest-verifier", "X-SecureDoc-Role": "VERIFIER"}
 
 
 def test_canonical_signing_payload_is_deterministic():
@@ -50,6 +56,215 @@ def test_v2_verify_success():
     assert data["report"]["revocationSource"] == "server-db"
     assert data["report"]["timestampStatus"] == "demo-tsa-valid"
     assert data["report"]["finalDecision"] == "valid"
+    assert data["report"]["cryptoValid"] is True
+    assert data["report"]["documentHashValid"] is True
+    assert data["report"]["trustedChainValid"] is True
+    assert data["report"]["revocationValid"] is True
+    assert data["report"]["timestampValid"] is True
+    assert data["report"]["serverAccepted"] is True
+    assert data["report"]["legalReady"] is False
+
+
+def test_offline_valid_package_is_not_server_accepted():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_unsigned_verify_package(
+            "Offline Signer",
+            "offline@example.com",
+        )
+
+        response = client.post(
+            "/api/verify/v2",
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is True
+    assert data["report"]["cryptoValid"] is True
+    assert data["report"]["serverAccepted"] is False
+    assert data["report"]["legalReady"] is False
+    assert any("Replay check is not authoritative" in warning for warning in data["report"]["warnings"])
+
+
+def test_legacy_private_key_routes_disabled_by_default():
+    with TestClient(app) as client:
+        generate = client.post(
+            "/api/keys/generate",
+            json={"name": "Legacy User", "email": "legacy@example.com"},
+        )
+        sign = client.post(
+            "/api/sign",
+            files={"file": ("document.txt", DOCUMENT, "text/plain")},
+            data={"privateKeyPem": "secret", "certificate": "{}"},
+        )
+        openapi = client.get("/openapi.json")
+
+    assert generate.status_code == 404
+    assert generate.json()["detail"] == "Legacy demo API is disabled"
+    assert sign.status_code == 404
+    assert sign.json()["detail"] == "Legacy demo API is disabled"
+    paths = openapi.json()["paths"]
+    assert "/api/keys/generate" not in paths
+    assert "/api/sign" not in paths
+
+
+def test_hash_document_respects_requested_hash_algorithm():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/documents/hash",
+            files={"file": ("document.txt", DOCUMENT, "text/plain")},
+            data={"hashAlgorithm": "SHA-512"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["hashAlgorithm"] == "SHA-512"
+    assert data["documentHash"] == hash_bytes(DOCUMENT, "SHA-512")
+
+
+def test_unauthenticated_cannot_issue_cert():
+    _, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/certificates/x509/issue",
+            json={"name": "No Auth", "email": "noauth@example.com", "publicKeyPem": public_key_pem},
+        )
+
+    assert response.status_code == 401
+
+
+def test_signer_cannot_revoke_cert():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/certificates/revoke/v2",
+            headers=SIGNER_HEADERS,
+            json={"serialNumber": "ABC", "reason": "pytest", "revokedBy": "pytest"},
+        )
+
+    assert response.status_code == 403
+
+
+def test_ca_officer_can_issue_cert():
+    _, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/certificates/x509/issue",
+            headers=CA_HEADERS,
+            json={"name": "CA Issued", "email": "ca-issued@example.com", "publicKeyPem": public_key_pem},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["certificateType"] == "x509-demo"
+
+
+def test_email_otp_is_hashed_expires_and_cannot_be_reused():
+    with SessionLocal() as db:
+        token, otp = create_email_otp(db, "otp@example.com", "SENSITIVE_ACTION")
+        db.commit()
+        assert token.otp_hash != otp
+        assert token.used_at is None
+
+        ok, message = verify_email_otp(db, "otp@example.com", "SENSITIVE_ACTION", otp)
+        db.commit()
+        assert ok, message
+
+        reused, reused_message = verify_email_otp(db, "otp@example.com", "SENSITIVE_ACTION", otp)
+        assert reused is False
+        assert reused_message == "OTP already used"
+
+
+def test_email_otp_api_does_not_return_plain_otp():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/email-otp/request",
+            json={"email": "api-otp@example.com", "purpose": "SENSITIVE_ACTION"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "otp" not in {key.lower() for key in data}
+    assert data["delivery"] == "not_configured_demo_no_otp_in_response"
+
+    with SessionLocal() as db:
+        token = db.query(EmailOtpToken).filter_by(email="api-otp@example.com").first()
+        assert token is not None
+        assert len(token.otp_hash) == 64
+
+
+def test_email_otp_attempt_limit_and_expiry():
+    with SessionLocal() as db:
+        token, _otp = create_email_otp(db, "limit@example.com", "LOGIN_MFA")
+        token.max_attempts = 2
+        db.commit()
+
+        first, _ = verify_email_otp(db, "limit@example.com", "LOGIN_MFA", "000000")
+        second, _ = verify_email_otp(db, "limit@example.com", "LOGIN_MFA", "111111")
+        third, message = verify_email_otp(db, "limit@example.com", "LOGIN_MFA", "222222")
+        db.commit()
+        assert first is False
+        assert second is False
+        assert third is False
+        assert message == "OTP attempt limit exceeded"
+
+        expired_token, expired_otp = create_email_otp(db, "expired-otp@example.com", "LOGIN_MFA")
+        expired_token.expires_at = expired_token.created_at
+        db.commit()
+        expired, expired_message = verify_email_otp(db, "expired-otp@example.com", "LOGIN_MFA", expired_otp)
+        assert expired is False
+        assert expired_message == "OTP expired"
+
+
+def test_totp_setup_requires_valid_code_and_does_not_store_plain_secret():
+    with SessionLocal() as db:
+        setting, secret, uri = create_totp_setting(db, "mfa@example.com")
+        db.commit()
+        assert uri.startswith("otpauth://totp/")
+        assert setting.secret_encrypted != secret
+
+        valid_code = current_totp_code(secret)
+        invalid_code = "000000" if valid_code != "000000" else "000001"
+        bad = client_like_verify_totp_setup(db, "mfa@example.com", secret, invalid_code)
+        assert bad is False
+
+        good = client_like_verify_totp_setup(db, "mfa@example.com", secret, valid_code)
+        db.commit()
+        stored = db.query(UserMfaSetting).filter_by(email="mfa@example.com").first()
+        assert good is True
+        assert stored is not None
+        assert stored.enabled == 1
+
+
+def test_request_size_limit_rejects_large_body():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/verify/v2",
+            content=b"x" * (2 * 1024 * 1024 + 1),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
+
+
+def test_rate_limit_returns_429_when_bucket_is_full():
+    _rate_limit_buckets[("testclient", "/api/algorithm-policy")] = [time.time()] * 120
+    with TestClient(app) as client:
+        response = client.get("/api/algorithm-policy")
+    _rate_limit_buckets.clear()
+
+    assert response.status_code == 429
+
+
+def test_cors_allowlist_does_not_reflect_untrusted_origin():
+    with TestClient(app) as client:
+        response = client.options(
+            "/api/algorithm-policy",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+
+    assert response.headers.get("access-control-allow-origin") != "https://evil.example"
 
 
 def test_v2_verify_rejects_modified_document_hash():
@@ -93,6 +308,7 @@ def test_v2_verify_rejects_revoked_certificate():
         serial = signed_package["signerCertificate"]["serialNumber"]
         revoke = client.post(
             "/api/certificates/revoke/v2",
+            headers=CA_HEADERS,
             json={"serialNumber": serial, "reason": "key_compromise", "revokedBy": "pytest"},
         )
         assert revoke.status_code == 200
@@ -180,11 +396,12 @@ def test_demo_crl_is_signed_and_lists_revoked_certificate():
         serial = signed_package["signerCertificate"]["serialNumber"]
         revoke = client.post(
             "/api/certificates/revoke/v2",
+            headers=CA_HEADERS,
             json={"serialNumber": serial, "reason": "cessation_of_operation", "revokedBy": "pytest"},
         )
         assert revoke.status_code == 200
 
-        response = client.get("/api/certificates/crl")
+        response = client.get("/api/certificates/crl", headers=VERIFIER_HEADERS)
 
     assert response.status_code == 200
     crl = response.json()
@@ -213,7 +430,7 @@ def test_timestamp_token_is_verified():
 def test_audit_chain_valid():
     with TestClient(app) as client:
         _create_submitted_package(client)
-        response = client.get("/api/audit/verify-chain")
+        response = client.get("/api/audit/verify-chain", headers=AUDITOR_HEADERS)
 
     assert response.status_code == 200
     data = response.json()
@@ -231,7 +448,7 @@ def test_audit_chain_detects_tampered_log():
             event.details = "tampered audit log"
             db.commit()
 
-        response = client.get("/api/audit/verify-chain")
+        response = client.get("/api/audit/verify-chain", headers=AUDITOR_HEADERS)
 
     assert response.status_code == 200
     data = response.json()
@@ -243,6 +460,7 @@ def _create_submitted_package(client: TestClient):
     private_key_pem, public_key_pem = generate_key_pair()
     issued = client.post(
         "/api/certificates/x509/issue",
+        headers=CA_HEADERS,
         json={"name": "Test Signer", "email": "signer@example.com", "publicKeyPem": public_key_pem},
     )
     assert issued.status_code == 200, issued.text
@@ -254,6 +472,7 @@ def _create_submitted_package(client: TestClient):
 
     prepare = client.post(
         "/api/sign/v2/prepare",
+        headers=SIGNER_HEADERS,
         json={
             "documentName": "document.txt",
             "documentHash": document_hash,
@@ -279,9 +498,14 @@ def _create_submitted_package(client: TestClient):
         "signedAtClient": "2026-06-16T00:00:00+00:00",
     }
 
-    submit = client.post("/api/sign/v2/submit", json=package)
+    submit = client.post("/api/sign/v2/submit", headers=SIGNER_HEADERS, json=package)
     assert submit.status_code == 200, submit.text
     return submit.json()["signedPackage"], document_hash
+
+
+def client_like_verify_totp_setup(db, email: str, secret: str, code: str) -> bool:
+    ok, _message = verify_totp_setup(db, email, secret, code)
+    return ok
 
 
 def _create_unsigned_verify_package(

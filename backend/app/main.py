@@ -1,10 +1,20 @@
 import json
+import time
 from typing import Any, Dict
 
+from fastapi import Request
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from .config import (
+    CORS_ALLOW_ORIGINS,
+    ENABLE_BLIND_SIGNATURE_DEMO,
+    ENABLE_LEGACY_DEMO,
+    RATE_LIMIT_REQUESTS_PER_MINUTE,
+    REQUEST_SIZE_LIMIT_BYTES,
+)
 from .blind_signature import ensure_blind_signer_key
 from .crypto_utils import (
     CERTIFICATE_SIGNATURE_ALGORITHM,
@@ -13,7 +23,9 @@ from .crypto_utils import (
     ensure_demo_ca_keys,
     generate_key_pair,
     get_demo_ca_public_key,
+    hash_bytes,
     isoformat,
+    normalize_hash_algorithm,
     parse_iso_datetime,
     sha256_hex,
     sign_hash,
@@ -24,6 +36,7 @@ from .crypto_utils import (
 from .database import SessionLocal, init_db
 from .models import CertificateRecord
 from .routes_blind import router as blind_router
+from .routes_auth import router as auth_router
 from .routes_v2 import router as v2_router
 from .schemas import (
     CaPublicKeyResponse,
@@ -40,22 +53,48 @@ app = FastAPI(title="SecureDoc API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+_rate_limit_buckets: dict[tuple[str, str], list[float]] = {}
+
+
+@app.middleware("http")
+async def request_hardening_middleware(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > REQUEST_SIZE_LIMIT_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
+    now = time.time()
+    client_host = request.client.host if request.client else "unknown"
+    key = (client_host, request.url.path)
+    window_start = now - 60
+    bucket = [timestamp for timestamp in _rate_limit_buckets.get(key, []) if timestamp >= window_start]
+    if len(bucket) >= RATE_LIMIT_REQUESTS_PER_MINUTE:
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+    bucket.append(now)
+    _rate_limit_buckets[key] = bucket
+
+    return await call_next(request)
+
+
+app.include_router(auth_router)
 app.include_router(v2_router)
-app.include_router(blind_router)
+if ENABLE_BLIND_SIGNATURE_DEMO:
+    app.include_router(blind_router)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
-    ensure_demo_ca_keys()
+    if ENABLE_LEGACY_DEMO:
+        ensure_demo_ca_keys()
     ensure_demo_x509_ca()
-    ensure_blind_signer_key()
+    if ENABLE_BLIND_SIGNATURE_DEMO:
+        ensure_blind_signer_key()
 
 
 def get_db():
@@ -76,8 +115,14 @@ def read_json_form(value: str, field_name: str) -> Dict[str, Any]:
     return parsed
 
 
-@app.get("/api/ca/public-key", response_model=CaPublicKeyResponse)
+def _require_legacy_demo_enabled() -> None:
+    if not ENABLE_LEGACY_DEMO:
+        raise HTTPException(status_code=404, detail="Legacy demo API is disabled")
+
+
+@app.get("/api/ca/public-key", response_model=CaPublicKeyResponse, include_in_schema=ENABLE_LEGACY_DEMO)
 def get_ca_public_key():
+    _require_legacy_demo_enabled()
     return {
         "issuer": ISSUER,
         "publicKeyPem": get_demo_ca_public_key(),
@@ -85,8 +130,9 @@ def get_ca_public_key():
     }
 
 
-@app.post("/api/keys/generate", response_model=KeyGenerateResponse)
+@app.post("/api/keys/generate", response_model=KeyGenerateResponse, include_in_schema=ENABLE_LEGACY_DEMO)
 def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
+    _require_legacy_demo_enabled()
     private_key_pem, public_key_pem = generate_key_pair()
     certificate = create_demo_certificate(payload.name, payload.email, public_key_pem)
     record = CertificateRecord(
@@ -109,18 +155,27 @@ def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/api/documents/hash")
-async def hash_document(file: UploadFile = File(...)):
+async def hash_document(file: UploadFile = File(...), hashAlgorithm: str = Form("SHA-256")):
+    try:
+        normalized_hash_algorithm = normalize_hash_algorithm(hashAlgorithm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unsupported hash algorithm") from exc
     content = await file.read()
-    return {"documentName": file.filename, "hashAlgorithm": "SHA-256", "documentHash": sha256_hex(content)}
+    return {
+        "documentName": file.filename,
+        "hashAlgorithm": normalized_hash_algorithm,
+        "documentHash": hash_bytes(content, normalized_hash_algorithm),
+    }
 
 
-@app.post("/api/sign", response_model=SignedPackage)
+@app.post("/api/sign", response_model=SignedPackage, include_in_schema=ENABLE_LEGACY_DEMO)
 async def sign_document(
     file: UploadFile = File(...),
     privateKeyPem: str = Form(...),
     certificate: str = Form(...),
     db: Session = Depends(get_db),
 ):
+    _require_legacy_demo_enabled()
     certificate_obj = read_json_form(certificate, "certificate")
     try:
         certificate_model = Certificate.model_validate(certificate_obj)
@@ -157,12 +212,13 @@ async def sign_document(
     }
 
 
-@app.post("/api/verify", response_model=VerifyResponse)
+@app.post("/api/verify", response_model=VerifyResponse, include_in_schema=ENABLE_LEGACY_DEMO)
 async def verify_document(
     file: UploadFile = File(...),
     signedPackage: str = Form(...),
     db: Session = Depends(get_db),
 ):
+    _require_legacy_demo_enabled()
     package_obj = read_json_form(signedPackage, "signed package")
     try:
         package = SignedPackage.model_validate(package_obj)
@@ -251,8 +307,9 @@ def _invalid(reason: str, package: SignedPackage, document_hash: str, details: D
     }
 
 
-@app.post("/api/certificates/revoke")
+@app.post("/api/certificates/revoke", include_in_schema=ENABLE_LEGACY_DEMO)
 def revoke_certificate(payload: RevokeCertificateRequest, db: Session = Depends(get_db)):
+    _require_legacy_demo_enabled()
     certificate = payload.certificate.model_dump()
     if not verify_certificate_signature(certificate):
         raise HTTPException(status_code=400, detail="Certificate is not signed by SecureDoc Demo CA")

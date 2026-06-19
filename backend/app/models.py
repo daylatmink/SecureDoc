@@ -122,3 +122,31 @@ class BlindSignatureSession(Base):
     @property
     def token_json_as_dict(self) -> dict:
         return json.loads(self.token_json)
+
+
+class EmailOtpToken(Base):
+    __tablename__ = "email_otp_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String, nullable=False, index=True)
+    purpose = Column(String, nullable=False, index=True)
+    otp_hash = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=5)
+    created_at = Column(DateTime, nullable=False)
+
+
+class UserMfaSetting(Base):
+    __tablename__ = "user_mfa_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String, nullable=False, unique=True, index=True)
+    type = Column(String, nullable=False, default="TOTP")
+    secret_encrypted = Column(Text, nullable=False)
+    enabled = Column(Integer, nullable=False, default=0)
+    verified_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+    last_used_at = Column(DateTime, nullable=True)
