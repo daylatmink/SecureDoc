@@ -13,16 +13,24 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi.testclient import TestClient
 
 from app.crypto_utils import canonicalize_signing_payload, generate_key_pair, get_public_key_size, hash_bytes, parse_iso_datetime
-from app.auth_utils import create_email_otp, create_totp_setting, current_totp_code, verify_email_otp, verify_totp_setup
+from app.auth_utils import (
+    create_email_otp,
+    create_signing_email_otp,
+    create_totp_setting,
+    current_totp_code,
+    verify_email_otp,
+    verify_totp_setup,
+)
 from app.database import SessionLocal
 from app.main import _rate_limit_buckets, app
-from app.models import AuditLog, CertificateRecord, EmailOtpToken, UserMfaSetting
+from app.models import AuditLog, CertificateRecord, EmailOtpToken, SigningRequest, UserMfaSetting
 from app.x509_utils import issue_user_x509_certificate, verify_signed_demo_crl
 
 
 DOCUMENT = b"SecureDoc v2 test document"
 CA_HEADERS = {"X-SecureDoc-User": "pytest-ca", "X-SecureDoc-Role": "CA_OFFICER"}
-SIGNER_HEADERS = {"X-SecureDoc-User": "pytest-signer", "X-SecureDoc-Role": "SIGNER"}
+SIGNER_HEADERS = {"X-SecureDoc-User": "signer@example.com", "X-SecureDoc-Role": "SIGNER"}
+OTHER_SIGNER_HEADERS = {"X-SecureDoc-User": "other-signer@example.com", "X-SecureDoc-Role": "SIGNER"}
 AUDITOR_HEADERS = {"X-SecureDoc-User": "pytest-auditor", "X-SecureDoc-Role": "AUDITOR"}
 VERIFIER_HEADERS = {"X-SecureDoc-User": "pytest-verifier", "X-SecureDoc-Role": "VERIFIER"}
 
@@ -62,6 +70,8 @@ def test_v2_verify_success():
     assert data["report"]["revocationValid"] is True
     assert data["report"]["timestampValid"] is True
     assert data["report"]["serverAccepted"] is True
+    assert data["report"]["signingRequestConfirmed"] is True
+    assert data["report"]["confirmationMethod"] == "EMAIL_OTP"
     assert data["report"]["legalReady"] is False
 
 
@@ -83,6 +93,9 @@ def test_offline_valid_package_is_not_server_accepted():
     assert data["report"]["cryptoValid"] is True
     assert data["report"]["serverAccepted"] is False
     assert data["report"]["legalReady"] is False
+    assert data["report"]["signingRequestConfirmed"] is False
+    assert data["report"]["confirmationMethod"] is None
+    assert data["report"]["finalDecision"] == "crypto_valid_server_rejected"
     assert any("Replay check is not authoritative" in warning for warning in data["report"]["warnings"])
 
 
@@ -427,6 +440,103 @@ def test_timestamp_token_is_verified():
     assert data["report"]["timestampStatus"] == "demo-tsa-valid"
 
 
+def test_submit_signed_package_without_otp_or_totp_confirmation_is_rejected():
+    with TestClient(app) as client:
+        package, _document_hash, _certificate = _create_prepared_signed_package(client)
+
+        response = client.post("/api/sign/v2/submit", headers=SIGNER_HEADERS, json=package)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Signing request has not been OTP/TOTP confirmed"
+
+
+def test_email_otp_bound_to_different_request_id_is_rejected():
+    with TestClient(app) as client:
+        package_a, _document_hash_a, _certificate_a = _create_prepared_signed_package(client, document_name="request-a.txt")
+        package_b, _document_hash_b, _certificate = _create_prepared_signed_package(
+            client,
+            document_name="request-b.txt",
+            document=b"second document",
+        )
+        otp = _create_bound_email_otp(package_a["signingPayload"]["requestId"])
+
+        response = client.post(
+            f"/api/v2/signing-requests/{package_b['signingPayload']['requestId']}/confirm",
+            headers=SIGNER_HEADERS,
+            json={"method": "EMAIL_OTP", "code": otp},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "OTP not found for this signing request"
+
+
+def test_email_otp_bound_to_different_document_hash_is_rejected():
+    with TestClient(app) as client:
+        package, _document_hash, _certificate = _create_prepared_signed_package(client)
+        request_id = package["signingPayload"]["requestId"]
+        with SessionLocal() as db:
+            request = db.get(SigningRequest, request_id)
+            assert request is not None
+            _token, otp = create_signing_email_otp(
+                db,
+                email=request.signer_email,
+                signing_request_id=request.request_id,
+                document_hash=hash_bytes(b"different document", "SHA-256"),
+                certificate_serial=request.certificate_serial,
+                signing_purpose=request.signing_purpose,
+                nonce=request.nonce,
+            )
+            db.commit()
+
+        response = client.post(
+            f"/api/v2/signing-requests/{request_id}/confirm",
+            headers=SIGNER_HEADERS,
+            json={"method": "EMAIL_OTP", "code": otp},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "OTP not found for this signing request"
+
+
+def test_totp_confirmation_rejects_authenticated_user_who_does_not_own_request():
+    with TestClient(app) as client:
+        package, _document_hash, _certificate = _create_prepared_signed_package(client)
+        request_id = package["signingPayload"]["requestId"]
+        with SessionLocal() as db:
+            setting, secret, _uri = create_totp_setting(db, "signer@example.com")
+            db.commit()
+            ok, message = verify_totp_setup(db, "signer@example.com", secret, current_totp_code(secret))
+            db.commit()
+            assert ok, message
+        code = current_totp_code(secret)
+
+        response = client.post(
+            f"/api/v2/signing-requests/{request_id}/confirm",
+            headers=OTHER_SIGNER_HEADERS,
+            json={"method": "TOTP", "code": code},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Authenticated signer does not own this signing request"
+
+
+def test_crypto_valid_package_for_unconfirmed_request_is_not_server_accepted():
+    with TestClient(app) as client:
+        package, document_hash, _certificate = _create_prepared_signed_package(client)
+
+        response = client.post(
+            "/api/verify/v2",
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["report"]["cryptoValid"] is True
+    assert data["report"]["serverAccepted"] is False
+    assert data["report"]["signingRequestConfirmed"] is False
+    assert data["report"]["confirmationMethod"] is None
+
+
 def test_audit_chain_valid():
     with TestClient(app) as client:
         _create_submitted_package(client)
@@ -457,6 +567,19 @@ def test_audit_chain_detects_tampered_log():
 
 
 def _create_submitted_package(client: TestClient):
+    package, document_hash, _certificate = _create_prepared_signed_package(client)
+    _confirm_request_with_email_otp(client, package["signingPayload"]["requestId"])
+    submit = client.post("/api/sign/v2/submit", headers=SIGNER_HEADERS, json=package)
+    assert submit.status_code == 200, submit.text
+    return submit.json()["signedPackage"], document_hash
+
+
+def _create_prepared_signed_package(
+    client: TestClient,
+    *,
+    document: bytes = DOCUMENT,
+    document_name: str = "document.txt",
+):
     private_key_pem, public_key_pem = generate_key_pair()
     issued = client.post(
         "/api/certificates/x509/issue",
@@ -468,28 +591,27 @@ def _create_submitted_package(client: TestClient):
     assert key_data["certificateType"] == "x509-demo"
     assert key_data["userCertificatePem"].startswith("-----BEGIN CERTIFICATE-----")
     certificate = key_data["certificate"]
-    document_hash = hash_bytes(DOCUMENT, "SHA-256")
 
+    document_hash = hash_bytes(document, "SHA-256")
     prepare = client.post(
         "/api/sign/v2/prepare",
         headers=SIGNER_HEADERS,
         json={
-            "documentName": "document.txt",
+            "documentName": document_name,
             "documentHash": document_hash,
             "hashAlgorithm": "SHA-256",
             "certificateSerialNumber": certificate["serialNumber"],
             "signingPurpose": "approve_document",
         },
     )
-    assert prepare.status_code == 200
+    assert prepare.status_code == 200, prepare.text
     payload = prepare.json()["signingPayload"]
-    signature = _sign_payload(payload, private_key_pem)
     package = {
         "packageVersion": "2.0",
         "signingPayload": payload,
         "payloadCanonicalization": "JSON-canonical-sorted-keys",
         "signatureAlgorithm": "RSA-PSS",
-        "signatureBase64": signature,
+        "signatureBase64": _sign_payload(payload, private_key_pem),
         "userCertificatePem": certificate["userCertificatePem"],
         "intermediateCertificatePem": certificate["intermediateCertificatePem"],
         "rootCertificatePem": certificate["rootCertificatePem"],
@@ -497,10 +619,34 @@ def _create_submitted_package(client: TestClient):
         "signerCertificate": certificate,
         "signedAtClient": "2026-06-16T00:00:00+00:00",
     }
+    return package, document_hash, certificate
 
-    submit = client.post("/api/sign/v2/submit", headers=SIGNER_HEADERS, json=package)
-    assert submit.status_code == 200, submit.text
-    return submit.json()["signedPackage"], document_hash
+
+def _confirm_request_with_email_otp(client: TestClient, request_id: str) -> None:
+    otp = _create_bound_email_otp(request_id)
+    confirm = client.post(
+        f"/api/v2/signing-requests/{request_id}/confirm",
+        headers=SIGNER_HEADERS,
+        json={"method": "EMAIL_OTP", "code": otp},
+    )
+    assert confirm.status_code == 200, confirm.text
+
+
+def _create_bound_email_otp(request_id: str) -> str:
+    with SessionLocal() as db:
+        request = db.get(SigningRequest, request_id)
+        assert request is not None
+        _token, otp = create_signing_email_otp(
+            db,
+            email=request.signer_email,
+            signing_request_id=request.request_id,
+            document_hash=request.document_hash,
+            certificate_serial=request.certificate_serial,
+            signing_purpose=request.signing_purpose,
+            nonce=request.nonce,
+        )
+        db.commit()
+        return otp
 
 
 def client_like_verify_totp_setup(db, email: str, secret: str, code: str) -> bool:

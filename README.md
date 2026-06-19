@@ -47,8 +47,8 @@ Phase 1 stabilization also adds:
 
 - Demo RBAC headers for sensitive endpoints: `X-SecureDoc-User` and `X-SecureDoc-Role`.
 - Roles: `ADMIN`, `CA_OFFICER`, `SIGNER`, `VERIFIER`, `AUDITOR`.
-- Email OTP storage with hash, purpose, expiry, used time, and attempt count. The API does not return OTP values. Configure SMTP env vars to receive OTP by email.
-- TOTP Authenticator setup primitives are available in the frontend `MFA` tab. This is still not a full production login system.
+- Email OTP fallback for signing confirmation is bound to the signing request, document hash, certificate serial, signing purpose, and nonce. The API does not return OTP values. Configure SMTP env vars to receive OTP by email.
+- TOTP Authenticator setup primitives are available in the frontend `Security` tab and are used as step-up confirmation in the signing flow. This is still not a full production login system.
 - Request size limit, in-memory rate limit, and CORS allowlist configuration.
 
 ## Run Frontend
