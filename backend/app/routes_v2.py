@@ -479,6 +479,8 @@ def prepare_signing_request(
     record = db.get(CertificateRecord, body.certificateSerialNumber)
     if not record:
         raise HTTPException(status_code=404, detail="Certificate not found")
+    if record.email.strip().lower() != _actor_email(actor):
+        raise HTTPException(status_code=403, detail="Authenticated signer does not own this certificate")
     if record.status != "valid":
         raise HTTPException(status_code=400, detail="Certificate is revoked")
     if _as_utc(record.expires_at) < utc_now():
@@ -566,15 +568,20 @@ def request_signing_email_otp(
     if request.status != "pending":
         raise HTTPException(status_code=400, detail=f"Signing request is {request.status}")
 
-    token, otp = create_signing_email_otp(
-        db,
-        email=request.signer_email,
-        signing_request_id=request.request_id,
-        document_hash=request.document_hash,
-        certificate_serial=request.certificate_serial,
-        signing_purpose=request.signing_purpose,
-        nonce=request.nonce,
-    )
+    try:
+        token, otp = create_signing_email_otp(
+            db,
+            email=request.signer_email,
+            signing_request_id=request.request_id,
+            document_hash=request.document_hash,
+            certificate_serial=request.certificate_serial,
+            signing_purpose=request.signing_purpose,
+            nonce=request.nonce,
+        )
+    except ValueError as exc:
+        if "cooldown" in str(exc):
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     delivery = _send_otp_email(token.email, "SIGNING_CONFIRMATION", otp)
     _log_audit(
         db,

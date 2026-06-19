@@ -1,8 +1,11 @@
 import base64
 import copy
+import hashlib
+import hmac
 import sys
 import os
 import time
+from datetime import timedelta
 from pathlib import Path
 
 os.environ["SECUREDOC_DATABASE_URL"] = "sqlite:///:memory:"
@@ -170,6 +173,32 @@ def test_ca_officer_can_issue_cert():
     assert response.json()["certificateType"] == "x509-demo"
 
 
+def test_user_cannot_prepare_signing_request_for_certificate_they_do_not_own():
+    _, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        issued = client.post(
+            "/api/certificates/x509/issue",
+            headers=CA_HEADERS,
+            json={"name": "Other Owner", "email": "other-owner@example.com", "publicKeyPem": public_key_pem},
+        )
+        assert issued.status_code == 200
+        certificate = issued.json()["certificate"]
+        response = client.post(
+            "/api/sign/v2/prepare",
+            headers=SIGNER_HEADERS,
+            json={
+                "documentName": "document.txt",
+                "documentHash": hash_bytes(DOCUMENT, "SHA-256"),
+                "hashAlgorithm": "SHA-256",
+                "certificateSerialNumber": certificate["serialNumber"],
+                "signingPurpose": "approve_document",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Authenticated signer does not own this certificate"
+
+
 def test_email_otp_is_hashed_expires_and_cannot_be_reused():
     with SessionLocal() as db:
         token, otp = create_email_otp(db, "otp@example.com", "SENSITIVE_ACTION")
@@ -186,10 +215,25 @@ def test_email_otp_is_hashed_expires_and_cannot_be_reused():
         assert reused_message == "OTP already used"
 
 
+def test_otp_hash_uses_hmac_pepper_and_is_not_plain_bruteforce(monkeypatch):
+    monkeypatch.delenv("SECUREDOC_OTP_PEPPER", raising=False)
+    with SessionLocal() as db:
+        token, otp = create_email_otp(db, "pepper@example.com", "SENSITIVE_ACTION")
+        stored_hash = token.otp_hash
+        db.commit()
+
+    legacy_plain = hashlib.sha256(f"pepper@example.com:SENSITIVE_ACTION:{otp}".encode("utf-8")).hexdigest()
+    context = "pepper@example.com:SENSITIVE_ACTION::::::" + otp
+    wrong_pepper = hmac.new(b"wrong-pepper", context.encode("utf-8"), hashlib.sha256).hexdigest()
+    assert stored_hash != legacy_plain
+    assert stored_hash != wrong_pepper
+
+
 def test_email_otp_api_does_not_return_plain_otp():
     with TestClient(app) as client:
         response = client.post(
             "/api/auth/email-otp/request",
+            headers={"X-SecureDoc-User": "api-otp@example.com", "X-SecureDoc-Role": "SIGNER"},
             json={"email": "api-otp@example.com", "purpose": "SENSITIVE_ACTION"},
         )
 
@@ -202,6 +246,18 @@ def test_email_otp_api_does_not_return_plain_otp():
         token = db.query(EmailOtpToken).filter_by(email="api-otp@example.com").first()
         assert token is not None
         assert len(token.otp_hash) == 64
+
+
+def test_generic_email_otp_cannot_be_used_for_signing_confirmation():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/email-otp/request",
+            headers=SIGNER_HEADERS,
+            json={"email": "signer@example.com", "purpose": "SIGNING_CONFIRMATION"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Use signing request confirmation OTP endpoint"
 
 
 def test_email_otp_attempt_limit_and_expiry():
@@ -228,23 +284,79 @@ def test_email_otp_attempt_limit_and_expiry():
 
 
 def test_totp_setup_requires_valid_code_and_does_not_store_plain_secret():
+    headers = {"X-SecureDoc-User": "mfa@example.com", "X-SecureDoc-Role": "SIGNER"}
+    with TestClient(app) as client:
+        setup = client.post("/api/auth/totp/setup", headers=headers)
+        assert setup.status_code == 200, setup.text
+        data = setup.json()
+        assert data["email"] == "mfa@example.com"
+        assert data["otpauthUri"].startswith("otpauth://totp/")
+        secret = data["secret"]
+
+        invalid_code = "000000" if current_totp_code(secret) != "000000" else "000001"
+        bad = client.post("/api/auth/totp/verify-setup", headers=headers, json={"code": invalid_code})
+        assert bad.status_code == 200
+        assert bad.json()["verified"] is False
+
+        good = client.post("/api/auth/totp/verify-setup", headers=headers, json={"code": current_totp_code(secret)})
+        assert good.status_code == 200
+        assert good.json()["verified"] is True
+
     with SessionLocal() as db:
-        setting, secret, uri = create_totp_setting(db, "mfa@example.com")
-        db.commit()
-        assert uri.startswith("otpauth://totp/")
-        assert setting.secret_encrypted != secret
-
-        valid_code = current_totp_code(secret)
-        invalid_code = "000000" if valid_code != "000000" else "000001"
-        bad = client_like_verify_totp_setup(db, "mfa@example.com", secret, invalid_code)
-        assert bad is False
-
-        good = client_like_verify_totp_setup(db, "mfa@example.com", secret, valid_code)
-        db.commit()
         stored = db.query(UserMfaSetting).filter_by(email="mfa@example.com").first()
-        assert good is True
         assert stored is not None
         assert stored.enabled == 1
+        assert stored.secret_encrypted != secret
+        assert not stored.secret_encrypted.startswith("demo-b64:")
+        assert base64.b32encode(base64.b32decode(secret + ("=" * ((8 - len(secret) % 8) % 8)), casefold=True)).decode("ascii").rstrip("=") == secret
+        assert base64.b64encode(secret.encode("utf-8")).decode("ascii") not in stored.secret_encrypted
+
+
+def test_unauthenticated_totp_setup_is_rejected():
+    with TestClient(app) as client:
+        response = client.post("/api/auth/totp/setup")
+
+    assert response.status_code == 401
+
+
+def test_totp_verify_setup_does_not_accept_secret():
+    headers = {"X-SecureDoc-User": "totp-contract@example.com", "X-SecureDoc-Role": "SIGNER"}
+    with TestClient(app) as client:
+        setup = client.post("/api/auth/totp/setup", headers=headers)
+        assert setup.status_code == 200
+        secret = setup.json()["secret"]
+        response = client.post(
+            "/api/auth/totp/verify-setup",
+            headers=headers,
+            json={"code": current_totp_code(secret), "secret": secret},
+        )
+
+    assert response.status_code == 422
+
+
+def test_enabled_mfa_is_not_reset_by_regular_totp_setup():
+    headers = {"X-SecureDoc-User": "enabled-mfa@example.com", "X-SecureDoc-Role": "SIGNER"}
+    with TestClient(app) as client:
+        setup = client.post("/api/auth/totp/setup", headers=headers)
+        assert setup.status_code == 200
+        secret = setup.json()["secret"]
+        verify = client.post("/api/auth/totp/verify-setup", headers=headers, json={"code": current_totp_code(secret)})
+        assert verify.status_code == 200
+        assert verify.json()["verified"] is True
+        with SessionLocal() as db:
+            stored_before = db.query(UserMfaSetting).filter_by(email="enabled-mfa@example.com").first()
+            assert stored_before is not None
+            encrypted_before = stored_before.secret_encrypted
+
+        reset = client.post("/api/auth/totp/setup", headers=headers)
+
+    assert reset.status_code == 403
+    assert reset.json()["detail"] == "TOTP already enabled; re-authentication is required to reset it"
+    with SessionLocal() as db:
+        stored_after = db.query(UserMfaSetting).filter_by(email="enabled-mfa@example.com").first()
+        assert stored_after is not None
+        assert stored_after.enabled == 1
+        assert stored_after.secret_encrypted == encrypted_before
 
 
 def test_request_size_limit_rejects_large_body():
@@ -450,6 +562,50 @@ def test_submit_signed_package_without_otp_or_totp_confirmation_is_rejected():
     assert response.json()["detail"] == "Signing request has not been OTP/TOTP confirmed"
 
 
+def test_signing_otp_resend_cooldown_is_enforced():
+    with TestClient(app) as client:
+        package, _document_hash, _certificate = _create_prepared_signed_package(client)
+        request_id = package["signingPayload"]["requestId"]
+        first = client.post(f"/api/v2/signing-requests/{request_id}/otp/request", headers=SIGNER_HEADERS)
+        second = client.post(f"/api/v2/signing-requests/{request_id}/otp/request", headers=SIGNER_HEADERS)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 429
+    assert "cooldown" in second.json()["detail"]
+
+
+def test_old_signing_otp_is_revoked_when_new_one_is_created_after_cooldown():
+    with TestClient(app) as client:
+        package, _document_hash, _certificate = _create_prepared_signed_package(client)
+        request_id = package["signingPayload"]["requestId"]
+        old_otp = _create_bound_email_otp(request_id)
+        with SessionLocal() as db:
+            old_token = (
+                db.query(EmailOtpToken)
+                .filter_by(signing_request_id=request_id, purpose="SIGNING_CONFIRMATION")
+                .order_by(EmailOtpToken.id.desc())
+                .first()
+            )
+            assert old_token is not None
+            old_token.created_at = old_token.created_at - timedelta(seconds=61)
+            db.commit()
+        new_otp = _create_bound_email_otp(request_id)
+
+        old_confirm = client.post(
+            f"/api/v2/signing-requests/{request_id}/confirm",
+            headers=SIGNER_HEADERS,
+            json={"method": "EMAIL_OTP", "code": old_otp},
+        )
+        new_confirm = client.post(
+            f"/api/v2/signing-requests/{request_id}/confirm",
+            headers=SIGNER_HEADERS,
+            json={"method": "EMAIL_OTP", "code": new_otp},
+        )
+
+    assert old_confirm.status_code == 400
+    assert new_confirm.status_code == 200, new_confirm.text
+
+
 def test_email_otp_bound_to_different_request_id_is_rejected():
     with TestClient(app) as client:
         package_a, _document_hash_a, _certificate_a = _create_prepared_signed_package(client, document_name="request-a.txt")
@@ -505,7 +661,7 @@ def test_totp_confirmation_rejects_authenticated_user_who_does_not_own_request()
         with SessionLocal() as db:
             setting, secret, _uri = create_totp_setting(db, "signer@example.com")
             db.commit()
-            ok, message = verify_totp_setup(db, "signer@example.com", secret, current_totp_code(secret))
+            ok, message = verify_totp_setup(db, "signer@example.com", current_totp_code(secret))
             db.commit()
             assert ok, message
         code = current_totp_code(secret)
@@ -649,8 +805,8 @@ def _create_bound_email_otp(request_id: str) -> str:
         return otp
 
 
-def client_like_verify_totp_setup(db, email: str, secret: str, code: str) -> bool:
-    ok, _message = verify_totp_setup(db, email, secret, code)
+def client_like_verify_totp_setup(db, email: str, code: str) -> bool:
+    ok, _message = verify_totp_setup(db, email, code)
     return ok
 
 

@@ -185,7 +185,7 @@ export async function requestEmailOtp(body: {
 }): Promise<EmailOtpRequestResponse> {
   const response = await fetch(`${API_BASE}/api/auth/email-otp/request`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(body.email) },
     body: JSON.stringify(body),
   });
   return handleResponse<EmailOtpRequestResponse>(response);
@@ -198,7 +198,7 @@ export async function verifyEmailOtp(body: {
 }): Promise<EmailOtpVerifyResponse> {
   const response = await fetch(`${API_BASE}/api/auth/email-otp/verify`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(body.email) },
     body: JSON.stringify(body),
   });
   return handleResponse<EmailOtpVerifyResponse>(response);
@@ -209,21 +209,19 @@ export async function setupTotp(body: {
 }): Promise<TotpSetupResponse> {
   const response = await fetch(`${API_BASE}/api/auth/totp/setup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(body.email) },
   });
   return handleResponse<TotpSetupResponse>(response);
 }
 
 export async function verifyTotpSetup(body: {
   email: string;
-  secret: string;
   code: string;
 }): Promise<TotpVerifyResponse> {
   const response = await fetch(`${API_BASE}/api/auth/totp/verify-setup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(body.email) },
+    body: JSON.stringify({ code: body.code }),
   });
   return handleResponse<TotpVerifyResponse>(response);
 }
@@ -256,10 +254,11 @@ export async function prepareSigningRequest(body: {
   hashAlgorithm: HashAlgorithm;
   certificateSerialNumber: string;
   signingPurpose: string;
+  signerEmail: string;
 }): Promise<PrepareResponse> {
   const response = await fetch(`${API_BASE}/api/sign/v2/prepare`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...DEMO_AUTH.signer },
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(body.signerEmail) },
     body: JSON.stringify(body),
   });
   return handleResponse<PrepareResponse>(response);
@@ -268,7 +267,7 @@ export async function prepareSigningRequest(body: {
 export async function submitSignature(body: SignedPackageV2): Promise<SubmitResponse> {
   const response = await fetch(`${API_BASE}/api/sign/v2/submit`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...DEMO_AUTH.signer },
+    headers: { "Content-Type": "application/json", ...signerAuthHeaders(body.signingPayload.signerEmail) },
     body: JSON.stringify(body),
   });
   return handleResponse<SubmitResponse>(response);

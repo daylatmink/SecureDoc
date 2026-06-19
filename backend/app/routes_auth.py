@@ -8,12 +8,13 @@ import smtplib
 from email.message import EmailMessage
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr
 from sqlalchemy.orm import Session
 
-from .auth_utils import create_email_otp, create_totp_setting, verify_email_otp, verify_totp_setup
+from .auth_utils import create_email_otp, create_totp_setting, totp_storage_warning, verify_email_otp, verify_totp_setup
 from .config import SMTP_FROM_EMAIL, SMTP_HOST, SMTP_PASSWORD, SMTP_PORT, SMTP_USERNAME, SMTP_USE_TLS
 from .database import SessionLocal
+from .security import SIGNER, require_roles
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -30,12 +31,14 @@ class EmailOtpVerifyRequest(BaseModel):
 
 
 class TotpSetupRequest(BaseModel):
-    email: EmailStr
+    model_config = ConfigDict(extra="forbid")
+
+    pass
 
 
 class TotpVerifySetupRequest(BaseModel):
-    email: EmailStr
-    secret: str
+    model_config = ConfigDict(extra="forbid")
+
     code: str
 
 
@@ -68,14 +71,26 @@ def _send_otp_email(email: str, purpose: str, otp: str) -> str:
             if SMTP_USERNAME:
                 smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(message)
-    except OSError as exc:
+    except (OSError, smtplib.SMTPException) as exc:
         raise HTTPException(status_code=502, detail="OTP email delivery failed") from exc
 
     return "smtp_sent"
 
 
-@router.post("/email-otp/request")
-def request_email_otp(body: EmailOtpRequest, db: Session = Depends(get_db)):
+def _actor_email(actor: dict[str, str]) -> str:
+    return actor["user"].strip().lower()
+
+
+@router.post("/email-otp/request", include_in_schema=False)
+def request_email_otp(
+    body: EmailOtpRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    if body.purpose.strip().upper() == "SIGNING_CONFIRMATION":
+        raise HTTPException(status_code=400, detail="Use signing request confirmation OTP endpoint")
+    if body.email.strip().lower() != _actor_email(actor):
+        raise HTTPException(status_code=403, detail="Generic OTP is limited to the authenticated account")
     try:
         token, otp = create_email_otp(db, body.email, body.purpose)
     except ValueError as exc:
@@ -88,12 +103,20 @@ def request_email_otp(body: EmailOtpRequest, db: Session = Depends(get_db)):
         "purpose": token.purpose,
         "expiresAt": token.expires_at.isoformat(),
         "delivery": delivery,
-        "warning": "OTP is hashed in storage and is not returned by this API.",
+        "warning": "Demo account-only OTP. Not used for signing confirmation and not returned by this API.",
     }
 
 
-@router.post("/email-otp/verify")
-def verify_email_otp_route(body: EmailOtpVerifyRequest, db: Session = Depends(get_db)):
+@router.post("/email-otp/verify", include_in_schema=False)
+def verify_email_otp_route(
+    body: EmailOtpVerifyRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    if body.purpose.strip().upper() == "SIGNING_CONFIRMATION":
+        raise HTTPException(status_code=400, detail="Use signing request confirmation endpoint")
+    if body.email.strip().lower() != _actor_email(actor):
+        raise HTTPException(status_code=403, detail="Generic OTP is limited to the authenticated account")
     try:
         ok, message = verify_email_otp(db, body.email, body.purpose, body.otp)
     except ValueError as exc:
@@ -103,8 +126,14 @@ def verify_email_otp_route(body: EmailOtpVerifyRequest, db: Session = Depends(ge
 
 
 @router.post("/totp/setup")
-def setup_totp(body: TotpSetupRequest, db: Session = Depends(get_db)):
-    setting, secret, uri = create_totp_setting(db, body.email)
+def setup_totp(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    try:
+        setting, secret, uri = create_totp_setting(db, _actor_email(actor))
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     db.commit()
     return {
         "mfaId": setting.id,
@@ -113,12 +142,16 @@ def setup_totp(body: TotpSetupRequest, db: Session = Depends(get_db)):
         "enabled": False,
         "secret": secret,
         "otpauthUri": uri,
-        "warning": "Show this secret/QR only during setup. Do not store it in public UI state.",
+        "warning": f"Show this secret/QR only during setup. {totp_storage_warning()}",
     }
 
 
 @router.post("/totp/verify-setup")
-def verify_totp_setup_route(body: TotpVerifySetupRequest, db: Session = Depends(get_db)):
-    ok, message = verify_totp_setup(db, body.email, body.secret, body.code)
+def verify_totp_setup_route(
+    body: TotpVerifySetupRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    ok, message = verify_totp_setup(db, _actor_email(actor), body.code)
     db.commit()
     return {"verified": ok, "reason": message}
