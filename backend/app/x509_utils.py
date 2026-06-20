@@ -229,6 +229,8 @@ def issue_user_x509_certificate(
     validity_days: int = 365,
     digital_signature_usage: bool = True,
     content_commitment_usage: bool = True,
+    signer_ca: bool = False,
+    not_yet_valid: bool = False,
 ) -> dict[str, Any]:
     if not name.strip():
         raise ValueError("name is required")
@@ -245,7 +247,10 @@ def issue_user_x509_certificate(
     root_cert = _load_certificate(X509_ROOT_CERT_PATH)
 
     now = utc_now()
-    if validity_days <= 0:
+    if not_yet_valid:
+        not_before = now + timedelta(days=1)
+        not_after = now + timedelta(days=max(validity_days, 1) + 1)
+    elif validity_days <= 0:
         not_before = now - timedelta(days=2)
         not_after = now - timedelta(days=1)
     else:
@@ -259,7 +264,7 @@ def issue_user_x509_certificate(
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_before)
         .not_valid_after(not_after)
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.BasicConstraints(ca=signer_ca, path_length=0 if signer_ca else None), critical=True)
         .add_extension(_user_key_usage(digital_signature_usage, content_commitment_usage), critical=True)
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False)
         .add_extension(
@@ -365,10 +370,12 @@ def verify_demo_x509_chain(
         for ca_cert in (root_cert, intermediate_cert):
             basic_constraints = _extension(ca_cert, ExtensionOID.BASIC_CONSTRAINTS)
             key_usage = _extension(ca_cert, ExtensionOID.KEY_USAGE)
+            _extension(ca_cert, ExtensionOID.SUBJECT_KEY_IDENTIFIER)
             if not basic_constraints.ca:
                 return False, "CA certificate BasicConstraints is not CA=true"
             if not key_usage.key_cert_sign or not key_usage.crl_sign:
                 return False, "CA certificate KeyUsage must include keyCertSign and cRLSign"
+        _extension(intermediate_cert, ExtensionOID.AUTHORITY_KEY_IDENTIFIER)
 
         user_constraints = _extension(user_cert, ExtensionOID.BASIC_CONSTRAINTS)
         user_key_usage = _extension(user_cert, ExtensionOID.KEY_USAGE)
@@ -382,9 +389,11 @@ def verify_demo_x509_chain(
             return False, "User signing certificate must not be allowed to sign certificates or CRLs"
 
         now = utc_now()
-        for certificate in (intermediate_cert, root_cert):
-            if certificate.not_valid_before_utc > now or certificate.not_valid_after_utc < now:
-                return False, "CA certificate chain is outside its validity period"
+        for certificate in (user_cert, intermediate_cert, root_cert):
+            if certificate.not_valid_before_utc > now:
+                return False, "Certificate is not yet valid"
+            if certificate.not_valid_after_utc < now:
+                return False, "Certificate is expired"
 
         return True, "X.509 demo chain is valid"
     except (ValueError, InvalidSignature, x509.ExtensionNotFound, TypeError) as exc:

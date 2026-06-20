@@ -11,7 +11,6 @@ import {
   EyeOff,
   FileCheck,
   FileSignature,
-  FileText,
   Fingerprint,
   Hash,
   KeyRound,
@@ -24,23 +23,28 @@ import {
 import {
   browserSigningHashSupported,
   canonicalizePayload,
+  clearAuthToken,
   confirmSigningRequest,
-  demoLogin,
   generateBrowserSigningKeyPair,
+  getMe,
   hashDocument,
   importPrivateKey,
   issueX509Certificate,
   prepareSigningRequest,
+  requestLoginOtp,
   requestSigningEmailOtp,
   revokeCertificate,
+  setAuthToken,
   signPdfPades,
   signPayload,
   setupTotp,
   submitSignature,
   verifyAuditChain,
+  verifyLoginOtp,
   verifyTotpSetup,
   verifyV2,
   type AuditChainResult,
+  type AuthUser,
   type Certificate,
   type HashAlgorithm,
   type PrepareResponse,
@@ -50,6 +54,7 @@ import {
   type SubmitResponse,
   type TotpSetupResponse,
   type TotpVerifyResponse,
+  type UserRole,
   type VerificationReport,
   type VerificationStep,
   type VerifyV2Response,
@@ -142,18 +147,32 @@ type BlindRedeemResponse = {
   spentAt?: string;
 };
 
-type Tab = "home" | "documents" | "mfa" | "hash" | "keys" | "signv2" | "verifyv2" | "sign" | "verify" | "revoke" | "blind";
+type Tab = "home" | "keys" | "signv2" | "verifyv2" | "revoke" | "audit" | "admin";
+type NavItem = { tab: Tab; label: string; helper: string; icon: React.ReactNode };
 
-const tabs: Array<{ tab: Tab; label: string; helper: string; icon: React.ReactNode }> = [
-  { tab: "home", label: "Tong quan", helper: "V2 flow", icon: <BadgeCheck size={18} /> },
-  { tab: "documents", label: "Documents", helper: "Main flow", icon: <FileText size={18} /> },
-  { tab: "mfa", label: "Security", helper: "TOTP", icon: <Smartphone size={18} /> },
-  { tab: "hash", label: "Bam file", helper: "SHA-2/SHA-3", icon: <Hash size={18} /> },
-  { tab: "keys", label: "Tao khoa", helper: "X.509 demo", icon: <KeyRound size={18} /> },
-  { tab: "signv2", label: "Ky v2", helper: "Client-side", icon: <FileSignature size={18} /> },
-  { tab: "verifyv2", label: "Xac minh v2", helper: "Report", icon: <ClipboardCheck size={18} /> },
-  { tab: "revoke", label: "Thu hoi", helper: "By serial", icon: <RotateCcw size={18} /> }
-];
+const roleTabs: Record<UserRole, NavItem[]> = {
+  SIGNER: [
+    { tab: "home", label: "Tong quan", helper: "Signer", icon: <BadgeCheck size={18} /> },
+    { tab: "signv2", label: "Ky tai lieu", helper: "Client-side", icon: <FileSignature size={18} /> }
+  ],
+  CA_OFFICER: [
+    { tab: "home", label: "Tong quan", helper: "CA", icon: <BadgeCheck size={18} /> },
+    { tab: "keys", label: "Cap certificate", helper: "X.509", icon: <KeyRound size={18} /> },
+    { tab: "revoke", label: "Thu hoi", helper: "By serial", icon: <RotateCcw size={18} /> }
+  ],
+  VERIFIER: [
+    { tab: "home", label: "Tong quan", helper: "Verifier", icon: <BadgeCheck size={18} /> },
+    { tab: "verifyv2", label: "Xac minh", helper: "Report", icon: <ClipboardCheck size={18} /> }
+  ],
+  AUDITOR: [
+    { tab: "home", label: "Tong quan", helper: "Auditor", icon: <BadgeCheck size={18} /> },
+    { tab: "audit", label: "Audit chain", helper: "Verify", icon: <ShieldCheck size={18} /> }
+  ],
+  ADMIN: [
+    { tab: "home", label: "Tong quan", helper: "Admin", icon: <BadgeCheck size={18} /> },
+    { tab: "admin", label: "Users", helper: "Roles", icon: <Fingerprint size={18} /> }
+  ]
+};
 
 const hashAlgorithmOptions: Array<{ value: HashAlgorithm; label: string; helper: string }> = [
   { value: "SHA-256", label: "SHA-256", helper: "Default for v2 browser signing." },
@@ -171,7 +190,26 @@ const signingPurposes = [
 ];
 
 function App() {
+  const [session, setSession] = useState<AuthUser | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("home");
+  const tabs = session ? roleTabs[session.role] : [];
+
+  async function handleSignedIn(token: string, _user: AuthUser) {
+    setAuthToken(token);
+    const currentUser = await getMe();
+    setSession(currentUser);
+    setActiveTab(roleTabs[currentUser.role][0]?.tab ?? "home");
+  }
+
+  function logout() {
+    clearAuthToken();
+    setSession(null);
+    setActiveTab("home");
+  }
+
+  if (!session) {
+    return <LoginOtpPanel onSignedIn={handleSignedIn} />;
+  }
 
   return (
     <div className="appShell">
@@ -182,7 +220,7 @@ function App() {
           </div>
           <div>
             <h1>SecureDoc</h1>
-            <span>Digital signature demo</span>
+            <span>{session.role}</span>
           </div>
         </div>
         <nav className="navList">
@@ -192,22 +230,19 @@ function App() {
         </nav>
         <div className="sidebarNote">
           <ShieldCheck size={18} />
-          <p>Main flow is Documents: browser key generation, x509-demo certificate, payload review, browser signing, verify report, and revocation demo.</p>
+          <p>{session.name} is signed in as {session.email}. Role permissions are loaded from the SecureDoc user database.</p>
+          <button className="secondary" onClick={logout}>Sign out</button>
         </div>
       </aside>
 
       <main>
-        {activeTab === "home" && <Home setActiveTab={setActiveTab} />}
-        {activeTab === "documents" && <DocumentsWorkflow />}
-        {activeTab === "mfa" && <MfaOtpSetup />}
-        {activeTab === "hash" && <HashDocument />}
+        {activeTab === "home" && <Home user={session} setActiveTab={setActiveTab} />}
         {activeTab === "keys" && <GenerateKeys />}
         {activeTab === "signv2" && <SignDocumentV2 />}
         {activeTab === "verifyv2" && <VerifyDocumentV2 />}
         {activeTab === "revoke" && <RevokeCertificate />}
-        {activeTab === "sign" && <SignDocumentLegacy />}
-        {activeTab === "verify" && <VerifyDocumentLegacy />}
-        {activeTab === "blind" && <BlindSignatureDemo />}
+        {activeTab === "audit" && <AuditChain />}
+        {activeTab === "admin" && <AdminPanel />}
       </main>
     </div>
   );
@@ -234,44 +269,112 @@ function TabButton(props: {
   );
 }
 
-function Home({ setActiveTab }: { setActiveTab: (tab: Tab) => void }) {
+function Home({ user, setActiveTab }: { user: AuthUser; setActiveTab: (tab: Tab) => void }) {
+  const primary = roleTabs[user.role].find((item) => item.tab !== "home");
+
   return (
     <section className="page">
       <div className="heroPanel">
         <div className="pageHeader">
-          <p className="eyebrow">Digital signature protocol</p>
-          <h2>SecureDoc v2 signs canonical payloads in the browser</h2>
+          <p className="eyebrow">{user.role}</p>
+          <h2>SecureDoc role workspace</h2>
           <p>
-            The main flow no longer sends a private key to the API. SecureDoc creates a signing payload,
-            the client signs that canonical JSON, and the server verifies X.509 demo certificate trust,
-            revocation, replay status, algorithm policy, document integrity, and the RSA-PSS signature.
+            SecureDoc now uses email OTP login and database-backed roles. Protected actions call the API
+            with a Bearer JWT only; the browser no longer selects CA, auditor, or signer privileges.
           </p>
         </div>
-        <div className="heroActions">
-          <button className="primary heroAction" onClick={() => setActiveTab("keys")}>
-            <KeyRound size={18} />
-            Create keys
-          </button>
-          <button className="secondary heroAction" onClick={() => setActiveTab("documents")}>
-            <ClipboardCheck size={18} />
-            Open Documents
-          </button>
-        </div>
+        {primary && (
+          <div className="heroActions">
+            <button className="primary heroAction" onClick={() => setActiveTab(primary.tab)}>
+              {primary.icon}
+              Open {primary.label}
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="workflowGrid" aria-label="V2 workflow">
-        <StepCard number="01" title="Key and certificate" text="Generate the RSA key in the browser, then request an x509-demo certificate from Demo Root CA -> Demo Intermediate CA." />
-        <StepCard number="02" title="Review payload" text="Upload a document, create the signing request, inspect every signingPayload field, then confirm the signing intent." />
-        <StepCard number="03" title="Verify and revoke" text="Submit the signedPackage, inspect the report, revoke the certificate, then verify again to show failure." />
+        <StepCard number="01" title="SIGNER" text="Signs canonical payloads in the browser, confirms signing intent with OTP/TOTP, submits, and views verification results." />
+        <StepCard number="02" title="CA_OFFICER" text="Issues and revokes certificates with proof-of-possession enforced by the API." />
+        <StepCard number="03" title="AUDITOR / VERIFIER" text="Verifier checks signed packages; auditor validates the audit chain." />
       </div>
 
       <div className="metricGrid">
         <InfoBox title="No server-side private key" text="The v2 signing endpoint receives only a signed package, never a private key." />
-        <InfoBox title="Canonical JSON" text="The signature covers the full signingPayload, not only a detached document hash." />
-        <InfoBox title="DB revocation" text="Revocation is checked by serialNumber from the server DB, not from package status." />
-        <InfoBox title="Demo boundaries" text="The CA chain is local demo trust only. PAdES PDF export is available, but default key custody is still demo server-side unless replaced with HSM/remote signing." />
+        <InfoBox title="Role from DB" text="JWT subject identifies the user; authorization loads role and status from the users table." />
+        <InfoBox title="DB revocation" text="Revocation is checked by serialNumber from the server database." />
+        <InfoBox title="Separate workspaces" text="The main navigation no longer exposes a combined document workflow." />
       </div>
     </section>
+  );
+}
+
+function LoginOtpPanel({ onSignedIn }: { onSignedIn: (token: string, user: AuthUser) => Promise<void> }) {
+  const [email, setEmail] = useState("signer@example.com");
+  const [otp, setOtp] = useState("");
+  const [sentTo, setSentTo] = useState("");
+  const [delivery, setDelivery] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function requestOtp() {
+    setError("");
+    setLoading(true);
+    try {
+      const response = await requestLoginOtp(email);
+      setSentTo(response.email);
+      setDelivery(response.delivery);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot request login OTP."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function verifyOtp() {
+    setError("");
+    setLoading(true);
+    try {
+      const response = await verifyLoginOtp(email, otp);
+      await onSignedIn(response.accessToken, response.user);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot verify login OTP."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="loginShell">
+      <section className="surface loginPanel">
+        <div className="brand loginBrand">
+          <div className="brandMark" aria-hidden="true">
+            <Fingerprint size={26} />
+          </div>
+          <div>
+            <h1>SecureDoc</h1>
+            <span>Email OTP login</span>
+          </div>
+        </div>
+        <label>
+          Email
+          <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="signer@example.com" />
+        </label>
+        <button className="primary" onClick={requestOtp} disabled={loading}>
+          <Mail size={18} />
+          Request OTP
+        </button>
+        {sentTo && <p className="successText">OTP requested for {sentTo}. Delivery: {delivery}</p>}
+        <label>
+          OTP
+          <input value={otp} onChange={(event) => setOtp(event.target.value)} inputMode="numeric" placeholder="6 digits" />
+        </label>
+        <button className="secondary" onClick={verifyOtp} disabled={loading || !otp.trim()}>
+          Sign in
+        </button>
+        {error && <p className="errorText" role="alert">{error}</p>}
+      </section>
+    </main>
   );
 }
 
@@ -382,556 +485,7 @@ function StatusLine({ ok, text }: { ok: boolean; text: string }) {
   return <p className={ok ? "successText" : "errorText"}>{text}</p>;
 }
 
-type DocumentStatus = "draft" | "pending_signature" | "signed" | "verification_failed" | "certificate_revoked";
 type SigningConfirmationMethod = "EMAIL_OTP" | "TOTP";
-
-function DocumentsWorkflow() {
-  const [name, setName] = useState("Nguyen Van A");
-  const [email, setEmail] = useState("student@example.com");
-  const [privateKeyPem, setPrivateKeyPem] = useState("");
-  const [certificate, setCertificate] = useState<Certificate | null>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [hashAlgorithm, setHashAlgorithm] = useState<HashAlgorithm>("SHA-256");
-  const [purpose, setPurpose] = useState("approve_document");
-  const [hashResult, setHashResult] = useState<HashResult | null>(null);
-  const [prepareResult, setPrepareResult] = useState<PrepareResponse | null>(null);
-  const [signingConfirmed, setSigningConfirmed] = useState(false);
-  const [confirmationMethod, setConfirmationMethod] = useState<SigningConfirmationMethod>("EMAIL_OTP");
-  const [confirmationCode, setConfirmationCode] = useState("");
-  const [otpRequest, setOtpRequest] = useState<SigningOtpRequestResponse | null>(null);
-  const [confirmationResult, setConfirmationResult] = useState<SigningConfirmResponse | null>(null);
-  const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
-  const [verifyResult, setVerifyResult] = useState<VerifyV2Response | null>(null);
-  const [padesProfile, setPadesProfile] = useState("");
-  const [revokeResult, setRevokeResult] = useState<{ serialNumber: string; status: string; reason: string; revokedAt: string } | null>(null);
-  const [auditResult, setAuditResult] = useState<AuditChainResult | null>(null);
-  const [status, setStatus] = useState<DocumentStatus>("draft");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  const signer = certificate ? `${certificate.ownerName} (${certificate.email})` : "-";
-  const purposeLabel = signingPurposes.find((item) => item.value === purpose)?.label ?? purpose;
-
-  async function createCertificate() {
-    setError("");
-    setLoading(true);
-    try {
-      await demoLogin(email, "SIGNER");
-      const keyPair = await generateBrowserSigningKeyPair();
-      const issued = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem, privateKeyPem: keyPair.privateKeyPem });
-      setPrivateKeyPem(keyPair.privateKeyPem);
-      setCertificate(issued.certificate);
-      setStatus("draft");
-      setPrepareResult(null);
-      setSubmitResult(null);
-      setVerifyResult(null);
-      setPadesProfile("");
-      setRevokeResult(null);
-      setSigningConfirmed(false);
-      setConfirmationCode("");
-      setOtpRequest(null);
-      setConfirmationResult(null);
-    } catch (err) {
-      setError(errorMessage(err, "Cannot create browser key and X.509 demo certificate."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function createSigningRequest() {
-    if (!file) {
-      setError("Choose a document first.");
-      return;
-    }
-    if (!certificate) {
-      setError("Generate an X.509 demo certificate first.");
-      return;
-    }
-    setError("");
-    setLoading(true);
-    try {
-      await demoLogin(certificate.email, "SIGNER");
-      const hash = await hashDocument(file, hashAlgorithm);
-      const prepared = await prepareSigningRequest({
-        documentName: file.name,
-        documentHash: hash.documentHash,
-        hashAlgorithm: hash.hashAlgorithm,
-        certificateSerialNumber: certificate.serialNumber,
-        signingPurpose: purpose,
-        signerEmail: certificate.email
-      });
-      setHashResult(hash);
-      setPrepareResult(prepared);
-      setSubmitResult(null);
-      setVerifyResult(null);
-      setPadesProfile("");
-      setSigningConfirmed(false);
-      setConfirmationCode("");
-      setOtpRequest(null);
-      setConfirmationResult(null);
-      setStatus("pending_signature");
-    } catch (err) {
-      setError(errorMessage(err, "Cannot create signing request."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function requestSigningOtp() {
-    if (!prepareResult) return;
-    setError("");
-    setLoading(true);
-    try {
-      const response = await requestSigningEmailOtp(prepareResult.requestId, prepareResult.signingPayload.signerEmail);
-      setOtpRequest(response);
-    } catch (err) {
-      setError(errorMessage(err, "Cannot request signing OTP."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function confirmSigningIntent() {
-    if (!prepareResult) return;
-    setError("");
-    setLoading(true);
-    try {
-      const response = await confirmSigningRequest({
-        requestId: prepareResult.requestId,
-        signerEmail: prepareResult.signingPayload.signerEmail,
-        method: confirmationMethod,
-        code: confirmationCode
-      });
-      setConfirmationResult(response);
-      setSigningConfirmed(response.confirmed);
-    } catch (err) {
-      setSigningConfirmed(false);
-      setError(errorMessage(err, "Cannot confirm signing request."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function signAndSubmit() {
-    if (!prepareResult || !certificate) return;
-    if (!signingConfirmed) {
-      setError("Confirm the signing payload before signing.");
-      return;
-    }
-    if (!privateKeyPem.trim()) {
-      setError("Private key PEM is missing. Generate the key pair in this browser again.");
-      return;
-    }
-    if (!certificate.userCertificatePem || !certificate.intermediateCertificatePem || !certificate.rootCertificatePem) {
-      setError("X.509 demo certificate is missing PEM chain fields.");
-      return;
-    }
-    const signingHash = prepareResult.signingPayload.hashAlgorithm;
-    if (!browserSigningHashSupported(signingHash)) {
-      setError("Browser Web Crypto cannot RSA-PSS sign with SHA3-256.");
-      return;
-    }
-
-    setError("");
-    setLoading(true);
-    try {
-      const canonicalPayload = canonicalizePayload(prepareResult.signingPayload);
-      const key = await importPrivateKey(privateKeyPem, signingHash);
-      const signatureBase64 = await signPayload(key, canonicalPayload, signingHash);
-      const signedPackage: SignedPackageV2 = {
-        packageVersion: "2.0",
-        signingPayload: prepareResult.signingPayload,
-        payloadCanonicalization: "JSON-canonical-sorted-keys",
-        signatureAlgorithm: "RSA-PSS",
-        signatureBase64,
-        userCertificatePem: certificate.userCertificatePem,
-        intermediateCertificatePem: certificate.intermediateCertificatePem,
-        rootCertificatePem: certificate.rootCertificatePem,
-        trustedRootId: "securedoc-demo-root",
-        signerCertificate: certificate,
-        signedAtClient: new Date().toISOString()
-      };
-      const submitted = await submitSignature(signedPackage);
-      setSubmitResult(submitted);
-      setVerifyResult(null);
-      setStatus("signed");
-    } catch (err) {
-      setStatus("verification_failed");
-      setError(errorMessage(err, "Cannot sign or submit signedPackage."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function exportPadesPdf() {
-    if (!file || !certificate) {
-      setError("Choose a PDF document and create a certificate first.");
-      return;
-    }
-    setError("");
-    setLoading(true);
-    try {
-      const result = await signPdfPades(file, certificate.email, purposeLabel);
-      setPadesProfile(result.profile);
-      downloadBlob(`${file.name.replace(/\.pdf$/i, "") || "document"}-pades-signed.pdf`, result.blob);
-    } catch (err) {
-      setError(errorMessage(err, "Cannot create PAdES signed PDF."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function verifyCurrentPackage() {
-    if (!file || !submitResult) {
-      setError("Sign a package first.");
-      return;
-    }
-    setError("");
-    setLoading(true);
-    try {
-      const algorithm = submitResult.signedPackage.signingPayload.hashAlgorithm;
-      const hash = await hashDocument(file, algorithm);
-      const result = await verifyV2({
-        documentHash: hash.documentHash,
-        hashAlgorithm: hash.hashAlgorithm,
-        signedPackage: submitResult.signedPackage
-      });
-      setVerifyResult(result);
-      setStatus(result.valid ? "signed" : "verification_failed");
-    } catch (err) {
-      setStatus("verification_failed");
-      setError(errorMessage(err, "Cannot verify signedPackage."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function revokeAndVerifyAgain() {
-    if (!certificate || !file || !submitResult) {
-      setError("Sign a package with an X.509 demo certificate first.");
-      return;
-    }
-    setError("");
-    setLoading(true);
-    try {
-      const revoked = await revokeCertificate({
-        serialNumber: certificate.serialNumber,
-        reason: "classroom_demo_revoke",
-        revokedBy: "local-demo-user",
-      });
-      setRevokeResult(revoked);
-
-      const algorithm = submitResult.signedPackage.signingPayload.hashAlgorithm;
-      const hash = await hashDocument(file, algorithm);
-      const result = await verifyV2({
-        documentHash: hash.documentHash,
-        hashAlgorithm: hash.hashAlgorithm,
-        signedPackage: submitResult.signedPackage
-      });
-      setVerifyResult(result);
-      setStatus(result.valid ? "signed" : "certificate_revoked");
-    } catch (err) {
-      setError(errorMessage(err, "Cannot revoke certificate or verify again."));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function checkAuditChain() {
-    setError("");
-    try {
-      setAuditResult(await verifyAuditChain());
-    } catch (err) {
-      setError(errorMessage(err, "Cannot verify audit chain."));
-    }
-  }
-
-  return (
-    <section className="page documentsPage">
-      <PageHeader title="Documents workflow" description="Main digital-signature demo flow: browser key, X.509 demo certificate, signing request, signing confirmation, browser signing, verification report, revocation, and audit chain." />
-
-      <div className="flowStrip" aria-label="Main demo flow">
-        {[
-          "Generate key in browser",
-          "Request X.509 demo certificate",
-          "Upload document",
-          "Create signing request",
-          "Review signingPayload",
-          "Confirm signing",
-          "Sign in browser",
-          "Submit signedPackage",
-          "Verify report",
-          "Revoke and verify again"
-        ].map((item, index) => (
-          <div key={item} className="flowStep">
-            <span>{String(index + 1).padStart(2, "0")}</span>
-            <strong>{item}</strong>
-          </div>
-        ))}
-      </div>
-
-      <div className="documentTableWrap">
-        <table className="documentTable">
-          <thead>
-            <tr>
-              <th>Document name</th>
-              <th>Signer</th>
-              <th>Purpose</th>
-              <th>Certificate serial</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>{file?.name ?? "No document selected"}</td>
-              <td>{signer}</td>
-              <td>{purposeLabel}</td>
-              <td>{certificate?.serialNumber ?? "-"}</td>
-              <td><StatusBadge status={status} /></td>
-              <td>
-                <div className="tableActions">
-                  <button className="secondary" onClick={verifyCurrentPackage} disabled={!submitResult || loading}>Verify</button>
-                  <button className="secondary" onClick={() => submitResult && downloadText("signed_package_v2.json", JSON.stringify(submitResult.signedPackage, null, 2))} disabled={!submitResult}>
-                    Export
-                  </button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div className="workflowPanels">
-        <div className="surface">
-          <h3>1. Key and X.509 demo certificate</h3>
-          <div className="successBanner">
-            <ShieldCheck size={16} />
-            Browser generates the private key. The API receives publicKeyPem only.
-          </div>
-          <div className="formGrid">
-            <label>
-              Full name
-              <input value={name} onChange={(event) => setName(event.target.value)} />
-            </label>
-            <label>
-              Email
-              <input value={email} onChange={(event) => setEmail(event.target.value)} />
-            </label>
-          </div>
-          <button className="primary" onClick={createCertificate} disabled={loading}>
-            <KeyRound size={18} />
-            {loading ? "Working..." : "Generate key and request certificate"}
-          </button>
-          {certificate && (
-            <dl className="detailList">
-              <DetailItem label="Certificate type" value={certificate.certificateType} />
-              <DetailItem label="Certificate serial" value={certificate.serialNumber} />
-              <DetailItem label="Fingerprint" value={certificate.certificateFingerprint ?? "-"} />
-            </dl>
-          )}
-        </div>
-
-        <div className="surface">
-          <h3>2. Document and signing request</h3>
-          <FileInput label="Document" onFile={(selected) => {
-            setFile(selected);
-            setHashResult(null);
-            setPrepareResult(null);
-            setSubmitResult(null);
-            setVerifyResult(null);
-            setSigningConfirmed(false);
-            setConfirmationCode("");
-            setOtpRequest(null);
-            setConfirmationResult(null);
-            setStatus("draft");
-          }} />
-          <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />
-          <label>
-            Signing purpose
-            <select value={purpose} onChange={(event) => setPurpose(event.target.value)}>
-              {signingPurposes.map((item) => (
-                <option key={item.value} value={item.value}>{item.label}</option>
-              ))}
-            </select>
-          </label>
-          <button className="primary" onClick={createSigningRequest} disabled={!certificate || !file || loading}>
-            <Eye size={18} />
-            Create signing request
-          </button>
-          {hashResult && (
-            <dl className="detailList">
-              <DetailItem label="Document hash" value={hashResult.documentHash} />
-              <DetailItem label="Hash algorithm" value={hashResult.hashAlgorithm} />
-            </dl>
-          )}
-        </div>
-      </div>
-
-      {prepareResult && (
-        <div className="surface reviewPanel">
-          <h3>3. Review signingPayload before signing</h3>
-          <div className="warningBanner">
-            <AlertTriangle size={16} />
-            Check these fields before signing.
-          </div>
-          <dl className="detailList">
-            <DetailItem label="documentName" value={prepareResult.signingPayload.documentName} />
-            <DetailItem label="documentHash" value={prepareResult.signingPayload.documentHash} />
-            <DetailItem label="signerName" value={prepareResult.signingPayload.signerName} />
-            <DetailItem label="signerEmail" value={prepareResult.signingPayload.signerEmail} />
-            <DetailItem label="certificateSerialNumber" value={prepareResult.signingPayload.certificateSerialNumber} />
-            <DetailItem label="certificateFingerprint" value={prepareResult.signingPayload.certificateFingerprint} />
-            <DetailItem label="signingPurpose" value={prepareResult.signingPayload.signingPurpose} />
-            <DetailItem label="requestId" value={prepareResult.requestId} />
-            <DetailItem label="nonce" value={prepareResult.nonce} />
-          </dl>
-          <div className="pinPanel">
-            <h3>4. Xac nhan ky</h3>
-            <label>
-              Method
-              <select value={confirmationMethod} onChange={(event) => {
-                setConfirmationMethod(event.target.value as SigningConfirmationMethod);
-                setConfirmationCode("");
-                setSigningConfirmed(false);
-                setConfirmationResult(null);
-              }}>
-                <option value="EMAIL_OTP">Email OTP fallback</option>
-                <option value="TOTP">Authenticator TOTP</option>
-              </select>
-            </label>
-            {confirmationMethod === "EMAIL_OTP" && (
-              <button className="secondary" onClick={requestSigningOtp} disabled={loading || signingConfirmed}>
-                <Mail size={18} />
-                Request signing OTP
-              </button>
-            )}
-            {otpRequest && confirmationMethod === "EMAIL_OTP" && (
-              <dl className="detailList">
-                <DetailItem label="OTP ID" value={String(otpRequest.otpId)} />
-                <DetailItem label="Delivery" value={otpRequest.delivery} />
-                <DetailItem label="Expires at" value={otpRequest.expiresAt} />
-              </dl>
-            )}
-            <label>
-              Confirmation code
-              <input value={confirmationCode} onChange={(event) => setConfirmationCode(event.target.value)} inputMode="numeric" placeholder="6 digits" />
-            </label>
-            <button className="secondary" onClick={confirmSigningIntent} disabled={loading || !confirmationCode || signingConfirmed}>
-              <ShieldCheck size={18} />
-              Confirm signing request
-            </button>
-            {confirmationResult && <StatusLine ok={confirmationResult.confirmed} text={`${confirmationResult.confirmationMethod} confirmed at ${confirmationResult.confirmedAt}`} />}
-            <button className="primary" onClick={signAndSubmit} disabled={loading || !prepareResult || !signingConfirmed}>
-              <FileSignature size={18} />
-              {loading ? "Signing..." : "Sign in browser and submit"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {submitResult && (
-        <div className="resultPanel">
-          <div className="resultHeader">
-            <CheckCircle2 size={22} />
-            <div>
-              <h3>signedPackage accepted</h3>
-              <p>Backend issued a demo timestamp token and returned a verification report.</p>
-            </div>
-          </div>
-          <ReportPanel report={submitResult.verificationReport} />
-          <PdfVisualStampPreview certificate={certificate} signedPackage={submitResult.signedPackage} purpose={purposeLabel} />
-          <div className="buttonRow">
-            <button className="secondary" onClick={verifyCurrentPackage}>
-              <ClipboardCheck size={18} />
-              Verify report
-            </button>
-            <button className="secondary" onClick={revokeAndVerifyAgain}>
-              <RotateCcw size={18} />
-              Revoke certificate and verify again
-            </button>
-            <button className="secondary" onClick={() => downloadText("signed_package_v2.json", JSON.stringify(submitResult.signedPackage, null, 2))}>
-              <Download size={18} />
-              Export signedPackage
-            </button>
-            <button className="secondary" onClick={exportPadesPdf} disabled={loading || !file || !file.name.toLowerCase().endsWith(".pdf")}>
-              <FileCheck size={18} />
-              Export PAdES PDF
-            </button>
-          </div>
-          {padesProfile && <StatusLine ok text={`Downloaded ${padesProfile} signed PDF.`} />}
-        </div>
-      )}
-
-      {verifyResult && (
-        <div className={verifyResult.valid ? "verifyBox valid" : "verifyBox invalid"} role="status" aria-live="polite">
-          <div className="statusIcon" aria-hidden="true">
-            {verifyResult.valid ? <BadgeCheck size={24} /> : <Ban size={24} />}
-          </div>
-          <div>
-            <h3>{verifyResult.valid ? "Verification passed" : "Verification failed"}</h3>
-            <p>{verifyResult.reason}</p>
-            <ReportPanel report={verifyResult.report} />
-          </div>
-        </div>
-      )}
-
-      {revokeResult && (
-        <div className="warningBanner">
-          <Ban size={16} />
-          Certificate {revokeResult.serialNumber} was revoked for reason {revokeResult.reason}. Verifying the old package should now fail with certificate_revoked.
-        </div>
-      )}
-
-      <div className="surface">
-        <h3>Audit chain</h3>
-        <button className="secondary" onClick={checkAuditChain}>
-          <ShieldCheck size={18} />
-          Verify audit hash chain
-        </button>
-        {auditResult && (
-          <dl className="detailList">
-            <DetailItem label="Audit chain valid" value={String(auditResult.valid)} />
-            <DetailItem label="Total events" value={String(auditResult.totalEvents)} />
-            <DetailItem label="Broken at" value={auditResult.brokenAt ? JSON.stringify(auditResult.brokenAt) : "none"} />
-          </dl>
-        )}
-      </div>
-
-      {error && <p className="errorText" role="alert">{error}</p>}
-    </section>
-  );
-}
-
-function StatusBadge({ status }: { status: DocumentStatus }) {
-  return <span className={`statusBadge ${status}`}>{status}</span>;
-}
-
-function PdfVisualStampPreview({
-  certificate,
-  signedPackage,
-  purpose
-}: {
-  certificate: Certificate | null;
-  signedPackage: SignedPackageV2;
-  purpose: string;
-}) {
-  return (
-    <div className="visualStampPanel">
-      <div>
-        <h3>PDF visual stamp demo</h3>
-        <p>Visual stamp is not PAdES.</p>
-      </div>
-      <div className="visualStamp">
-        <strong>Signed by {certificate?.ownerName ?? signedPackage.signingPayload.signerName}</strong>
-        <span>Email: {certificate?.email ?? signedPackage.signingPayload.signerEmail}</span>
-        <span>Certificate serial: {certificate?.serialNumber ?? signedPackage.signingPayload.certificateSerialNumber}</span>
-        <span>Signing time: {signedPackage.signedAtClient ?? "client time not provided"}</span>
-        <span>Reason: {purpose}</span>
-      </div>
-    </div>
-  );
-}
 
 function HashDocument() {
   const [file, setFile] = useState<File | null>(null);
@@ -1442,6 +996,60 @@ function RevokeCertificate() {
   );
 }
 
+function AuditChain() {
+  const [result, setResult] = useState<AuditChainResult | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function verifyChain() {
+    setError("");
+    setLoading(true);
+    try {
+      setResult(await verifyAuditChain());
+    } catch (err) {
+      setError(errorMessage(err, "Cannot verify audit chain."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="page taskPage">
+      <PageHeader title="Audit chain" description="Auditor-only verification of the audit hash chain." />
+      <div className="surface">
+        <button className="primary" onClick={verifyChain} disabled={loading}>
+          <ShieldCheck size={18} />
+          Verify audit chain
+        </button>
+        {error && <p className="errorText" role="alert">{error}</p>}
+      </div>
+      {result && (
+        <div className={result.valid ? "verifyBox valid" : "verifyBox invalid"} role="status" aria-live="polite">
+          <div className="statusIcon" aria-hidden="true">
+            {result.valid ? <BadgeCheck size={24} /> : <Ban size={24} />}
+          </div>
+          <div>
+            <h3>{result.valid ? "Audit chain valid" : "Audit chain broken"}</h3>
+            <p>Total events: {result.totalEvents}</p>
+            {result.brokenAt && <pre>{JSON.stringify(result.brokenAt, null, 2)}</pre>}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AdminPanel() {
+  return (
+    <section className="page taskPage">
+      <PageHeader title="User administration" description="User and role records are stored in the users table." />
+      <div className="surface">
+        <p className="fieldHint">Admin API for editing users is not implemented yet. Seeded product users are managed server-side for this phase.</p>
+      </div>
+    </section>
+  );
+}
+
 function SignDocumentLegacy() {
   const [file, setFile] = useState<File | null>(null);
   const [privateKey, setPrivateKey] = useState("");
@@ -1476,7 +1084,7 @@ function SignDocumentLegacy() {
       <div className="surface">
         <div className="warningBanner">
           <AlertTriangle size={16} />
-          Insecure legacy demo: backend receives privateKeyPem. Use Documents for the main flow.
+          Insecure legacy demo: backend receives privateKeyPem. Use the signer workspace for product signing.
         </div>
         <FileInput label="Document" onFile={setFile} />
         <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />

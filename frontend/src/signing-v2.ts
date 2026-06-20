@@ -1,28 +1,30 @@
 const API_BASE = "http://127.0.0.1:8000";
 
-export type DemoRole = "ADMIN" | "CA_OFFICER" | "SIGNER" | "VERIFIER" | "AUDITOR";
+export type UserRole = "ADMIN" | "CA_OFFICER" | "SIGNER" | "VERIFIER" | "AUDITOR";
 
-export type DemoLoginResponse = {
-  accessToken: string;
-  tokenType: "Bearer";
-  expiresIn: number;
-  user: string;
-  role: DemoRole;
+export type AuthUser = {
+  email: string;
+  name: string;
+  role: UserRole;
+  status?: string;
+};
+
+export type LoginOtpRequestResponse = {
+  otpId: number;
+  email: string;
+  expiresAt: string;
+  delivery: string;
   warning: string;
 };
 
-type DemoToken = {
+export type LoginOtpVerifyResponse = {
   accessToken: string;
-  expiresAtMs: number;
+  tokenType: "Bearer";
+  expiresIn: number;
+  user: AuthUser;
 };
 
-const demoTokens = new Map<string, DemoToken>();
-const roleUsers: Record<Exclude<DemoRole, "SIGNER">, string> = {
-  ADMIN: "demo-admin@example.com",
-  CA_OFFICER: "demo-ca-officer@example.com",
-  VERIFIER: "demo-verifier@example.com",
-  AUDITOR: "demo-auditor@example.com",
-};
+let sessionToken: string | null = null;
 
 export type HashAlgorithm = "SHA-256" | "SHA-384" | "SHA-512" | "SHA3-256";
 
@@ -55,6 +57,7 @@ export type X509IssueResponse = {
 };
 
 export type SigningPayload = {
+  schemaVersion: string;
   documentName: string;
   documentHash: string;
   hashAlgorithm: HashAlgorithm;
@@ -65,10 +68,18 @@ export type SigningPayload = {
   certificateFingerprint: string;
   certificateType: "legacy-demo" | "x509-demo";
   signingPurpose: string;
+  signingIntent: string;
   createdAt: string;
+  expiresAt: string;
   nonce: string;
   requestId: string;
   payloadVersion: string;
+  rsaPssParams: {
+    hashAlgorithm: HashAlgorithm;
+    mgf: "MGF1";
+    mgfHashAlgorithm: HashAlgorithm;
+    saltLength: number;
+  };
 };
 
 export type PrepareResponse = {
@@ -209,18 +220,39 @@ export type AuditChainResult = {
   brokenAt: null | { index: number; id: number; eventId: string };
 };
 
-export async function demoLogin(email: string, role: DemoRole): Promise<DemoLoginResponse> {
-  const response = await fetch(`${API_BASE}/api/auth/demo-login`, {
+export function setAuthToken(token: string | null) {
+  sessionToken = token;
+}
+
+export function clearAuthToken() {
+  sessionToken = null;
+}
+
+export async function requestLoginOtp(email: string): Promise<LoginOtpRequestResponse> {
+  const response = await fetch(`${API_BASE}/api/auth/login/request-otp`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, role }),
+    body: JSON.stringify({ email }),
   });
-  const data = await handleResponse<DemoLoginResponse>(response);
-  demoTokens.set(tokenKey(data.user, data.role), {
-    accessToken: data.accessToken,
-    expiresAtMs: Date.now() + Math.max(0, data.expiresIn - 30) * 1000,
+  return handleResponse<LoginOtpRequestResponse>(response);
+}
+
+export async function verifyLoginOtp(email: string, otp: string): Promise<LoginOtpVerifyResponse> {
+  const response = await fetch(`${API_BASE}/api/auth/login/verify-otp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, otp }),
   });
+  const data = await handleResponse<LoginOtpVerifyResponse>(response);
+  setAuthToken(data.accessToken);
   return data;
+}
+
+export async function getMe(): Promise<AuthUser> {
+  const response = await fetch(`${API_BASE}/api/me`, {
+    headers: authHeaders(),
+  });
+  return handleResponse<AuthUser>(response);
 }
 
 export async function requestEmailOtp(body: {
@@ -229,7 +261,7 @@ export async function requestEmailOtp(body: {
 }): Promise<EmailOtpRequestResponse> {
   const response = await fetch(`${API_BASE}/api/auth/email-otp/request`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(body.email)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   return handleResponse<EmailOtpRequestResponse>(response);
@@ -242,18 +274,18 @@ export async function verifyEmailOtp(body: {
 }): Promise<EmailOtpVerifyResponse> {
   const response = await fetch(`${API_BASE}/api/auth/email-otp/verify`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(body.email)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   return handleResponse<EmailOtpVerifyResponse>(response);
 }
 
-export async function setupTotp(body: {
+export async function setupTotp(_body: {
   email: string;
 }): Promise<TotpSetupResponse> {
   const response = await fetch(`${API_BASE}/api/auth/totp/setup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(body.email)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
   });
   return handleResponse<TotpSetupResponse>(response);
 }
@@ -264,16 +296,16 @@ export async function verifyTotpSetup(body: {
 }): Promise<TotpVerifyResponse> {
   const response = await fetch(`${API_BASE}/api/auth/totp/verify-setup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(body.email)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ code: body.code }),
   });
   return handleResponse<TotpVerifyResponse>(response);
 }
 
-export async function requestSigningEmailOtp(requestId: string, signerEmail: string): Promise<SigningOtpRequestResponse> {
+export async function requestSigningEmailOtp(requestId: string, _signerEmail: string): Promise<SigningOtpRequestResponse> {
   const response = await fetch(`${API_BASE}/api/v2/signing-requests/${requestId}/otp/request`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(signerEmail)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
   });
   return handleResponse<SigningOtpRequestResponse>(response);
 }
@@ -286,7 +318,7 @@ export async function confirmSigningRequest(body: {
 }): Promise<SigningConfirmResponse> {
   const response = await fetch(`${API_BASE}/api/v2/signing-requests/${body.requestId}/confirm`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(body.signerEmail)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ method: body.method, code: body.code }),
   });
   return handleResponse<SigningConfirmResponse>(response);
@@ -302,7 +334,7 @@ export async function prepareSigningRequest(body: {
 }): Promise<PrepareResponse> {
   const response = await fetch(`${API_BASE}/api/sign/v2/prepare`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(body.signerEmail)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   return handleResponse<PrepareResponse>(response);
@@ -311,7 +343,7 @@ export async function prepareSigningRequest(body: {
 export async function submitSignature(body: SignedPackageV2): Promise<SubmitResponse> {
   const response = await fetch(`${API_BASE}/api/sign/v2/submit`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await signerAuthHeaders(body.signingPayload.signerEmail)) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   return handleResponse<SubmitResponse>(response);
@@ -324,7 +356,7 @@ export async function verifyV2(body: {
 }): Promise<VerifyV2Response> {
   const response = await fetch(`${API_BASE}/api/verify/v2`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   return handleResponse<VerifyV2Response>(response);
@@ -336,10 +368,10 @@ export async function issueX509Certificate(body: {
   publicKeyPem: string;
   privateKeyPem: string;
 }): Promise<X509IssueResponse> {
-  const authHeaders = await signerAuthHeaders(body.email);
+  const headers = authHeaders();
   const challengeResponse = await fetch(`${API_BASE}/api/certificates/x509/proof-challenge`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify({
       name: body.name,
       email: body.email,
@@ -351,7 +383,7 @@ export async function issueX509Certificate(body: {
   const proofSignatureBase64 = await signText(proofKey, challenge.challenge, "SHA-256");
   const response = await fetch(`${API_BASE}/api/certificates/x509/issue`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify({
       name: body.name,
       email: body.email,
@@ -370,7 +402,7 @@ export async function revokeCertificate(body: {
 }): Promise<RevokeCertificateResponse> {
   const response = await fetch(`${API_BASE}/api/certificates/revoke/v2`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await roleAuthHeaders("CA_OFFICER")) },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   return handleResponse<RevokeCertificateResponse>(response);
@@ -378,7 +410,7 @@ export async function revokeCertificate(body: {
 
 export async function verifyAuditChain(): Promise<AuditChainResult> {
   const response = await fetch(`${API_BASE}/api/audit/verify-chain`, {
-    headers: await roleAuthHeaders("AUDITOR"),
+    headers: authHeaders(),
   });
   return handleResponse<AuditChainResult>(response);
 }
@@ -391,14 +423,14 @@ export async function hashDocument(file: File, hashAlgorithm: HashAlgorithm) {
   return handleResponse<{ documentName: string; hashAlgorithm: HashAlgorithm; documentHash: string }>(response);
 }
 
-export async function signPdfPades(file: File, signerEmail: string, reason: string): Promise<{ blob: Blob; profile: string }> {
+export async function signPdfPades(file: File, _signerEmail: string, reason: string): Promise<{ blob: Blob; profile: string }> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("reason", reason);
   formData.append("location", "SecureDoc");
   const response = await fetch(`${API_BASE}/api/pdf/pades/sign`, {
     method: "POST",
-    headers: await signerAuthHeaders(signerEmail),
+    headers: authHeaders(),
     body: formData,
   });
   if (!response.ok) {
@@ -412,27 +444,9 @@ export async function signPdfPades(file: File, signerEmail: string, reason: stri
   };
 }
 
-async function signerAuthHeaders(signerEmail: string) {
-  return authorizationHeadersFor(signerEmail, "SIGNER");
-}
-
-async function roleAuthHeaders(role: Exclude<DemoRole, "SIGNER">) {
-  return authorizationHeadersFor(roleUsers[role], role);
-}
-
-async function authorizationHeadersFor(email: string, role: DemoRole) {
-  const key = tokenKey(email, role);
-  const cached = demoTokens.get(key);
-  if (!cached || cached.expiresAtMs <= Date.now()) {
-    await demoLogin(email, role);
-  }
-  const token = demoTokens.get(key);
-  if (!token) throw new Error("Demo login did not return a token.");
-  return { Authorization: `Bearer ${token.accessToken}` };
-}
-
-function tokenKey(email: string, role: DemoRole) {
-  return `${role}:${email.trim().toLowerCase()}`;
+function authHeaders() {
+  if (!sessionToken) throw new Error("Please sign in with email OTP first.");
+  return { Authorization: `Bearer ${sessionToken}` };
 }
 
 export function canonicalizePayload(payload: SigningPayload): string {

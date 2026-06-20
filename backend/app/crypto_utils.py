@@ -61,7 +61,7 @@ HASH_ALGORITHM_PROFILES = {
 # ── Algorithm policy ──────────────────────────────────────────────────────
 
 ALGORITHM_POLICY = {
-    "allowedHashAlgorithms": ["SHA-256", "SHA-384", "SHA-512", "SHA3-256"],
+    "allowedHashAlgorithms": ["SHA-256", "SHA-384", "SHA-512"],
     "rejectedHashAlgorithms": ["MD5", "SHA-1"],
     "allowedSignatureAlgorithms": ["RSA-PSS"],
     "minimumRsaKeyBits": 2048,
@@ -152,6 +152,36 @@ def check_algorithm_policy(hash_alg: str, sig_alg: str) -> Tuple[bool, str]:
     if sig_alg not in ALGORITHM_POLICY["allowedSignatureAlgorithms"]:
         return False, f"{sig_alg} is not in the allowed list"
     return True, "Algorithm policy satisfied"
+
+
+def rsa_pss_params(hash_algorithm: str) -> Dict[str, Any]:
+    normalized = normalize_hash_algorithm(hash_algorithm)
+    return {
+        "hashAlgorithm": normalized,
+        "mgf": "MGF1",
+        "mgfHashAlgorithm": normalized,
+        "saltLength": HASH_ALGORITHM_PROFILES[normalized]["digestBits"] // 8,
+    }
+
+
+def check_rsa_pss_params(params: Dict[str, Any], hash_algorithm: str) -> Tuple[bool, str]:
+    normalized = normalize_hash_algorithm(hash_algorithm)
+    expected = rsa_pss_params(normalized)
+    if not isinstance(params, dict):
+        return False, "RSA-PSS params must be an object"
+    actual_hash = str(params.get("hashAlgorithm", "")).strip().upper().replace("_", "-")
+    actual_mgf = str(params.get("mgf", "")).strip().upper()
+    actual_mgf_hash = str(params.get("mgfHashAlgorithm", "")).strip().upper().replace("_", "-")
+    actual_salt_length = params.get("saltLength")
+    if actual_hash != expected["hashAlgorithm"]:
+        return False, "RSA-PSS hashAlgorithm does not match payload hashAlgorithm"
+    if actual_mgf != expected["mgf"]:
+        return False, "RSA-PSS MGF must be MGF1"
+    if actual_mgf_hash != expected["mgfHashAlgorithm"]:
+        return False, "RSA-PSS MGF1 hash does not match payload hashAlgorithm"
+    if actual_salt_length != expected["saltLength"]:
+        return False, "RSA-PSS saltLength does not match hash digest length"
+    return True, "RSA-PSS parameters satisfied"
 
 
 # ── Key generation ────────────────────────────────────────────────────────

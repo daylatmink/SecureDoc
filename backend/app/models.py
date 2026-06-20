@@ -7,6 +7,17 @@ from sqlalchemy import Column, DateTime, Integer, String, Text
 from .database import Base
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    email = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    role = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="active")
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
 class CertificateRecord(Base):
     __tablename__ = "certificates"
 
@@ -38,11 +49,13 @@ class SigningRequest(Base):
     signer_email = Column(String, nullable=False)
     certificate_serial = Column(String, nullable=False)
     signing_purpose = Column(String, nullable=False, default="approve_document")
+    signing_intent = Column(Text, nullable=True)
     nonce = Column(String, nullable=False)
     status = Column(String, nullable=False, default="pending")
     confirmation_method = Column(String, nullable=True)
     confirmed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
 
 

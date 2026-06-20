@@ -11,10 +11,12 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, EmailStr
 from sqlalchemy.orm import Session
 
+from .audit_service import log_audit
 from .auth_utils import create_email_otp, create_totp_setting, totp_storage_warning, verify_email_otp, verify_totp_setup
 from .config import JWT_TTL_SECONDS, SMTP_FROM_EMAIL, SMTP_HOST, SMTP_PASSWORD, SMTP_PORT, SMTP_USERNAME, SMTP_USE_TLS
 from .database import SessionLocal
-from .security import SIGNER, VALID_ROLES, create_demo_access_token, require_roles
+from .models import User
+from .security import SIGNER, create_access_token, require_roles
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -24,12 +26,29 @@ class DemoLoginRequest(BaseModel):
     role: str
 
 
+class LoginOtpRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+
+class LoginOtpVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+    otp: str
+
+
 class EmailOtpRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     email: EmailStr
     purpose: str
 
 
 class EmailOtpVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     email: EmailStr
     purpose: str
     otp: str
@@ -88,18 +107,55 @@ def _actor_email(actor: dict[str, str]) -> str:
 
 @router.post("/demo-login")
 def demo_login(body: DemoLoginRequest):
-    role = body.role.strip().upper()
-    if role not in VALID_ROLES:
-        raise HTTPException(status_code=400, detail="Invalid role")
-    user = body.email.strip().lower()
+    raise HTTPException(status_code=410, detail="demo-login is disabled; use email OTP login")
+
+
+@router.post("/login/request-otp")
+def request_login_otp(body: LoginOtpRequest, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    user = db.get(User, email)
+    if not user or user.status != "active":
+        log_audit(db, "login_failed", email, "failed", details="OTP login requested for missing or inactive user")
+        db.commit()
+        raise HTTPException(status_code=404, detail="User not found or inactive")
+    token, otp = create_email_otp(db, email, "LOGIN_MFA")
+    delivery = _send_otp_email(token.email, token.purpose, otp)
+    db.commit()
     return {
-        "accessToken": create_demo_access_token(user, role),
+        "otpId": token.id,
+        "email": token.email,
+        "expiresAt": token.expires_at.isoformat(),
+        "delivery": delivery,
+        "warning": "Login OTP was sent if SMTP is configured. Role is loaded from SecureDoc user database.",
+    }
+
+
+@router.post("/login/verify-otp")
+def verify_login_otp(body: LoginOtpVerifyRequest, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    user = db.get(User, email)
+    if not user or user.status != "active":
+        log_audit(db, "login_failed", email, "failed", details="OTP login verify for missing or inactive user")
+        db.commit()
+        raise HTTPException(status_code=404, detail="User not found or inactive")
+    ok, message = verify_email_otp(db, email, "LOGIN_MFA", body.otp)
+    if not ok:
+        log_audit(db, "login_failed", email, "failed", details=message)
+        db.commit()
+        raise HTTPException(status_code=401, detail=message)
+    log_audit(db, "login_success", email, "success", details="Email OTP login verified")
+    db.commit()
+    return {
+        "accessToken": create_access_token(email),
         "tokenType": "Bearer",
         "expiresIn": JWT_TTL_SECONDS,
-        "user": user,
-        "role": role,
-        "warning": "Demo JWT for local SecureDoc development only. Not a production identity provider.",
+        "user": {"email": user.email, "name": user.name, "role": user.role, "status": user.status},
     }
+
+
+@router.get("/me")
+def get_me(actor: dict[str, str] = Depends(require_roles(SIGNER, "CA_OFFICER", "VERIFIER", "AUDITOR", "ADMIN"))):
+    return {"email": actor["user"], "name": actor.get("name"), "role": actor["role"]}
 
 
 @router.post("/email-otp/request", include_in_schema=False)

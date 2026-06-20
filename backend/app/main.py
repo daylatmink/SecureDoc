@@ -48,6 +48,7 @@ from .schemas import (
     SignedPackage,
     VerifyResponse,
 )
+from .security import AUDITOR, CA_OFFICER, SIGNER, VERIFIER, ADMIN, require_roles
 from .x509_utils import ensure_demo_x509_ca
 
 app = FastAPI(title="SecureDoc API", version="0.1.0")
@@ -101,6 +102,11 @@ app.include_router(auth_router)
 app.include_router(v2_router)
 if ENABLE_BLIND_SIGNATURE_DEMO:
     app.include_router(blind_router)
+
+
+@app.get("/api/me", tags=["auth"])
+def get_current_user(actor: dict[str, str] = Depends(require_roles(SIGNER, CA_OFFICER, VERIFIER, AUDITOR, ADMIN))):
+    return {"email": actor["user"], "name": actor.get("name"), "role": actor["role"]}
 
 
 @app.on_event("startup")

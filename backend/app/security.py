@@ -15,7 +15,9 @@ from typing import Any
 
 from fastapi import Header, HTTPException, status
 
-from .config import ENABLE_DEMO_HEADER_AUTH, JWT_SECRET, JWT_TTL_SECONDS
+from .config import JWT_SECRET, JWT_TTL_SECONDS
+from .database import SessionLocal
+from .models import User
 
 Role = str
 
@@ -26,7 +28,7 @@ VERIFIER = "VERIFIER"
 AUDITOR = "AUDITOR"
 
 VALID_ROLES = {ADMIN, CA_OFFICER, SIGNER, VERIFIER, AUDITOR}
-JWT_TYP = "securedoc-demo-access"
+JWT_TYP = "securedoc-access"
 
 
 def _b64url_encode(value: bytes) -> str:
@@ -50,15 +52,11 @@ def _sign(message: str) -> str:
     return _b64url_encode(signature)
 
 
-def create_demo_access_token(user: str, role: Role) -> str:
-    normalized_role = role.strip().upper()
-    if normalized_role not in VALID_ROLES:
-        raise ValueError("Invalid role")
+def create_access_token(user: str) -> str:
     now = int(time.time())
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
         "sub": user.strip().lower(),
-        "role": normalized_role,
         "iat": now,
         "exp": now + JWT_TTL_SECONDS,
         "typ": JWT_TYP,
@@ -67,7 +65,13 @@ def create_demo_access_token(user: str, role: Role) -> str:
     return f"{signing_input}.{_sign(signing_input)}"
 
 
-def _decode_demo_access_token(token: str) -> dict[str, str]:
+def create_demo_access_token(user: str, role: Role | None = None) -> str:
+    # Compatibility wrapper for tests and older callers. The role argument is
+    # intentionally ignored; authorization is always loaded from the users DB.
+    return create_access_token(user)
+
+
+def _decode_access_token(token: str) -> str:
     parts = token.split(".")
     if len(parts) != 3 or not all(parts):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
@@ -89,33 +93,25 @@ def _decode_demo_access_token(token: str) -> dict[str, str]:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
 
     subject = payload.get("sub")
-    role = payload.get("role")
     issued_at = payload.get("iat")
     expires_at = payload.get("exp")
     if not isinstance(subject, str) or not subject.strip():
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
-    if not isinstance(role, str):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
     if not isinstance(issued_at, int) or not isinstance(expires_at, int):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
     if expires_at <= int(time.time()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer token expired")
+    return subject.strip().lower()
 
-    normalized_role = role.strip().upper()
-    if normalized_role not in VALID_ROLES:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid role")
-    return {"user": subject.strip().lower(), "role": normalized_role}
-
-
-def _actor_from_demo_header(user: str | None, role: str | None) -> dict[str, str] | None:
-    if not ENABLE_DEMO_HEADER_AUTH:
-        return None
-    if not user or not role:
-        return None
-    normalized_role = role.strip().upper()
-    if normalized_role not in VALID_ROLES:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid role")
-    return {"user": user.strip().lower(), "role": normalized_role}
+def _actor_from_db(email: str) -> dict[str, str]:
+    with SessionLocal() as db:
+        user = db.get(User, email)
+        if not user or user.status != "active":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User is not active")
+        role = user.role.strip().upper()
+        if role not in VALID_ROLES:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid role")
+        return {"user": user.email.strip().lower(), "role": role, "name": user.name}
 
 
 def require_roles(*allowed_roles: Role):
@@ -123,26 +119,19 @@ def require_roles(*allowed_roles: Role):
 
     def dependency(
         authorization: str | None = Header(default=None, alias="Authorization"),
-        x_securedoc_role: str | None = Header(default=None, alias="X-SecureDoc-Role"),
-        x_securedoc_user: str | None = Header(default=None, alias="X-SecureDoc-User"),
     ) -> dict[str, str]:
-        actor: dict[str, str] | None = None
-        if authorization:
-            scheme, _, token = authorization.partition(" ")
-            if scheme.lower() != "bearer" or not token.strip():
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid authorization header",
-                )
-            actor = _decode_demo_access_token(token.strip())
-        else:
-            actor = _actor_from_demo_header(x_securedoc_user, x_securedoc_role)
-
-        if actor is None:
+        if not authorization:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authentication required",
             )
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authorization header",
+            )
+        actor = _actor_from_db(_decode_access_token(token.strip()))
 
         role = actor["role"]
         if role not in VALID_ROLES:
@@ -161,7 +150,7 @@ def require_roles(*allowed_roles: Role):
 
 
 def auth_headers(user: str, role: Role) -> dict[str, str]:
-    return {"Authorization": f"Bearer {create_demo_access_token(user, role)}"}
+    return {"Authorization": f"Bearer {create_access_token(user)}"}
 
 
 def role_headers(user: str, role: Role) -> dict[str, str]:
