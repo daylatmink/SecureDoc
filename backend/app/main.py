@@ -12,6 +12,7 @@ from .config import (
     CORS_ALLOW_ORIGINS,
     ENABLE_BLIND_SIGNATURE_DEMO,
     ENABLE_LEGACY_DEMO,
+    HTTPS_ONLY,
     RATE_LIMIT_REQUESTS_PER_MINUTE,
     REQUEST_SIZE_LIMIT_BYTES,
 )
@@ -50,6 +51,11 @@ from .schemas import (
 from .x509_utils import ensure_demo_x509_ca
 
 app = FastAPI(title="SecureDoc API", version="0.1.0")
+LEGACY_DEMO_WARNING = "DEMO_ONLY_DO_NOT_USE_IN_PRODUCTION"
+LEGACY_DEMO_DESCRIPTION = (
+    f"{LEGACY_DEMO_WARNING}: insecure classroom compatibility endpoint. "
+    "Private keys must not move through API clients or servers in normal use."
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,7 +84,17 @@ async def request_hardening_middleware(request: Request, call_next):
     bucket.append(now)
     _rate_limit_buckets[key] = bucket
 
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+    )
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if HTTPS_ONLY:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 app.include_router(auth_router)
@@ -120,17 +136,32 @@ def _require_legacy_demo_enabled() -> None:
         raise HTTPException(status_code=404, detail="Legacy demo API is disabled")
 
 
-@app.get("/api/ca/public-key", response_model=CaPublicKeyResponse, include_in_schema=ENABLE_LEGACY_DEMO)
+@app.get(
+    "/api/demo/ca/public-key",
+    response_model=CaPublicKeyResponse,
+    include_in_schema=ENABLE_LEGACY_DEMO,
+    deprecated=True,
+    description=LEGACY_DEMO_DESCRIPTION,
+)
+@app.get("/api/ca/public-key", response_model=CaPublicKeyResponse, include_in_schema=False)
 def get_ca_public_key():
     _require_legacy_demo_enabled()
     return {
         "issuer": ISSUER,
         "publicKeyPem": get_demo_ca_public_key(),
         "signatureAlgorithm": CERTIFICATE_SIGNATURE_ALGORITHM,
+        "warning": LEGACY_DEMO_WARNING,
     }
 
 
-@app.post("/api/keys/generate", response_model=KeyGenerateResponse, include_in_schema=ENABLE_LEGACY_DEMO)
+@app.post(
+    "/api/demo/keys/generate",
+    response_model=KeyGenerateResponse,
+    include_in_schema=ENABLE_LEGACY_DEMO,
+    deprecated=True,
+    description=LEGACY_DEMO_DESCRIPTION,
+)
+@app.post("/api/keys/generate", response_model=KeyGenerateResponse, include_in_schema=False)
 def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
     _require_legacy_demo_enabled()
     private_key_pem, public_key_pem = generate_key_pair()
@@ -151,6 +182,7 @@ def generate_keys(payload: KeyGenerateRequest, db: Session = Depends(get_db)):
         "privateKeyPem": private_key_pem,
         "publicKeyPem": public_key_pem,
         "certificate": certificate,
+        "warning": LEGACY_DEMO_WARNING,
     }
 
 
@@ -168,7 +200,14 @@ async def hash_document(file: UploadFile = File(...), hashAlgorithm: str = Form(
     }
 
 
-@app.post("/api/sign", response_model=SignedPackage, include_in_schema=ENABLE_LEGACY_DEMO)
+@app.post(
+    "/api/demo/sign",
+    response_model=SignedPackage,
+    include_in_schema=ENABLE_LEGACY_DEMO,
+    deprecated=True,
+    description=LEGACY_DEMO_DESCRIPTION,
+)
+@app.post("/api/sign", response_model=SignedPackage, include_in_schema=False)
 async def sign_document(
     file: UploadFile = File(...),
     privateKeyPem: str = Form(...),
@@ -209,10 +248,18 @@ async def sign_document(
         "signatureBase64": signature,
         "signedAt": isoformat(utc_now()),
         "certificate": certificate_model.model_dump(),
+        "warning": LEGACY_DEMO_WARNING,
     }
 
 
-@app.post("/api/verify", response_model=VerifyResponse, include_in_schema=ENABLE_LEGACY_DEMO)
+@app.post(
+    "/api/demo/verify",
+    response_model=VerifyResponse,
+    include_in_schema=ENABLE_LEGACY_DEMO,
+    deprecated=True,
+    description=LEGACY_DEMO_DESCRIPTION,
+)
+@app.post("/api/verify", response_model=VerifyResponse, include_in_schema=False)
 async def verify_document(
     file: UploadFile = File(...),
     signedPackage: str = Form(...),
@@ -292,6 +339,7 @@ async def verify_document(
         "documentHash": current_hash,
         "signedAt": package.signedAt,
         "details": details,
+        "warning": LEGACY_DEMO_WARNING,
     }
 
 
@@ -304,10 +352,17 @@ def _invalid(reason: str, package: SignedPackage, document_hash: str, details: D
         "documentHash": document_hash,
         "signedAt": package.signedAt,
         "details": details,
+        "warning": LEGACY_DEMO_WARNING,
     }
 
 
-@app.post("/api/certificates/revoke", include_in_schema=ENABLE_LEGACY_DEMO)
+@app.post(
+    "/api/demo/certificates/revoke",
+    include_in_schema=ENABLE_LEGACY_DEMO,
+    deprecated=True,
+    description=LEGACY_DEMO_DESCRIPTION,
+)
+@app.post("/api/certificates/revoke", include_in_schema=False)
 def revoke_certificate(payload: RevokeCertificateRequest, db: Session = Depends(get_db)):
     _require_legacy_demo_enabled()
     certificate = payload.certificate.model_dump()
@@ -321,5 +376,5 @@ def revoke_certificate(payload: RevokeCertificateRequest, db: Session = Depends(
     certificate["status"] = "revoked"
     record.status = "revoked"
     db.commit()
-    return {"certificate": certificate}
+    return {"certificate": certificate, "warning": LEGACY_DEMO_WARNING}
 

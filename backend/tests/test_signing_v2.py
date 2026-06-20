@@ -26,7 +26,7 @@ from app.auth_utils import (
 )
 from app.database import SessionLocal
 from app.main import _rate_limit_buckets, app
-from app.models import AuditLog, CertificateRecord, EmailOtpToken, SigningRequest, UserMfaSetting
+from app.models import AuditLog, CertificateRecord, CertificateRevocation, EmailOtpToken, SigningRequest, UserMfaSetting
 from app.security import auth_headers
 from app.x509_utils import issue_user_x509_certificate, verify_signed_demo_crl
 
@@ -123,6 +123,8 @@ def test_legacy_private_key_routes_disabled_by_default():
     paths = openapi.json()["paths"]
     assert "/api/keys/generate" not in paths
     assert "/api/sign" not in paths
+    assert "/api/demo/keys/generate" not in paths
+    assert "/api/demo/sign" not in paths
 
 
 def test_hash_document_respects_requested_hash_algorithm():
@@ -144,7 +146,13 @@ def test_unauthenticated_cannot_issue_cert():
     with TestClient(app) as client:
         response = client.post(
             "/api/certificates/x509/issue",
-            json={"name": "No Auth", "email": "noauth@example.com", "publicKeyPem": public_key_pem},
+            json={
+                "name": "No Auth",
+                "email": "noauth@example.com",
+                "publicKeyPem": public_key_pem,
+                "proofChallenge": "missing",
+                "proofSignatureBase64": "missing",
+            },
         )
 
     assert response.status_code == 401
@@ -214,38 +222,111 @@ def test_signer_cannot_revoke_cert():
     assert response.status_code == 403
 
 
-def test_signer_cannot_issue_x509_certificate():
-    _, public_key_pem = generate_key_pair()
+def test_verifier_cannot_issue_x509_certificate():
+    private_key_pem, public_key_pem = generate_key_pair()
     with TestClient(app) as client:
+        challenge = _x509_proof_challenge(client, "Verifier Issued", "verifier-issued@example.com", public_key_pem)
         response = client.post(
             "/api/certificates/x509/issue",
-            headers=SIGNER_HEADERS,
-            json={"name": "Signer Issued", "email": "signer-issued@example.com", "publicKeyPem": public_key_pem},
+            headers=VERIFIER_HEADERS,
+            json=_x509_issue_body(
+                "Verifier Issued",
+                "verifier-issued@example.com",
+                private_key_pem,
+                public_key_pem,
+                challenge,
+            ),
         )
 
     assert response.status_code == 403
 
 
 def test_ca_officer_can_issue_cert():
-    _, public_key_pem = generate_key_pair()
+    private_key_pem, public_key_pem = generate_key_pair()
     with TestClient(app) as client:
-        response = client.post(
-            "/api/certificates/x509/issue",
-            headers=CA_HEADERS,
-            json={"name": "CA Issued", "email": "ca-issued@example.com", "publicKeyPem": public_key_pem},
+        response = _issue_x509_certificate(
+            client,
+            "CA Issued",
+            "ca-issued@example.com",
+            private_key_pem,
+            public_key_pem,
         )
 
     assert response.status_code == 200
     assert response.json()["certificateType"] == "x509-demo"
 
 
-def test_user_can_prepare_signing_request_for_certificate_they_own():
+def test_cert_issue_requires_proof_of_possession():
     _, public_key_pem = generate_key_pair()
+    other_private_key_pem, _ = generate_key_pair()
     with TestClient(app) as client:
-        issued = client.post(
+        challenge = _x509_proof_challenge(client, "CA Issued", "ca-issued-pop@example.com", public_key_pem)
+        response = client.post(
             "/api/certificates/x509/issue",
             headers=CA_HEADERS,
-            json={"name": "Signer Owner", "email": "signer@example.com", "publicKeyPem": public_key_pem},
+            json={
+                "name": "CA Issued",
+                "email": "ca-issued-pop@example.com",
+                "publicKeyPem": public_key_pem,
+                "proofChallenge": challenge,
+                "proofSignatureBase64": _sign_challenge(challenge, other_private_key_pem),
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Proof-of-possession signature is invalid"
+
+
+def test_cert_subject_bound_to_authenticated_signer_identity():
+    private_key_pem, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        challenge = _x509_proof_challenge(
+            client,
+            "Wrong Subject",
+            "other-person@example.com",
+            public_key_pem,
+        )
+        response = client.post(
+            "/api/certificates/x509/issue",
+            headers=SIGNER_HEADERS,
+            json=_x509_issue_body(
+                "Wrong Subject",
+                "other-person@example.com",
+                private_key_pem,
+                public_key_pem,
+                challenge,
+            ),
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Certificate subject email must match authenticated signer"
+
+
+def test_signer_can_issue_own_certificate_with_proof_of_possession():
+    private_key_pem, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        response = _issue_x509_certificate(
+            client,
+            "Signer Self",
+            "signer@example.com",
+            private_key_pem,
+            public_key_pem,
+            headers=SIGNER_HEADERS,
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["certificate"]["email"] == "signer@example.com"
+
+
+def test_user_can_prepare_signing_request_for_certificate_they_own():
+    private_key_pem, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        issued = _issue_x509_certificate(
+            client,
+            "Signer Owner",
+            "signer@example.com",
+            private_key_pem,
+            public_key_pem,
         )
         assert issued.status_code == 200
         certificate = issued.json()["certificate"]
@@ -266,12 +347,14 @@ def test_user_can_prepare_signing_request_for_certificate_they_own():
 
 
 def test_user_cannot_prepare_signing_request_for_certificate_they_do_not_own():
-    _, public_key_pem = generate_key_pair()
+    private_key_pem, public_key_pem = generate_key_pair()
     with TestClient(app) as client:
-        issued = client.post(
-            "/api/certificates/x509/issue",
-            headers=CA_HEADERS,
-            json={"name": "Other Owner", "email": "other-owner@example.com", "publicKeyPem": public_key_pem},
+        issued = _issue_x509_certificate(
+            client,
+            "Other Owner",
+            "other-owner@example.com",
+            private_key_pem,
+            public_key_pem,
         )
         assert issued.status_code == 200
         certificate = issued.json()["certificate"]
@@ -485,6 +568,119 @@ def test_cors_allowlist_does_not_reflect_untrusted_origin():
     assert response.headers.get("access-control-allow-origin") != "https://evil.example"
 
 
+def test_frontend_has_csp_headers():
+    with TestClient(app) as client:
+        response = client.get("/api/algorithm-policy")
+
+    assert response.status_code == 200
+    assert response.headers["content-security-policy"].startswith("default-src 'self'")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
+
+
+def test_upload_rejects_path_traversal_filename():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/documents/store",
+            headers=SIGNER_HEADERS,
+            files={"file": ("../../evil.txt", b"hello", "text/plain")},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Path traversal filenames are not allowed"
+
+
+def test_upload_rejects_invalid_mime():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/documents/store",
+            headers=SIGNER_HEADERS,
+            files={"file": ("fake.pdf", b"not a pdf", "application/pdf")},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "PDF filename does not contain PDF content"
+
+
+def test_document_acl_blocks_other_user():
+    with TestClient(app) as client:
+        stored = client.post(
+            "/api/documents/store",
+            headers=SIGNER_HEADERS,
+            files={"file": ("owned.txt", b"owner document", "text/plain")},
+        )
+        assert stored.status_code == 200, stored.text
+        document_id = stored.json()["documentId"]
+
+        response = client.get(f"/api/documents/{document_id}", headers=OTHER_SIGNER_HEADERS)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Document access denied"
+
+
+def test_signed_document_update_creates_new_version():
+    with TestClient(app) as client:
+        stored = client.post(
+            "/api/documents/store",
+            headers=SIGNER_HEADERS,
+            files={"file": ("contract.txt", b"v1", "text/plain")},
+        )
+        assert stored.status_code == 200, stored.text
+        document = stored.json()
+        mark = client.post(f"/api/documents/{document['documentId']}/mark-signed", headers=SIGNER_HEADERS)
+        assert mark.status_code == 200, mark.text
+        updated = client.put(
+            f"/api/documents/{document['documentId']}/content",
+            headers=SIGNER_HEADERS,
+            files={"file": ("contract.txt", b"v2", "text/plain")},
+        )
+
+    assert updated.status_code == 200, updated.text
+    data = updated.json()
+    assert data["documentId"] != document["documentId"]
+    assert data["previousDocumentId"] == document["documentId"]
+    assert data["version"] == 2
+    assert data["immutable"] is False
+
+
+def test_rfc3161_endpoint_requires_configured_tsa_url():
+    with TestClient(app) as client:
+        timestamp = client.post(
+            "/api/timestamp/rfc3161",
+            headers=SIGNER_HEADERS,
+            json={"messageDigestBase64": base64.b64encode(b"0" * 32).decode("ascii"), "hashAlgorithm": "SHA-256"},
+        )
+
+    assert timestamp.status_code == 503
+    assert timestamp.json()["detail"] == "SECUREDOC_RFC3161_TSA_URL is not configured"
+
+
+def test_pades_pdf_signing_produces_pdf_signature():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/pdf/pades/sign",
+            headers=SIGNER_HEADERS,
+            files={"file": ("demo.pdf", _minimal_pdf(), "application/pdf")},
+            data={"reason": "pytest approval", "location": "pytest"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.headers["x-securedoc-pades-profile"] == "PAdES-B-B"
+    assert b"/ByteRange" in response.content
+    assert b"/ETSI.CAdES.detached" in response.content
+    assert b"/Contents" in response.content
+
+
+def test_private_key_not_stored_plaintext_in_browser_storage():
+    frontend_source = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+    signing_source = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "signing-v2.ts").read_text(encoding="utf-8")
+    combined = f"{frontend_source}\n{signing_source}"
+
+    assert "localStorage" not in combined
+    assert "sessionStorage" not in combined
+
+
 def test_v2_verify_rejects_modified_document_hash():
     with TestClient(app) as client:
         signed_package, _ = _create_submitted_package(client)
@@ -520,7 +716,7 @@ def test_v2_verify_rejects_tampered_signature():
     assert data["report"]["signatureValid"] == "failed"
 
 
-def test_v2_verify_rejects_revoked_certificate():
+def test_signature_valid_when_cert_revoked_after_signing_time():
     with TestClient(app) as client:
         signed_package, document_hash = _create_submitted_package(client)
         serial = signed_package["signerCertificate"]["serialNumber"]
@@ -530,6 +726,61 @@ def test_v2_verify_rejects_revoked_certificate():
             json={"serialNumber": serial, "reason": "key_compromise", "revokedBy": "pytest"},
         )
         assert revoke.status_code == 200
+
+        response = client.post(
+            "/api/verify/v2",
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is True
+    assert data["report"]["certificateRevocationStatus"] == "revoked_after_signing_time"
+    assert data["report"]["revocationSource"] == "server-db"
+    assert data["report"]["revocationValid"] is True
+
+
+def test_no_timestamp_cannot_claim_ltv_ready_after_revocation():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        signed_package["timestampToken"] = None
+        serial = signed_package["signerCertificate"]["serialNumber"]
+        revoke = client.post(
+            "/api/certificates/revoke/v2",
+            headers=CA_HEADERS,
+            json={"serialNumber": serial, "reason": "key_compromise", "revokedBy": "pytest"},
+        )
+        assert revoke.status_code == 200
+
+        response = client.post(
+            "/api/verify/v2",
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "certificate revoked"
+    assert data["report"]["certificateRevocationStatus"] == "revoked"
+    assert data["report"]["timestampStatus"] == "not_available"
+
+
+def test_signature_invalid_when_cert_revoked_before_signing_time():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        serial = signed_package["signerCertificate"]["serialNumber"]
+        revoke = client.post(
+            "/api/certificates/revoke/v2",
+            headers=CA_HEADERS,
+            json={"serialNumber": serial, "reason": "key_compromise", "revokedBy": "pytest"},
+        )
+        assert revoke.status_code == 200
+        timestamp = parse_iso_datetime(signed_package["timestampToken"]["timestamp"]).replace(tzinfo=None)
+        with SessionLocal() as db:
+            revocation = db.query(CertificateRevocation).filter_by(serial_number=serial).first()
+            assert revocation is not None
+            revocation.revoked_at = timestamp - timedelta(seconds=1)
+            db.commit()
 
         response = client.post(
             "/api/verify/v2",
@@ -643,6 +894,23 @@ def test_timestamp_token_is_verified():
     assert data["valid"] is True
     assert signed_package["timestampToken"]["messageImprint"]
     assert data["report"]["timestampStatus"] == "demo-tsa-valid"
+
+
+def test_timestamp_token_nonce_mismatch_fails():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        signed_package["timestampToken"]["nonce"] = "tampered-nonce"
+
+        response = client.post(
+            "/api/verify/v2",
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "invalid timestamp token"
+    assert data["report"]["timestampStatus"] == "failed"
 
 
 def test_submit_signed_package_without_otp_or_totp_confirmation_is_rejected():
@@ -823,6 +1091,79 @@ def _create_submitted_package(client: TestClient):
     return submit.json()["signedPackage"], document_hash
 
 
+def _minimal_pdf() -> bytes:
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << >> >>\nendobj\n",
+        b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n",
+    ]
+    output = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(output))
+        output.extend(obj)
+    xref = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(output)
+
+
+def _x509_proof_challenge(
+    client: TestClient,
+    name: str,
+    email: str,
+    public_key_pem: str,
+    *,
+    headers: dict[str, str] = CA_HEADERS,
+) -> str:
+    response = client.post(
+        "/api/certificates/x509/proof-challenge",
+        headers=headers,
+        json={"name": name, "email": email, "publicKeyPem": public_key_pem},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["challenge"]
+
+
+def _x509_issue_body(
+    name: str,
+    email: str,
+    private_key_pem: str,
+    public_key_pem: str,
+    challenge: str,
+) -> dict:
+    return {
+        "name": name,
+        "email": email,
+        "publicKeyPem": public_key_pem,
+        "proofChallenge": challenge,
+        "proofSignatureBase64": _sign_challenge(challenge, private_key_pem),
+    }
+
+
+def _issue_x509_certificate(
+    client: TestClient,
+    name: str,
+    email: str,
+    private_key_pem: str,
+    public_key_pem: str,
+    *,
+    headers: dict[str, str] = CA_HEADERS,
+):
+    challenge = _x509_proof_challenge(client, name, email, public_key_pem, headers=headers)
+    return client.post(
+        "/api/certificates/x509/issue",
+        headers=headers,
+        json=_x509_issue_body(name, email, private_key_pem, public_key_pem, challenge),
+    )
+
+
 def _create_prepared_signed_package(
     client: TestClient,
     *,
@@ -830,10 +1171,12 @@ def _create_prepared_signed_package(
     document_name: str = "document.txt",
 ):
     private_key_pem, public_key_pem = generate_key_pair()
-    issued = client.post(
-        "/api/certificates/x509/issue",
-        headers=CA_HEADERS,
-        json={"name": "Test Signer", "email": "signer@example.com", "publicKeyPem": public_key_pem},
+    issued = _issue_x509_certificate(
+        client,
+        "Test Signer",
+        "signer@example.com",
+        private_key_pem,
+        public_key_pem,
     )
     assert issued.status_code == 200, issued.text
     key_data = issued.json()
@@ -980,6 +1323,17 @@ def _sign_payload(payload: dict, private_key_pem: str) -> str:
     algorithm = hashes.SHA256()
     signature = private_key.sign(
         canonicalize_signing_payload(payload),
+        padding.PSS(mgf=padding.MGF1(algorithm), salt_length=algorithm.digest_size),
+        algorithm,
+    )
+    return base64.b64encode(signature).decode("ascii")
+
+
+def _sign_challenge(challenge: str, private_key_pem: str) -> str:
+    private_key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+    algorithm = hashes.SHA256()
+    signature = private_key.sign(
+        challenge.encode("utf-8"),
         padding.PSS(mgf=padding.MGF1(algorithm), salt_length=algorithm.digest_size),
         algorithm,
     )

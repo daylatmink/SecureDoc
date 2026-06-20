@@ -1,7 +1,8 @@
 # SecureDoc Security Policy
 
-SecureDoc is an educational digital-signature demo. It is not production-ready,
-legally-ready, RFC 3161-compliant, or PAdES-compliant.
+SecureDoc is an educational digital-signature demo. It is not production-ready
+or legally-ready. PAdES PDF export is implemented with pyHanko for demo use,
+but the default key custody is still local demo server-side signing.
 
 ## Supported Mode
 
@@ -28,6 +29,9 @@ Supported demo roles are `ADMIN`, `CA_OFFICER`, `SIGNER`, `VERIFIER`, and
 - Demo CA/TSA/blind-signature keys are written to `.securedoc-runtime/` by default.
 - Production use requires HSM/KMS/token-backed key custody or an equivalent remote signing service.
 - Signer private keys must remain with the signer or signer device.
+- X.509 demo certificate issuance requires the browser/client to sign a short proof-of-possession challenge. For signer self-service issuance, the subject email must match the authenticated signer email.
+- Stored documents are written under runtime storage by content hash, not raw filename, and document metadata enforces owner ACL checks. Signed documents are made immutable and updates create a new version.
+- Responses include basic browser hardening headers. Enable `SECUREDOC_HTTPS_ONLY=true` behind HTTPS to emit HSTS.
 
 ## Reporting
 
@@ -38,8 +42,11 @@ whether private keys, certificates, documents, or audit data are exposed.
 ## Current Limits
 
 - Local demo CA only; no public trust store.
-- Demo JSON timestamp only; no RFC 3161 `TimeStampToken`.
-- No PAdES/CAdES/XAdES signing profile.
+- Signed-package timestamp tokens are still demo JSON tokens, not RFC 3161 `TimeStampToken`s.
+- RFC 3161 timestamp requests require `SECUREDOC_RFC3161_TSA_URL`.
+- PAdES PDF export produces a real PDF signature container through pyHanko, with PAdES-B-B by default and PAdES-B-T when a TSA URL is configured.
+- No CAdES/XAdES signing profile.
+- No real identity proofing or CA approval workflow beyond demo RBAC and proof-of-possession.
 - Demo RBAC, CORS allowlist, request size limit, and in-memory rate limit only.
 - No production authentication, session security, or HTTPS hardening.
 - `legalReady` remains `false` by design.

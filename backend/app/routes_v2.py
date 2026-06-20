@@ -1,15 +1,23 @@
 """V2 client-side signing protocol endpoints."""
 
 import base64
+import hashlib
+import hmac
+import asyncio
+import io
 import json
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from .auth_utils import create_signing_email_otp, verify_enabled_totp_for_email, verify_signing_email_otp
+from .config import JWT_SECRET, RFC3161_TSA_URL, ensure_document_storage_dir
 from .crypto_utils import (
     ALGORITHM_POLICY,
     ALLOWED_SIGNING_PURPOSES,
@@ -34,12 +42,18 @@ from .models import (
     AuditLog,
     CertificateRecord,
     CertificateRevocation,
+    DocumentObject,
     SignatureRecord,
     SigningRequest,
     UsedNonce,
 )
+from .pades_utils import sign_pdf_pades as sign_pdf_pades_bytes
 from .schemas import (
     Certificate,
+    DocumentMarkSignedResponse,
+    DocumentStoredResponse,
+    Rfc3161TimestampRequest,
+    Rfc3161TimestampResponse,
     RevokeBySerialRequest,
     SignedPackageV2,
     SigningConfirmRequest,
@@ -50,9 +64,11 @@ from .schemas import (
     SigningRequestResponseV2,
     X509CertificateIssueRequest,
     X509CertificateIssueResponse,
+    X509ProofChallengeRequest,
+    X509ProofChallengeResponse,
 )
 from .routes_auth import _send_otp_email
-from .security import AUDITOR, CA_OFFICER, SIGNER, VERIFIER, require_roles
+from .security import ADMIN, AUDITOR, CA_OFFICER, SIGNER, VERIFIER, require_roles
 from .x509_utils import (
     TRUSTED_DEMO_ROOT_ID,
     X509_CERTIFICATE_TYPE,
@@ -92,6 +108,89 @@ def _db_time(dt: datetime) -> datetime:
 
 def _db_iso(dt: datetime) -> str:
     return isoformat(_as_utc(dt))
+
+
+def _safe_original_filename(filename: str | None) -> str:
+    candidate = (filename or "document.bin").strip()
+    if not candidate or candidate in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if "/" in candidate or "\\" in candidate or Path(candidate).name != candidate or ".." in Path(candidate).parts:
+        raise HTTPException(status_code=400, detail="Path traversal filenames are not allowed")
+    return candidate
+
+
+def _sniff_mime(content: bytes) -> str:
+    if content.startswith(b"%PDF-"):
+        return "application/pdf"
+    if b"\x00" in content:
+        return "application/octet-stream"
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return "application/octet-stream"
+    return "text/plain"
+
+
+def _validate_document_upload(filename: str, content_type: str | None, content: bytes) -> str:
+    if not content:
+        raise HTTPException(status_code=400, detail="Document is empty")
+    sniffed = _sniff_mime(content)
+    declared = (content_type or "").split(";", 1)[0].strip().lower()
+    if filename.lower().endswith(".pdf") and sniffed != "application/pdf":
+        raise HTTPException(status_code=400, detail="PDF filename does not contain PDF content")
+    if declared == "application/pdf" and sniffed != "application/pdf":
+        raise HTTPException(status_code=400, detail="Declared PDF MIME does not match content")
+    return sniffed if declared in {"", "application/octet-stream"} else declared
+
+
+def _document_storage_path(content_hash: str) -> Path:
+    storage_dir = ensure_document_storage_dir()
+    path = storage_dir / content_hash[:2] / f"{content_hash}.bin"
+    resolved_storage = storage_dir.resolve()
+    resolved_path = path.resolve()
+    if resolved_storage not in resolved_path.parents:
+        raise HTTPException(status_code=400, detail="Invalid document storage path")
+    return path
+
+
+def _document_to_response(record: DocumentObject) -> dict[str, Any]:
+    return {
+        "documentId": record.document_id,
+        "ownerEmail": record.owner_email,
+        "originalFilename": record.original_filename,
+        "contentHash": record.content_hash,
+        "hashAlgorithm": record.hash_algorithm,
+        "mimeType": record.mime_type,
+        "sizeBytes": record.size_bytes,
+        "version": record.version,
+        "previousDocumentId": record.previous_document_id,
+        "immutable": bool(record.immutable),
+        "createdAt": _db_iso(record.created_at),
+        "updatedAt": _db_iso(record.updated_at),
+    }
+
+
+def _require_document_access(record: DocumentObject, actor: dict[str, str]) -> None:
+    if actor["role"] == ADMIN:
+        return
+    if record.owner_email.strip().lower() != _actor_email(actor):
+        raise HTTPException(status_code=403, detail="Document access denied")
+
+
+def _persist_document_content(content: bytes) -> tuple[str, Path]:
+    content_hash = hash_bytes(content, "SHA-256")
+    path = _document_storage_path(content_hash)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_bytes(content)
+    return content_hash, path
+
+
+async def _read_document_upload(file: UploadFile) -> tuple[str, bytes, str]:
+    filename = _safe_original_filename(file.filename)
+    content = await file.read()
+    mime_type = _validate_document_upload(filename, file.content_type, content)
+    return filename, content, mime_type
 
 
 def _log_audit(
@@ -361,6 +460,26 @@ def _signature_message_imprint(signature_base64: str) -> str:
     return hash_bytes(signature_bytes, "SHA-256")
 
 
+def _trusted_timestamp_time(
+    timestamp_token: dict[str, Any] | None,
+    signature_base64: str,
+    expected_nonce: str | None = None,
+) -> tuple[datetime | None, str, str]:
+    if not timestamp_token:
+        return None, "not_available", "No trusted timestamp token is present."
+    timestamp_ok, timestamp_message = verify_timestamp_token(
+        timestamp_token,
+        _signature_message_imprint(signature_base64),
+        expected_nonce,
+    )
+    if not timestamp_ok:
+        return None, "failed", timestamp_message
+    try:
+        return parse_iso_datetime(str(timestamp_token["timestamp"])), "demo-tsa-valid", timestamp_message
+    except (KeyError, ValueError, TypeError) as exc:
+        return None, "failed", f"Malformed timestamp token time: {exc}"
+
+
 def _reject_submit(
     db: Session,
     message: str,
@@ -382,6 +501,80 @@ def _reject_submit(
 
 def _actor_email(actor: dict[str, str]) -> str:
     return actor["user"].strip().lower()
+
+
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _public_key_fingerprint(public_key_pem: str) -> str:
+    return hash_bytes(public_key_pem.strip().encode("utf-8"), "SHA-256")
+
+
+def _subject_for_actor(body: X509ProofChallengeRequest | X509CertificateIssueRequest, actor: dict[str, str]) -> tuple[str, str]:
+    subject_name = body.name.strip()
+    subject_email = body.email.strip().lower()
+    if not subject_name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if actor["role"] == SIGNER and subject_email != _actor_email(actor):
+        raise HTTPException(status_code=403, detail="Certificate subject email must match authenticated signer")
+    return subject_name, subject_email
+
+
+def _challenge_signature(payload_b64: str) -> str:
+    digest = hmac.new(JWT_SECRET.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256).digest()
+    return _b64url_encode(digest)
+
+
+def _make_pop_challenge(subject_name: str, subject_email: str, public_key_pem: str, actor: dict[str, str]) -> tuple[str, datetime]:
+    now = utc_now()
+    expires_at = now + timedelta(minutes=10)
+    payload = {
+        "purpose": "X509_CERTIFICATE_PROOF_OF_POSSESSION",
+        "subjectName": subject_name,
+        "subjectEmail": subject_email,
+        "publicKeyFingerprint": _public_key_fingerprint(public_key_pem),
+        "actor": _actor_email(actor),
+        "actorRole": actor["role"],
+        "issuedAt": isoformat(now),
+        "expiresAt": isoformat(expires_at),
+        "nonce": secrets.token_hex(16),
+    }
+    payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload_b64 = _b64url_encode(payload_bytes)
+    return f"{payload_b64}.{_challenge_signature(payload_b64)}", expires_at
+
+
+def _verify_pop_challenge(challenge: str, subject_name: str, subject_email: str, public_key_pem: str) -> None:
+    payload_b64, separator, signature = challenge.partition(".")
+    if not separator or not payload_b64 or not signature:
+        raise HTTPException(status_code=400, detail="Malformed proof challenge")
+    expected_signature = _challenge_signature(payload_b64)
+    if not hmac.compare_digest(expected_signature, signature):
+        raise HTTPException(status_code=400, detail="Invalid proof challenge")
+    try:
+        payload = json.loads(_b64url_decode(payload_b64))
+        expires_at = parse_iso_datetime(str(payload["expiresAt"]))
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Malformed proof challenge") from exc
+    if payload.get("purpose") != "X509_CERTIFICATE_PROOF_OF_POSSESSION":
+        raise HTTPException(status_code=400, detail="Invalid proof challenge purpose")
+    if expires_at <= utc_now():
+        raise HTTPException(status_code=400, detail="Proof challenge expired")
+    if payload.get("subjectName") != subject_name or payload.get("subjectEmail") != subject_email:
+        raise HTTPException(status_code=400, detail="Proof challenge subject mismatch")
+    if payload.get("publicKeyFingerprint") != _public_key_fingerprint(public_key_pem):
+        raise HTTPException(status_code=400, detail="Proof challenge public key mismatch")
+
+
+def _verify_proof_of_possession(public_key_pem: str, challenge: str, proof_signature_base64: str) -> None:
+    if not verify_canonical_signature(challenge.encode("utf-8"), proof_signature_base64, public_key_pem, "SHA-256"):
+        raise HTTPException(status_code=400, detail="Proof-of-possession signature is invalid")
 
 
 def _require_signing_request_owner(request: SigningRequest, actor: dict[str, str]) -> None:
@@ -416,14 +609,41 @@ def _confirmation_state(
     return request, confirmed, request.confirmation_method, context_matches
 
 
+@router.post("/api/certificates/x509/proof-challenge", response_model=X509ProofChallengeResponse)
+def create_x509_proof_challenge(
+    body: X509ProofChallengeRequest,
+    actor: dict[str, str] = Depends(require_roles(CA_OFFICER, SIGNER)),
+):
+    subject_name, subject_email = _subject_for_actor(body, actor)
+    try:
+        key_size = get_public_key_size(body.publicKeyPem)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid public key PEM") from exc
+    if key_size < ALGORITHM_POLICY["minimumRsaKeyBits"]:
+        raise HTTPException(status_code=400, detail="RSA key size is below policy minimum")
+
+    challenge, expires_at = _make_pop_challenge(subject_name, subject_email, body.publicKeyPem, actor)
+    return {
+        "challenge": challenge,
+        "expiresAt": isoformat(expires_at),
+        "subjectName": subject_name,
+        "subjectEmail": subject_email,
+        "publicKeyFingerprint": _public_key_fingerprint(body.publicKeyPem),
+        "warning": "Sign this challenge with the private key matching publicKeyPem before certificate issuance.",
+    }
+
+
 @router.post("/api/certificates/x509/issue", response_model=X509CertificateIssueResponse)
 def issue_x509_certificate(
     body: X509CertificateIssueRequest,
     db: Session = Depends(get_db),
-    actor: dict[str, str] = Depends(require_roles(CA_OFFICER)),
+    actor: dict[str, str] = Depends(require_roles(CA_OFFICER, SIGNER)),
 ):
+    subject_name, subject_email = _subject_for_actor(body, actor)
+    _verify_pop_challenge(body.proofChallenge, subject_name, subject_email, body.publicKeyPem)
+    _verify_proof_of_possession(body.publicKeyPem, body.proofChallenge, body.proofSignatureBase64)
     try:
-        issued = issue_user_x509_certificate(body.name, body.email, body.publicKeyPem)
+        issued = issue_user_x509_certificate(subject_name, subject_email, body.publicKeyPem)
         certificate = issued["certificate"]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -450,11 +670,146 @@ def issue_x509_certificate(
         "certificate_issued",
         certificate["email"],
         "success",
-        details="x509-demo certificate issued from browser-generated public key",
+        details="x509-demo certificate issued after proof-of-possession verification",
         certificate_serial=certificate["serialNumber"],
     )
     db.commit()
     return issued
+
+
+@router.post("/api/documents/store", response_model=DocumentStoredResponse)
+async def store_document(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    filename, content, mime_type = await _read_document_upload(file)
+    content_hash, path = _persist_document_content(content)
+    now = utc_now()
+    record = DocumentObject(
+        document_id=secrets.token_hex(16),
+        owner_email=_actor_email(actor),
+        original_filename=filename,
+        content_hash=content_hash,
+        hash_algorithm="SHA-256",
+        mime_type=mime_type,
+        storage_path=str(path),
+        size_bytes=len(content),
+        version=1,
+        previous_document_id=None,
+        immutable=0,
+        created_at=_db_time(now),
+        updated_at=_db_time(now),
+    )
+    db.add(record)
+    _log_audit(
+        db,
+        "document_stored",
+        _actor_email(actor),
+        "success",
+        details=f"documentId={record.document_id}; mimeType={mime_type}; sizeBytes={len(content)}",
+        document_hash=content_hash,
+    )
+    db.commit()
+    return _document_to_response(record)
+
+
+@router.get("/api/documents/{document_id}", response_model=DocumentStoredResponse)
+def get_document_metadata(
+    document_id: str,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER, VERIFIER, AUDITOR)),
+):
+    record = db.get(DocumentObject, document_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Document not found")
+    _require_document_access(record, actor)
+    return _document_to_response(record)
+
+
+@router.put("/api/documents/{document_id}/content", response_model=DocumentStoredResponse)
+async def update_document_content(
+    document_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    record = db.get(DocumentObject, document_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Document not found")
+    _require_document_access(record, actor)
+    filename, content, mime_type = await _read_document_upload(file)
+    content_hash, path = _persist_document_content(content)
+    now = utc_now()
+    if record.immutable:
+        new_record = DocumentObject(
+            document_id=secrets.token_hex(16),
+            owner_email=record.owner_email,
+            original_filename=filename,
+            content_hash=content_hash,
+            hash_algorithm="SHA-256",
+            mime_type=mime_type,
+            storage_path=str(path),
+            size_bytes=len(content),
+            version=record.version + 1,
+            previous_document_id=record.document_id,
+            immutable=0,
+            created_at=_db_time(now),
+            updated_at=_db_time(now),
+        )
+        db.add(new_record)
+        _log_audit(
+            db,
+            "document_version_created",
+            _actor_email(actor),
+            "success",
+            details=f"previousDocumentId={record.document_id}; documentId={new_record.document_id}",
+            document_hash=content_hash,
+        )
+        db.commit()
+        return _document_to_response(new_record)
+
+    record.original_filename = filename
+    record.content_hash = content_hash
+    record.mime_type = mime_type
+    record.storage_path = str(path)
+    record.size_bytes = len(content)
+    record.updated_at = _db_time(now)
+    _log_audit(
+        db,
+        "document_updated",
+        _actor_email(actor),
+        "success",
+        details=f"documentId={record.document_id}",
+        document_hash=content_hash,
+    )
+    db.commit()
+    return _document_to_response(record)
+
+
+@router.post("/api/documents/{document_id}/mark-signed", response_model=DocumentMarkSignedResponse)
+def mark_document_signed(
+    document_id: str,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    record = db.get(DocumentObject, document_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Document not found")
+    _require_document_access(record, actor)
+    now = utc_now()
+    record.immutable = 1
+    record.updated_at = _db_time(now)
+    _log_audit(
+        db,
+        "document_marked_signed",
+        _actor_email(actor),
+        "success",
+        details=f"documentId={record.document_id}",
+        document_hash=record.content_hash,
+    )
+    db.commit()
+    return {"documentId": record.document_id, "immutable": True, "updatedAt": isoformat(now)}
 
 
 @router.post("/api/sign/v2/prepare", response_model=SigningRequestResponseV2)
@@ -787,12 +1142,12 @@ def submit_signature(
     timestamp_token = body.timestampToken
     timestamp_imprint = _signature_message_imprint(body.signatureBase64)
     if timestamp_token:
-        timestamp_ok, timestamp_message = verify_timestamp_token(timestamp_token, timestamp_imprint)
+        timestamp_ok, timestamp_message = verify_timestamp_token(timestamp_token, timestamp_imprint, payload.nonce)
         if not timestamp_ok:
             _reject_submit(db, timestamp_message, payload, cert)
         _step(steps, "Timestamp token", "passed", timestamp_message)
     else:
-        timestamp_token = issue_timestamp_token(timestamp_imprint, "SHA-256")
+        timestamp_token = issue_timestamp_token(timestamp_imprint, "SHA-256", payload.nonce)
         _log_audit(
             db,
             "timestamp_issued",
@@ -1119,28 +1474,51 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
     _step(steps, "Certificate record", "passed", "Certificate matches trusted server DB record.")
 
     revocation = _latest_revocation(db, cert.serialNumber)
+    revocation_status = "valid"
     if record.status != "valid":
         message = "Server DB marks certificate revoked."
         if revocation:
             message = f"{message} reason={revocation.reason}; revokedAt={_db_iso(revocation.revoked_at)}"
-        _step(steps, "Revocation status", "failed", message)
-        return fail(
-            "certificate revoked",
-            {
-                "documentIntegrity": "passed",
-                "signingPayloadValid": "passed",
-                "certificateParsed": "passed",
-                "certificateTrusted": "passed",
-                "certificateType": certificate_type,
-                "certificateRevocationStatus": "revoked",
-                "revocationSource": "server-db",
-                "algorithmPolicyValid": "passed",
-            },
-            payload,
-            cert,
-            signed_at,
+        trusted_signing_time, revocation_timestamp_status, revocation_timestamp_message = _trusted_timestamp_time(
+            package.timestampToken,
+            package.signatureBase64,
+            payload.nonce,
         )
-    _step(steps, "Revocation status", "passed", "Server DB marks certificate valid.")
+        if revocation and trusted_signing_time and _as_utc(revocation.revoked_at) > _as_utc(trusted_signing_time):
+            revocation_status = "revoked_after_signing_time"
+            _step(
+                steps,
+                "Revocation status",
+                "passed",
+                f"{message}; trusted signing time={isoformat(trusted_signing_time)}",
+            )
+            warnings.append("Certificate is currently revoked, but revocation occurred after the trusted signing time.")
+        else:
+            if revocation_timestamp_status != "demo-tsa-valid":
+                message = f"{message}; {revocation_timestamp_message}"
+            elif revocation and trusted_signing_time:
+                message = f"{message}; revoked before or at trusted signing time={isoformat(trusted_signing_time)}"
+            _step(steps, "Revocation status", "failed", message)
+            revocation_status = "revoked"
+            return fail(
+                "certificate revoked",
+                {
+                    "documentIntegrity": "passed",
+                    "signingPayloadValid": "passed",
+                    "certificateParsed": "passed",
+                    "certificateTrusted": "passed",
+                    "certificateType": certificate_type,
+                    "certificateRevocationStatus": revocation_status,
+                    "revocationSource": "server-db",
+                    "algorithmPolicyValid": "passed",
+                    "timestampStatus": revocation_timestamp_status,
+                },
+                payload,
+                cert,
+                signed_at,
+            )
+    else:
+        _step(steps, "Revocation status", "passed", "Server DB marks certificate valid.")
 
     try:
         expires_at = parse_iso_datetime(cert.expiresAt)
@@ -1154,7 +1532,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateParsed": "passed",
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
-                "certificateRevocationStatus": "valid",
+                "certificateRevocationStatus": revocation_status,
                 "revocationSource": "server-db",
                 "certificateValidityPeriod": "failed",
                 "algorithmPolicyValid": "passed",
@@ -1173,7 +1551,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateParsed": "passed",
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
-                "certificateRevocationStatus": "valid",
+                "certificateRevocationStatus": revocation_status,
                 "revocationSource": "server-db",
                 "certificateValidityPeriod": "failed",
                 "algorithmPolicyValid": "passed",
@@ -1195,7 +1573,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateParsed": "passed",
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
-                "certificateRevocationStatus": "valid",
+                "certificateRevocationStatus": revocation_status,
                 "revocationSource": "server-db",
                 "certificateValidityPeriod": "passed",
                 "keyUsageValid": "failed",
@@ -1245,7 +1623,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateTrusted": "passed",
                 "certificateType": certificate_type,
                 "certificateChainValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
-                "certificateRevocationStatus": "valid",
+                "certificateRevocationStatus": revocation_status,
                 "revocationSource": "server-db",
                 "certificateValidityPeriod": "passed",
                 "keyUsageValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
@@ -1263,6 +1641,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         timestamp_ok, timestamp_message = verify_timestamp_token(
             package.timestampToken,
             _signature_message_imprint(package.signatureBase64),
+            payload.nonce,
         )
         if timestamp_ok:
             timestamp_status = "demo-tsa-valid"
@@ -1281,7 +1660,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                     "certificateType": certificate_type,
                     "certificateChainValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
                     "certificateValidityPeriod": "passed",
-                    "certificateRevocationStatus": "valid",
+                    "certificateRevocationStatus": revocation_status,
                     "revocationSource": "server-db",
                     "keyUsageValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
                     "algorithmPolicyValid": "passed",
@@ -1313,7 +1692,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
             "certificateType": certificate_type,
             "certificateChainValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
             "certificateValidityPeriod": "passed",
-            "certificateRevocationStatus": "valid",
+            "certificateRevocationStatus": revocation_status,
             "revocationSource": "server-db",
             "keyUsageValid": "passed" if certificate_type == X509_CERTIFICATE_TYPE else "not_available",
             "algorithmPolicyValid": "passed",
@@ -1488,3 +1867,72 @@ def verify_audit_chain(
 @router.get("/api/algorithm-policy")
 def get_algorithm_policy():
     return ALGORITHM_POLICY
+
+
+@router.post("/api/timestamp/rfc3161", response_model=Rfc3161TimestampResponse)
+def request_rfc3161_timestamp(
+    body: Rfc3161TimestampRequest,
+    actor: dict[str, str] = Depends(require_roles(SIGNER, VERIFIER, CA_OFFICER)),
+):
+    if not RFC3161_TSA_URL:
+        raise HTTPException(status_code=503, detail="SECUREDOC_RFC3161_TSA_URL is not configured")
+    try:
+        digest = base64.b64decode(body.messageDigestBase64, validate=True)
+        hash_algorithm = normalize_hash_algorithm(body.hashAlgorithm)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid timestamp request") from exc
+    try:
+        from pyhanko.sign import timestamps
+
+        timestamper = timestamps.HTTPTimeStamper(RFC3161_TSA_URL)
+        token = asyncio.run(timestamper.async_timestamp(digest, hash_algorithm.lower().replace("-", "")))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"RFC3161 TSA request failed: {exc}") from exc
+    return {
+        "tokenBase64": base64.b64encode(token.dump()).decode("ascii"),
+        "hashAlgorithm": hash_algorithm,
+        "provider": RFC3161_TSA_URL,
+    }
+
+
+@router.post("/api/pdf/pades/sign")
+async def sign_pdf_pades(
+    file: UploadFile = File(...),
+    reason: str = Form("SecureDoc document approval"),
+    location: str = Form("SecureDoc"),
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    filename, content, mime_type = await _read_document_upload(file)
+    if mime_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="PAdES signing requires a PDF file")
+    try:
+        signed_pdf, profile = await run_in_threadpool(
+            sign_pdf_pades_bytes,
+            content,
+            reason=reason,
+            location=location,
+            signer_name=_actor_email(actor),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PAdES signing failed: {exc}") from exc
+
+    signed_hash = hash_bytes(signed_pdf, "SHA-256")
+    _log_audit(
+        db,
+        "pades_pdf_signed",
+        _actor_email(actor),
+        "success",
+        details=f"profile={profile}; filename={filename}",
+        document_hash=signed_hash,
+    )
+    db.commit()
+    stem = Path(filename).stem or "signed"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{stem}-pades-signed.pdf"',
+        "X-SecureDoc-PAdES-Profile": profile,
+        "X-SecureDoc-PAdES-Hash": signed_hash,
+    }
+    return StreamingResponse(io.BytesIO(signed_pdf), media_type="application/pdf", headers=headers)

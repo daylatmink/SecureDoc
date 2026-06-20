@@ -66,3 +66,13 @@ def _ensure_sqlite_columns() -> None:
                 if column_name not in otp_existing:
                     connection.execute(text(f"ALTER TABLE email_otp_tokens ADD COLUMN {column_name} {column_type}"))
 
+        if "documents" in table_names:
+            document_existing = {column["name"] for column in inspector.get_columns("documents")}
+            document_additions = {
+                "previous_document_id": "VARCHAR",
+                "immutable": "INTEGER DEFAULT 0 NOT NULL",
+            }
+            for column_name, column_type in document_additions.items():
+                if column_name not in document_existing:
+                    connection.execute(text(f"ALTER TABLE documents ADD COLUMN {column_name} {column_type}"))
+

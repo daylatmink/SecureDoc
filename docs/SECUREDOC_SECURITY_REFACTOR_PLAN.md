@@ -18,6 +18,15 @@ File này là roadmap bảo mật dài hạn. Trong lần refactor hiện tại 
 [x] Fix document hashing endpoint to respect requested hash algorithm
 [x] Add request size limit, in-memory rate limit, and CORS allowlist config
 [x] Disable blind-signature demo routes by default
+[x] Add proof-of-possession challenge for X.509 certificate issuance
+[x] Bind signer self-service certificate subject email to authenticated signer
+[x] Bind demo timestamp token to signing nonce
+[x] Evaluate revocation against trusted demo timestamp when present
+[x] Add secure document storage API with path traversal/MIME checks
+[x] Add document owner ACL and immutable versioning
+[x] Add CSP/security response headers
+[x] Add pyHanko-backed PAdES-B-B PDF signing endpoint
+[x] Add RFC3161 HTTP TSA provider integration via SECUREDOC_RFC3161_TSA_URL
 [x] Add regression tests for the implemented security changes
 [x] Add .env.example and SECURITY.md
 ```
@@ -27,10 +36,12 @@ Các mục sau vẫn là roadmap, chưa được coi là hoàn thành:
 ```text
 [ ] Production authentication + RBAC backed by real accounts/JWT/session
 [ ] Email delivery and full TOTP MFA login flow
-[ ] Proof-of-possession for certificate issuance
+[x] Proof-of-possession for certificate issuance
 [ ] Full RFC 5280 path validation
-[ ] RFC 3161 TimeStampToken
-[ ] PAdES/CAdES/XAdES signing profile
+[x] RFC 3161 TimeStampToken provider integration when external TSA is configured
+[x] PAdES-B-B PDF signing profile
+[ ] PAdES-B-T requires configured external TSA in deployment
+[ ] CAdES/XAdES signing profile
 [ ] HSM/KMS/token-backed key custody
 [ ] Distributed production rate limiting, HTTPS, CSRF/session hardening
 ```
@@ -1153,23 +1164,26 @@ Không được tạo cảm giác hệ thống đã đạt chuẩn pháp lý n�
 [ ] Add recovery codes
 [x] Add demo auth + RBAC
 [ ] Encrypt CA/TSA keys or integrate KMS/HSM
-[ ] Add proof-of-possession for cert issuance
+[x] Add proof-of-possession for cert issuance
 [ ] Improve X.509 validation
 [ ] Add EKU/KeyUsage/BasicConstraints policies
-[ ] Implement revocation semantics by signing time
-[ ] Replace demo timestamp with RFC3161 provider
-[ ] Implement PAdES roadmap for PDF
+[x] Implement revocation semantics by signing time
+[x] Add RFC3161 provider endpoint for external TSA
+[x] Implement PAdES-B-B roadmap for PDF
+[ ] Implement PAdES-B-T/LT/LTA deployment with trusted TSA/revocation evidence
 [x] Split verify result fields
 [ ] Add canonical payload binding checks
 [ ] Add algorithm allowlist
 [x] Gate blind signature demo
 [ ] Add append-only audit log
-[ ] Add document ACL and immutable storage
-[ ] Harden frontend signing and browser key storage
+[x] Add document ACL and immutable storage
+[x] Harden frontend signing and browser key storage
 [x] Add rate limit and CORS config
+[x] Add CSP/security headers and HTTPS/HSTS opt-in
 [ ] Add CSRF/HTTPS/session hardening
+[x] Add lightweight SQLite migration guards for new demo tables/columns
 [ ] Add migration and production config
-[ ] Add negative tests
+[x] Add negative tests
 [ ] Add interoperability tests
 [x] Update README/SECURITY/docs
 ```

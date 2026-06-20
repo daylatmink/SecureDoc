@@ -440,7 +440,7 @@ def ensure_demo_tsa_key() -> rsa.RSAPrivateKey:
     return private_key
 
 
-def issue_timestamp_token(message_imprint: str, hash_algorithm: str = "SHA-256") -> dict[str, Any]:
+def issue_timestamp_token(message_imprint: str, hash_algorithm: str = "SHA-256", nonce: str | None = None) -> dict[str, Any]:
     private_key = ensure_demo_tsa_key()
     token = {
         "tokenVersion": "1.0",
@@ -451,11 +451,17 @@ def issue_timestamp_token(message_imprint: str, hash_algorithm: str = "SHA-256")
         "serialNumber": secrets.token_hex(12).upper(),
         "signatureAlgorithm": DEMO_SIGNATURE_ALGORITHM,
     }
+    if nonce:
+        token["nonce"] = nonce
     token["signatureBase64"] = _sign_demo_payload(private_key, token)
     return token
 
 
-def verify_timestamp_token(token: dict[str, Any], expected_message_imprint: str) -> tuple[bool, str]:
+def verify_timestamp_token(
+    token: dict[str, Any],
+    expected_message_imprint: str,
+    expected_nonce: str | None = None,
+) -> tuple[bool, str]:
     try:
         signature_base64 = str(token["signatureBase64"])
         payload = {
@@ -470,10 +476,14 @@ def verify_timestamp_token(token: dict[str, Any], expected_message_imprint: str)
                 "signatureAlgorithm",
             )
         }
+        if "nonce" in token:
+            payload["nonce"] = token["nonce"]
         if payload["tokenVersion"] != "1.0":
             return False, "Unsupported timestamp token version"
         if payload["messageImprint"] != expected_message_imprint:
             return False, "Timestamp token messageImprint mismatch"
+        if expected_nonce is not None and payload.get("nonce") != expected_nonce:
+            return False, "Timestamp token nonce mismatch"
         if payload["hashAlgorithm"] != "SHA-256":
             return False, "Unsupported timestamp hash algorithm"
         if payload["tsaName"] != DEMO_TSA_NAME:
