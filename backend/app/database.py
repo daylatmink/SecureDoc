@@ -18,6 +18,36 @@ Base = declarative_base()
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_sqlite_columns()
+    _seed_default_users()
+
+
+def _seed_default_users() -> None:
+    from .crypto_utils import utc_now
+    from .models import User
+
+    defaults = [
+        ("tai.dv230062@sis.hust.edu.vn", "Default Signer", "SIGNER"),
+        ("signer@example.com", "Test Signer", "SIGNER"),
+        ("other-signer@example.com", "Other Signer", "SIGNER"),
+        ("nguyenhathanhdz2k5@gmail.com", "Pytest CA Officer", "CA_OFFICER"),
+        ("pytest-ca@example.com", "Pytest CA Officer", "CA_OFFICER"),
+        ("pytest-auditor@example.com", "Pytest Auditor", "AUDITOR"),
+        ("pytest-verifier@example.com", "Pytest Verifier", "VERIFIER"),
+        ("api-otp@example.com", "API OTP Signer", "SIGNER"),
+        ("mfa@example.com", "MFA Signer", "SIGNER"),
+        ("totp-contract@example.com", "TOTP Contract Signer", "SIGNER"),
+        ("enabled-mfa@example.com", "Enabled MFA Signer", "SIGNER"),
+        ("demo-admin@example.com", "Demo Admin", "ADMIN"),
+        ("demo-ca-officer@example.com", "Demo CA Officer", "CA_OFFICER"),
+        ("demo-auditor@example.com", "Demo Auditor", "AUDITOR"),
+        ("demo-verifier@example.com", "Demo Verifier", "VERIFIER"),
+    ]
+    now = utc_now().replace(tzinfo=None)
+    with SessionLocal() as db:
+        for email, name, role in defaults:
+            if not db.get(User, email):
+                db.add(User(email=email, name=name, role=role, status="active", created_at=now, updated_at=now))
+        db.commit()
 
 
 def _ensure_sqlite_columns() -> None:
@@ -26,10 +56,7 @@ def _ensure_sqlite_columns() -> None:
 
     inspector = inspect(engine)
     table_names = inspector.get_table_names()
-    if "certificates" not in table_names:
-        return
-
-    certificate_existing = {column["name"] for column in inspector.get_columns("certificates")}
+    certificate_existing = {column["name"] for column in inspector.get_columns("certificates")} if "certificates" in table_names else set()
     certificate_additions = {
         "certificate_type": "VARCHAR DEFAULT 'legacy-demo' NOT NULL",
         "fingerprint_sha256": "VARCHAR",
@@ -39,8 +66,21 @@ def _ensure_sqlite_columns() -> None:
         "root_certificate_pem": "TEXT",
     }
     with engine.begin() as connection:
+        if "users" in table_names:
+            user_existing = {column["name"] for column in inspector.get_columns("users")}
+            user_additions = {
+                "name": "VARCHAR DEFAULT '' NOT NULL",
+                "role": "VARCHAR DEFAULT 'SIGNER' NOT NULL",
+                "status": "VARCHAR DEFAULT 'active' NOT NULL",
+                "created_at": "DATETIME",
+                "updated_at": "DATETIME",
+            }
+            for column_name, column_type in user_additions.items():
+                if column_name not in user_existing:
+                    connection.execute(text(f"ALTER TABLE users ADD COLUMN {column_name} {column_type}"))
+
         for column_name, column_type in certificate_additions.items():
-            if column_name not in certificate_existing:
+            if "certificates" in table_names and column_name not in certificate_existing:
                 connection.execute(text(f"ALTER TABLE certificates ADD COLUMN {column_name} {column_type}"))
 
         if "signing_requests" in table_names:
@@ -48,6 +88,8 @@ def _ensure_sqlite_columns() -> None:
             signing_request_additions = {
                 "confirmation_method": "VARCHAR",
                 "confirmed_at": "DATETIME",
+                "signing_intent": "TEXT",
+                "expires_at": "DATETIME",
             }
             for column_name, column_type in signing_request_additions.items():
                 if column_name not in signing_request_existing:
@@ -75,4 +117,3 @@ def _ensure_sqlite_columns() -> None:
             for column_name, column_type in document_additions.items():
                 if column_name not in document_existing:
                     connection.execute(text(f"ALTER TABLE documents ADD COLUMN {column_name} {column_type}"))
-

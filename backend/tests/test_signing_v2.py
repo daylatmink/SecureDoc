@@ -5,17 +5,19 @@ import hmac
 import sys
 import os
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ["SECUREDOC_DATABASE_URL"] = "sqlite:///:memory:"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 
-from app.crypto_utils import canonicalize_signing_payload, generate_key_pair, get_public_key_size, hash_bytes, parse_iso_datetime
+from app.crypto_utils import canonicalize_signing_payload, generate_key_pair, get_public_key_size, hash_bytes, parse_iso_datetime, rsa_pss_params
 from app.auth_utils import (
     create_email_otp,
     create_signing_email_otp,
@@ -28,7 +30,16 @@ from app.database import SessionLocal
 from app.main import _rate_limit_buckets, app
 from app.models import AuditLog, CertificateRecord, CertificateRevocation, EmailOtpToken, SigningRequest, UserMfaSetting
 from app.security import auth_headers
-from app.x509_utils import issue_user_x509_certificate, verify_signed_demo_crl
+from app.x509_utils import (
+    X509_INTERMEDIATE_COMMON_NAME,
+    X509_CERTIFICATE_TYPE,
+    X509_ROOT_CERT_PATH,
+    X509_ROOT_KEY_PATH,
+    ensure_demo_x509_ca,
+    issue_user_x509_certificate,
+    parse_user_x509_details,
+    verify_signed_demo_crl,
+)
 
 
 DOCUMENT = b"SecureDoc v2 test document"
@@ -53,6 +64,7 @@ def test_v2_verify_success():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -88,6 +100,7 @@ def test_offline_valid_package_is_not_server_accepted():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -158,37 +171,64 @@ def test_unauthenticated_cannot_issue_cert():
     assert response.status_code == 401
 
 
-def test_demo_login_returns_jwt_that_can_access_totp_setup():
+def test_login_otp_existing_user_passes():
     with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/login/request-otp",
+            json={"email": "signer@example.com"},
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["email"] == "signer@example.com"
+    assert data["delivery"] == "not_configured_demo_no_otp_in_response"
+
+
+def test_login_otp_unknown_user_fails():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/login/request-otp",
+            json={"email": "missing-user@example.com"},
+        )
+
+    assert response.status_code == 404
+
+
+def test_verify_login_otp_returns_jwt_with_db_role():
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            _token, otp = create_email_otp(db, "pytest-ca@example.com", "LOGIN_MFA")
+            db.commit()
+
         login = client.post(
-            "/api/auth/demo-login",
-            json={"email": "jwt-signer@example.com", "role": "SIGNER"},
+            "/api/auth/login/verify-otp",
+            json={"email": "pytest-ca@example.com", "otp": otp},
         )
         assert login.status_code == 200, login.text
         data = login.json()
         assert data["accessToken"]
         assert data["tokenType"] == "Bearer"
-        assert data["expiresIn"] == 3600
-        assert data["user"] == "jwt-signer@example.com"
-        assert data["role"] == "SIGNER"
+        assert data["user"]["email"] == "pytest-ca@example.com"
+        assert data["user"]["role"] == "CA_OFFICER"
 
-        setup = client.post(
-            "/api/auth/totp/setup",
-            headers={"Authorization": f"Bearer {data['accessToken']}"},
-        )
+        me = client.get("/api/me", headers={"Authorization": f"Bearer {data['accessToken']}"})
 
-    assert setup.status_code == 200, setup.text
-    assert setup.json()["email"] == "jwt-signer@example.com"
+    assert me.status_code == 200, me.text
+    assert me.json()["role"] == "CA_OFFICER"
 
 
-def test_demo_login_rejects_invalid_role():
+def test_client_cannot_choose_role_during_otp_verify():
     with TestClient(app) as client:
+        with SessionLocal() as db:
+            _token, otp = create_email_otp(db, "signer@example.com", "LOGIN_MFA")
+            db.commit()
+
         response = client.post(
-            "/api/auth/demo-login",
-            json={"email": "bad-role@example.com", "role": "NOT_A_ROLE"},
+            "/api/auth/login/verify-otp",
+            json={"email": "signer@example.com", "otp": otp, "role": "ADMIN"},
         )
 
-    assert response.status_code == 400
+    assert response.status_code == 422
 
 
 def test_protected_endpoint_rejects_fake_bearer_token():
@@ -256,6 +296,30 @@ def test_ca_officer_can_issue_cert():
     assert response.json()["certificateType"] == "x509-demo"
 
 
+def test_ca_officer_can_issue_and_revoke_cert():
+    private_key_pem, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        issued = _issue_x509_certificate(
+            client,
+            "CA Revoked",
+            "ca-revoked@example.com",
+            private_key_pem,
+            public_key_pem,
+        )
+        assert issued.status_code == 200, issued.text
+        serial = issued.json()["certificate"]["serialNumber"]
+
+        revoked = client.post(
+            "/api/certificates/revoke/v2",
+            headers=CA_HEADERS,
+            json={"serialNumber": serial, "reason": "key_compromise", "revokedBy": "pytest"},
+        )
+
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["serialNumber"] == serial
+    assert revoked.json()["status"] == "revoked"
+
+
 def test_cert_issue_requires_proof_of_possession():
     _, public_key_pem = generate_key_pair()
     other_private_key_pem, _ = generate_key_pair()
@@ -277,21 +341,28 @@ def test_cert_issue_requires_proof_of_possession():
     assert response.json()["detail"] == "Proof-of-possession signature is invalid"
 
 
-def test_cert_subject_bound_to_authenticated_signer_identity():
+def test_signer_cannot_create_x509_proof_challenge():
+    _, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/certificates/x509/proof-challenge",
+            headers=SIGNER_HEADERS,
+            json={"name": "Signer Issued", "email": "signer@example.com", "publicKeyPem": public_key_pem},
+        )
+
+    assert response.status_code == 403
+
+
+def test_signer_cannot_issue_own_certificate_with_proof_of_possession():
     private_key_pem, public_key_pem = generate_key_pair()
     with TestClient(app) as client:
-        challenge = _x509_proof_challenge(
-            client,
-            "Wrong Subject",
-            "other-person@example.com",
-            public_key_pem,
-        )
+        challenge = _x509_proof_challenge(client, "Signer Self", "signer@example.com", public_key_pem)
         response = client.post(
             "/api/certificates/x509/issue",
             headers=SIGNER_HEADERS,
             json=_x509_issue_body(
-                "Wrong Subject",
-                "other-person@example.com",
+                "Signer Self",
+                "signer@example.com",
                 private_key_pem,
                 public_key_pem,
                 challenge,
@@ -299,23 +370,6 @@ def test_cert_subject_bound_to_authenticated_signer_identity():
         )
 
     assert response.status_code == 403
-    assert response.json()["detail"] == "Certificate subject email must match authenticated signer"
-
-
-def test_signer_can_issue_own_certificate_with_proof_of_possession():
-    private_key_pem, public_key_pem = generate_key_pair()
-    with TestClient(app) as client:
-        response = _issue_x509_certificate(
-            client,
-            "Signer Self",
-            "signer@example.com",
-            private_key_pem,
-            public_key_pem,
-            headers=SIGNER_HEADERS,
-        )
-
-    assert response.status_code == 200, response.text
-    assert response.json()["certificate"]["email"] == "signer@example.com"
 
 
 def test_user_can_prepare_signing_request_for_certificate_they_own():
@@ -688,6 +742,7 @@ def test_v2_verify_rejects_modified_document_hash():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": tampered_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -706,6 +761,7 @@ def test_v2_verify_rejects_tampered_signature():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": tampered_package},
         )
 
@@ -729,6 +785,7 @@ def test_signature_valid_when_cert_revoked_after_signing_time():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -754,6 +811,7 @@ def test_no_timestamp_cannot_claim_ltv_ready_after_revocation():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -784,6 +842,7 @@ def test_signature_invalid_when_cert_revoked_before_signing_time():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -805,6 +864,7 @@ def test_v2_verify_rejects_expired_certificate():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -825,6 +885,7 @@ def test_v2_verify_rejects_bad_key_usage():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -835,12 +896,113 @@ def test_v2_verify_rejects_bad_key_usage():
     assert data["report"]["keyUsageValid"] == "failed"
 
 
+def test_v2_verify_rejects_not_yet_valid_certificate():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_unsigned_verify_package(
+            "Future Signer",
+            "future@example.com",
+            not_yet_valid=True,
+        )
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "certificate not yet valid"
+    assert data["report"]["certificateValidityPeriod"] == "failed"
+
+
+def test_v2_verify_rejects_signer_certificate_ca_true():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_unsigned_verify_package(
+            "Bad CA Signer",
+            "bad-ca@example.com",
+            signer_ca=True,
+        )
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "certificate not trusted"
+
+
+def test_v2_verify_rejects_signer_missing_digital_signature_usage():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_unsigned_verify_package(
+            "No Digital Signature",
+            "no-digital-signature@example.com",
+            digital_signature_usage=False,
+        )
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "certificate not trusted"
+    assert data["report"]["keyUsageValid"] == "failed"
+
+
+def test_v2_verify_rejects_intermediate_missing_key_cert_sign():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_package_with_bad_intermediate_key_usage()
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "certificate not trusted"
+    assert data["report"]["keyUsageValid"] == "failed"
+
+
+def test_v2_verify_rejects_unknown_root_chain():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_unsigned_verify_package(
+            "Unknown Root",
+            "unknown-root@example.com",
+        )
+        signed_package["rootCertificatePem"] = _untrusted_root_certificate_pem()
+        signed_package["signerCertificate"]["rootCertificatePem"] = signed_package["rootCertificatePem"]
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "certificate not trusted"
+
+
 def test_x509_chain_success_and_failure_when_chain_is_tampered():
     with TestClient(app) as client:
         signed_package, document_hash = _create_submitted_package(client)
 
         ok_response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
         tampered_package = copy.deepcopy(signed_package)
@@ -848,6 +1010,7 @@ def test_x509_chain_success_and_failure_when_chain_is_tampered():
         tampered_package["signerCertificate"]["intermediateCertificatePem"] = tampered_package["rootCertificatePem"]
         fail_response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": tampered_package},
         )
 
@@ -886,6 +1049,7 @@ def test_timestamp_token_is_verified():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -903,6 +1067,7 @@ def test_timestamp_token_nonce_mismatch_fails():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
         )
 
@@ -913,6 +1078,105 @@ def test_timestamp_token_nonce_mismatch_fails():
     assert data["report"]["timestampStatus"] == "failed"
 
 
+def test_v2_verify_rejects_payload_field_tampering():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        signed_package["signingPayload"]["signingIntent"] = "tampered intent"
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] in {"invalid signature", "signing payload policy failed"}
+
+
+def test_v2_verify_rejects_extra_payload_field():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        signed_package["signingPayload"]["unexpectedField"] = "not signed"
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Malformed signedPackage"
+
+
+def test_v2_verify_rejects_certificate_fingerprint_mismatch():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        signed_package["signingPayload"]["certificateFingerprint"] = "0" * 64
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "certificate fingerprint mismatch"
+
+
+def test_v2_verify_rejects_sha1_and_md5():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        for algorithm in ("SHA-1", "MD5"):
+            package = copy.deepcopy(signed_package)
+            package["signingPayload"]["hashAlgorithm"] = algorithm
+            response = client.post(
+                "/api/verify/v2",
+                headers=VERIFIER_HEADERS,
+                json={"documentHash": document_hash, "hashAlgorithm": algorithm, "signedPackage": package},
+            )
+            assert response.status_code == 200
+            assert response.json()["valid"] is False
+
+
+def test_v2_verify_rejects_algorithm_downgrade():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        signed_package["signatureAlgorithm"] = "RSA-PKCS1v15"
+        signed_package["signingPayload"]["signatureAlgorithm"] = "RSA-PKCS1v15"
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["report"]["algorithmPolicyValid"] == "failed"
+
+
+def test_v2_verify_rejects_rsa_pss_params_mismatch():
+    with TestClient(app) as client:
+        signed_package, document_hash = _create_submitted_package(client)
+        signed_package["signingPayload"]["rsaPssParams"]["saltLength"] = 1
+
+        response = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["reason"] == "signing payload policy failed"
+
+
 def test_submit_signed_package_without_otp_or_totp_confirmation_is_rejected():
     with TestClient(app) as client:
         package, _document_hash, _certificate = _create_prepared_signed_package(client)
@@ -921,6 +1185,18 @@ def test_submit_signed_package_without_otp_or_totp_confirmation_is_rejected():
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Signing request has not been OTP/TOTP confirmed"
+
+
+def test_replay_submit_is_rejected_after_first_success():
+    with TestClient(app) as client:
+        package, _document_hash, _certificate = _create_prepared_signed_package(client)
+        _confirm_request_with_email_otp(client, package["signingPayload"]["requestId"])
+        first = client.post("/api/sign/v2/submit", headers=SIGNER_HEADERS, json=package)
+        second = client.post("/api/sign/v2/submit", headers=SIGNER_HEADERS, json=package)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 400
+    assert second.json()["detail"] in {"Nonce already used", "Signing request already signed"}
 
 
 def test_signing_otp_resend_cooldown_is_enforced():
@@ -1043,6 +1319,7 @@ def test_crypto_valid_package_for_unconfirmed_request_is_not_server_accepted():
 
         response = client.post(
             "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
             json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": package},
         )
 
@@ -1052,6 +1329,56 @@ def test_crypto_valid_package_for_unconfirmed_request_is_not_server_accepted():
     assert data["report"]["serverAccepted"] is False
     assert data["report"]["signingRequestConfirmed"] is False
     assert data["report"]["confirmationMethod"] is None
+
+
+def test_signer_lists_only_own_certificates_and_signing_requests():
+    private_key_pem, public_key_pem = generate_key_pair()
+    other_private_key_pem, other_public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        own = _issue_x509_certificate(client, "Signer Owner", "signer@example.com", private_key_pem, public_key_pem)
+        other = _issue_x509_certificate(client, "Other Signer", "other-signer@example.com", other_private_key_pem, other_public_key_pem)
+        assert own.status_code == 200
+        assert other.status_code == 200
+        own_certificate = own.json()["certificate"]
+        other_certificate = other.json()["certificate"]
+
+        prepare_own = client.post(
+            "/api/sign/v2/prepare",
+            headers=SIGNER_HEADERS,
+            json={
+                "documentName": "own.txt",
+                "documentHash": hash_bytes(DOCUMENT, "SHA-256"),
+                "hashAlgorithm": "SHA-256",
+                "certificateSerialNumber": own_certificate["serialNumber"],
+                "signingPurpose": "approve_document",
+            },
+        )
+        prepare_other = client.post(
+            "/api/sign/v2/prepare",
+            headers=OTHER_SIGNER_HEADERS,
+            json={
+                "documentName": "other.txt",
+                "documentHash": hash_bytes(b"other", "SHA-256"),
+                "hashAlgorithm": "SHA-256",
+                "certificateSerialNumber": other_certificate["serialNumber"],
+                "signingPurpose": "approve_document",
+            },
+        )
+        assert prepare_own.status_code == 200
+        assert prepare_other.status_code == 200
+
+        certificates = client.get("/api/my/certificates", headers=SIGNER_HEADERS)
+        requests = client.get("/api/my/signing-requests", headers=SIGNER_HEADERS)
+        other_request = client.get(
+            f"/api/my/signing-requests/{prepare_other.json()['requestId']}",
+            headers=SIGNER_HEADERS,
+        )
+
+    assert certificates.status_code == 200
+    assert all(item["email"] == "signer@example.com" for item in certificates.json()["certificates"])
+    assert requests.status_code == 200
+    assert all(item["signerEmail"] == "signer@example.com" for item in requests.json()["signingRequests"])
+    assert other_request.status_code == 403
 
 
 def test_audit_chain_valid():
@@ -1064,6 +1391,67 @@ def test_audit_chain_valid():
     assert data["valid"] is True
     assert data["totalEvents"] > 0
     assert data["brokenAt"] is None
+
+
+def test_auditor_can_list_audit_logs():
+    with TestClient(app) as client:
+        _create_submitted_package(client)
+        response = client.get("/api/audit/logs", headers=AUDITOR_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["events"]
+
+
+def test_signer_cannot_view_audit_chain():
+    with TestClient(app) as client:
+        _create_submitted_package(client)
+        response = client.get("/api/audit/verify-chain", headers=SIGNER_HEADERS)
+
+    assert response.status_code == 403
+
+
+def test_audit_events_created_for_core_lifecycle(monkeypatch):
+    monkeypatch.setattr("app.auth_utils.secrets.randbelow", lambda upper_bound: 123456)
+    with TestClient(app) as client:
+        package, document_hash, _certificate = _create_prepared_signed_package(client)
+        request_id = package["signingPayload"]["requestId"]
+        otp_request = client.post(f"/api/v2/signing-requests/{request_id}/otp/request", headers=SIGNER_HEADERS)
+        assert otp_request.status_code == 200, otp_request.text
+        confirm = client.post(
+            f"/api/v2/signing-requests/{request_id}/confirm",
+            headers=SIGNER_HEADERS,
+            json={"method": "EMAIL_OTP", "code": "123456"},
+        )
+        assert confirm.status_code == 200, confirm.text
+        submit = client.post("/api/sign/v2/submit", headers=SIGNER_HEADERS, json=package)
+        assert submit.status_code == 200, submit.text
+        signed_package = submit.json()["signedPackage"]
+        serial = signed_package["signerCertificate"]["serialNumber"]
+        verify = client.post(
+            "/api/verify/v2",
+            headers=VERIFIER_HEADERS,
+            json={"documentHash": document_hash, "hashAlgorithm": "SHA-256", "signedPackage": signed_package},
+        )
+        revoke = client.post(
+            "/api/certificates/revoke/v2",
+            headers=CA_HEADERS,
+            json={"serialNumber": serial, "reason": "key_compromise", "revokedBy": "pytest"},
+        )
+        assert verify.status_code == 200
+        assert revoke.status_code == 200
+
+    with SessionLocal() as db:
+        event_types = {event.event_type for event in db.query(AuditLog).all()}
+
+    assert {
+        "certificate_issued",
+        "signing_request_created",
+        "signing_confirmation_otp_requested",
+        "signing_request_confirmed",
+        "signature_submitted",
+        "signature_verified",
+        "certificate_revoked",
+    }.issubset(event_types)
 
 
 def test_audit_chain_detects_tampered_log():
@@ -1251,7 +1639,10 @@ def _create_unsigned_verify_package(
     email: str,
     *,
     validity_days: int = 365,
+    digital_signature_usage: bool = True,
     content_commitment_usage: bool = True,
+    signer_ca: bool = False,
+    not_yet_valid: bool = False,
 ):
     private_key_pem, public_key_pem = generate_key_pair()
     issued = issue_user_x509_certificate(
@@ -1259,12 +1650,18 @@ def _create_unsigned_verify_package(
         email,
         public_key_pem,
         validity_days=validity_days,
+        digital_signature_usage=digital_signature_usage,
         content_commitment_usage=content_commitment_usage,
+        signer_ca=signer_ca,
+        not_yet_valid=not_yet_valid,
     )
     certificate = issued["certificate"]
     _insert_certificate_record(certificate)
     document_hash = hash_bytes(DOCUMENT, "SHA-256")
+    created_at = "2026-06-16T00:00:00+00:00"
+    expires_at = "2026-06-16T00:15:00+00:00"
     payload = {
+        "schemaVersion": "2.0",
         "documentName": "document.txt",
         "documentHash": document_hash,
         "hashAlgorithm": "SHA-256",
@@ -1275,10 +1672,13 @@ def _create_unsigned_verify_package(
         "certificateFingerprint": certificate["certificateFingerprint"],
         "certificateType": "x509-demo",
         "signingPurpose": "approve_document",
-        "createdAt": "2026-06-16T00:00:00+00:00",
+        "signingIntent": "I approve and sign this document with SecureDoc.",
+        "createdAt": created_at,
+        "expiresAt": expires_at,
         "requestId": "verify-only-request",
         "nonce": "verify-only-nonce",
         "payloadVersion": "1.0",
+        "rsaPssParams": rsa_pss_params("SHA-256"),
     }
     return {
         "packageVersion": "2.0",
@@ -1293,6 +1693,184 @@ def _create_unsigned_verify_package(
         "signerCertificate": certificate,
         "signedAtClient": "2026-06-16T00:00:00+00:00",
     }, document_hash
+
+
+def _create_package_with_bad_intermediate_key_usage():
+    ensure_demo_x509_ca()
+    root_key = serialization.load_pem_private_key(X509_ROOT_KEY_PATH.read_bytes(), password=None)
+    root_cert = x509.load_pem_x509_certificate(X509_ROOT_CERT_PATH.read_bytes())
+    intermediate_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    user_private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    now = datetime.now(timezone.utc)
+    intermediate_subject = _x509_name(X509_INTERMEDIATE_COMMON_NAME)
+    intermediate_cert = (
+        x509.CertificateBuilder()
+        .subject_name(intermediate_subject)
+        .issuer_name(root_cert.subject)
+        .public_key(intermediate_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=True,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(intermediate_key.public_key()), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key()), critical=False)
+        .sign(private_key=root_key, algorithm=hashes.SHA256())
+    )
+    user_subject = _x509_name("Bad Intermediate User", "bad-intermediate@example.com")
+    user_cert = (
+        x509.CertificateBuilder()
+        .subject_name(user_subject)
+        .issuer_name(intermediate_cert.subject)
+        .public_key(user_private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=True,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(user_private_key.public_key()), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(intermediate_key.public_key()), critical=False)
+        .sign(private_key=intermediate_key, algorithm=hashes.SHA256())
+    )
+    certificate = _certificate_from_x509(
+        user_cert,
+        intermediate_cert.public_bytes(serialization.Encoding.PEM).decode("utf-8"),
+        root_cert.public_bytes(serialization.Encoding.PEM).decode("utf-8"),
+    )
+    private_key_pem = user_private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("utf-8")
+    _insert_certificate_record(certificate)
+    document_hash = hash_bytes(DOCUMENT, "SHA-256")
+    return _signed_package_for_certificate(certificate, private_key_pem, document_hash), document_hash
+
+
+def _certificate_from_x509(user_cert: x509.Certificate, intermediate_pem: str, root_pem: str) -> dict:
+    user_pem = user_cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+    details = parse_user_x509_details(user_pem)
+    return {
+        "serialNumber": details.serial_number,
+        "ownerName": details.owner_name,
+        "email": details.email,
+        "publicKeyPem": details.public_key_pem,
+        "issuer": details.issuer,
+        "issuedAt": details.issued_at.isoformat(),
+        "expiresAt": details.expires_at.isoformat(),
+        "status": "valid",
+        "certificateType": X509_CERTIFICATE_TYPE,
+        "certificateFingerprint": details.fingerprint_sha256,
+        "userCertificatePem": user_pem,
+        "intermediateCertificatePem": intermediate_pem,
+        "rootCertificatePem": root_pem,
+    }
+
+
+def _signed_package_for_certificate(certificate: dict, private_key_pem: str, document_hash: str):
+    payload = {
+        "schemaVersion": "2.0",
+        "documentName": "document.txt",
+        "documentHash": document_hash,
+        "hashAlgorithm": "SHA-256",
+        "signatureAlgorithm": "RSA-PSS",
+        "signerName": certificate["ownerName"],
+        "signerEmail": certificate["email"],
+        "certificateSerialNumber": certificate["serialNumber"],
+        "certificateFingerprint": certificate["certificateFingerprint"],
+        "certificateType": "x509-demo",
+        "signingPurpose": "approve_document",
+        "signingIntent": "I approve and sign this document with SecureDoc.",
+        "createdAt": "2026-06-16T00:00:00+00:00",
+        "expiresAt": "2026-06-16T00:15:00+00:00",
+        "requestId": "verify-only-request",
+        "nonce": "verify-only-nonce",
+        "payloadVersion": "1.0",
+        "rsaPssParams": rsa_pss_params("SHA-256"),
+    }
+    return {
+        "packageVersion": "2.0",
+        "signingPayload": payload,
+        "payloadCanonicalization": "JSON-canonical-sorted-keys",
+        "signatureAlgorithm": "RSA-PSS",
+        "signatureBase64": _sign_payload(payload, private_key_pem),
+        "userCertificatePem": certificate["userCertificatePem"],
+        "intermediateCertificatePem": certificate["intermediateCertificatePem"],
+        "rootCertificatePem": certificate["rootCertificatePem"],
+        "trustedRootId": "securedoc-demo-root",
+        "signerCertificate": certificate,
+        "signedAtClient": "2026-06-16T00:00:00+00:00",
+    }
+
+
+def _x509_name(common_name: str, email: str | None = None) -> x509.Name:
+    attributes = [
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "VN"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SecureDoc Demo"),
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+    ]
+    if email:
+        attributes.append(x509.NameAttribute(NameOID.EMAIL_ADDRESS, email))
+    return x509.Name(attributes)
+
+
+def _untrusted_root_certificate_pem() -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    now = datetime.now(timezone.utc)
+    subject = _x509_name("Untrusted Root")
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=1), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(private_key=key, algorithm=hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
 
 
 def _insert_certificate_record(certificate: dict) -> None:

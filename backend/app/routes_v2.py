@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from .auth_utils import create_signing_email_otp, verify_enabled_totp_for_email, verify_signing_email_otp
+from .audit_service import audit_log_to_response, log_audit
 from .config import JWT_SECRET, RFC3161_TSA_URL, ensure_document_storage_dir
 from .crypto_utils import (
     ALGORITHM_POLICY,
@@ -26,6 +27,7 @@ from .crypto_utils import (
     build_audit_event_json,
     canonicalize_signing_payload,
     check_algorithm_policy,
+    check_rsa_pss_params,
     compute_audit_hash,
     compute_certificate_fingerprint,
     get_public_key_size,
@@ -33,6 +35,7 @@ from .crypto_utils import (
     isoformat,
     normalize_hash_algorithm,
     parse_iso_datetime,
+    rsa_pss_params,
     utc_now,
     verify_canonical_signature,
     verify_certificate_signature,
@@ -85,7 +88,8 @@ from .x509_utils import (
 router = APIRouter()
 
 CANONICALIZATION_METHOD = "JSON-canonical-sorted-keys"
-CONFIRMED_SIGNING_REQUEST_STATUSES = {"mfa_confirmed", "completed"}
+CONFIRMED_SIGNING_REQUEST_STATUSES = {"mfa_confirmed", "signed"}
+SIGNING_REQUEST_TTL_MINUTES = 15
 
 
 def get_db():
@@ -170,6 +174,27 @@ def _document_to_response(record: DocumentObject) -> dict[str, Any]:
     }
 
 
+def _signing_request_payload(record: SigningRequest) -> dict[str, Any]:
+    return {
+        "requestId": record.request_id,
+        "documentName": record.document_name,
+        "documentHash": record.document_hash,
+        "hashAlgorithm": record.hash_algorithm,
+        "signerName": record.signer_name,
+        "signerEmail": record.signer_email,
+        "certificateSerialNumber": record.certificate_serial,
+        "signingPurpose": record.signing_purpose,
+        "signingIntent": record.signing_intent,
+        "nonce": record.nonce,
+        "status": record.status,
+        "confirmationMethod": record.confirmation_method,
+        "confirmedAt": _db_iso(record.confirmed_at) if record.confirmed_at else None,
+        "createdAt": _db_iso(record.created_at),
+        "expiresAt": _db_iso(record.expires_at) if record.expires_at else None,
+        "completedAt": _db_iso(record.completed_at) if record.completed_at else None,
+    }
+
+
 def _require_document_access(record: DocumentObject, actor: dict[str, str]) -> None:
     if actor["role"] == ADMIN:
         return
@@ -202,26 +227,7 @@ def _log_audit(
     document_hash: str | None = None,
     certificate_serial: str | None = None,
 ) -> None:
-    now = utc_now()
-    event_id = secrets.token_hex(16)
-    last = db.query(AuditLog).order_by(AuditLog.id.desc()).first()
-    previous_hash = last.current_log_hash if last else None
-    event_json = build_audit_event_json(event_id, event_type, actor, result, details, isoformat(now))
-    db.add(
-        AuditLog(
-            event_id=event_id,
-            event_type=event_type,
-            actor=actor,
-            document_hash=document_hash,
-            certificate_serial=certificate_serial,
-            result=result,
-            details=details,
-            created_at=_db_time(now),
-            previous_log_hash=previous_hash,
-            current_log_hash=compute_audit_hash(event_json, previous_hash),
-        )
-    )
-    db.flush()
+    log_audit(db, event_type, actor, result, details, document_hash, certificate_serial)
 
 
 def _step(steps: list[dict[str, str]], name: str, status: str, message: str) -> None:
@@ -389,6 +395,25 @@ def _hash_hex_valid(document_hash: str, hash_algorithm: str) -> bool:
     if len(document_hash) != expected_len:
         return False
     return all(ch in "0123456789abcdefABCDEF" for ch in document_hash)
+
+
+def _validate_payload_policy(payload: SigningPayloadV2, hash_algorithm: str, *, enforce_expiry: bool) -> tuple[bool, str]:
+    if payload.schemaVersion != "2.0":
+        return False, "Unsupported signing payload schemaVersion"
+    if payload.payloadVersion != "1.0":
+        return False, "Unsupported signing payload payloadVersion"
+    if not payload.signingIntent.strip():
+        return False, "signingIntent is required"
+    try:
+        expires_at = parse_iso_datetime(payload.expiresAt)
+    except (ValueError, TypeError):
+        return False, "Malformed signing payload expiresAt"
+    if enforce_expiry and expires_at <= utc_now():
+        return False, "Signing payload expired"
+    ok, message = check_rsa_pss_params(payload.rsaPssParams, hash_algorithm)
+    if not ok:
+        return False, message
+    return True, "Signing payload policy satisfied"
 
 
 def _base_report(steps: list[dict[str, str]], warnings: list[str], decision: str = "invalid") -> dict[str, Any]:
@@ -583,6 +608,10 @@ def _require_signing_request_owner(request: SigningRequest, actor: dict[str, str
 
 
 def _request_context_matches_payload(request: SigningRequest, payload: SigningPayloadV2, hash_algorithm: str) -> bool:
+    try:
+        payload_expires_at = _db_time(parse_iso_datetime(payload.expiresAt))
+    except (ValueError, TypeError):
+        return False
     expected = {
         "document_name": payload.documentName,
         "document_hash": payload.documentHash.lower(),
@@ -591,9 +620,12 @@ def _request_context_matches_payload(request: SigningRequest, payload: SigningPa
         "signer_email": payload.signerEmail,
         "certificate_serial": payload.certificateSerialNumber,
         "signing_purpose": payload.signingPurpose,
+        "signing_intent": payload.signingIntent,
         "nonce": payload.nonce,
     }
-    return all(getattr(request, attr) == expected_value for attr, expected_value in expected.items())
+    if not all(getattr(request, attr) == expected_value for attr, expected_value in expected.items()):
+        return False
+    return request.expires_at == payload_expires_at
 
 
 def _confirmation_state(
@@ -612,7 +644,7 @@ def _confirmation_state(
 @router.post("/api/certificates/x509/proof-challenge", response_model=X509ProofChallengeResponse)
 def create_x509_proof_challenge(
     body: X509ProofChallengeRequest,
-    actor: dict[str, str] = Depends(require_roles(CA_OFFICER, SIGNER)),
+    actor: dict[str, str] = Depends(require_roles(CA_OFFICER)),
 ):
     subject_name, subject_email = _subject_for_actor(body, actor)
     try:
@@ -637,7 +669,7 @@ def create_x509_proof_challenge(
 def issue_x509_certificate(
     body: X509CertificateIssueRequest,
     db: Session = Depends(get_db),
-    actor: dict[str, str] = Depends(require_roles(CA_OFFICER, SIGNER)),
+    actor: dict[str, str] = Depends(require_roles(CA_OFFICER)),
 ):
     subject_name, subject_email = _subject_for_actor(body, actor)
     _verify_pop_challenge(body.proofChallenge, subject_name, subject_email, body.publicKeyPem)
@@ -668,9 +700,9 @@ def issue_x509_certificate(
     _log_audit(
         db,
         "certificate_issued",
-        certificate["email"],
+        _actor_email(actor),
         "success",
-        details="x509-demo certificate issued after proof-of-possession verification",
+        details=f"subject={certificate['email']}; x509-demo certificate issued after proof-of-possession verification",
         certificate_serial=certificate["serialNumber"],
     )
     db.commit()
@@ -830,6 +862,9 @@ def prepare_signing_request(
         raise HTTPException(status_code=400, detail="documentHash does not match hashAlgorithm")
     if body.signingPurpose not in ALLOWED_SIGNING_PURPOSES:
         raise HTTPException(status_code=400, detail=f"Invalid signing purpose: {body.signingPurpose}")
+    signing_intent = body.signingIntent.strip()
+    if not signing_intent:
+        raise HTTPException(status_code=400, detail="signingIntent is required")
 
     record = db.get(CertificateRecord, body.certificateSerialNumber)
     if not record:
@@ -838,6 +873,8 @@ def prepare_signing_request(
         raise HTTPException(status_code=403, detail="Authenticated signer does not own this certificate")
     if record.status != "valid":
         raise HTTPException(status_code=400, detail="Certificate is revoked")
+    if _as_utc(record.issued_at) > utc_now():
+        raise HTTPException(status_code=400, detail="Certificate is not yet valid")
     if _as_utc(record.expires_at) < utc_now():
         raise HTTPException(status_code=400, detail="Certificate has expired")
 
@@ -855,9 +892,11 @@ def prepare_signing_request(
     warnings.append("SecureDoc Demo CA is local demo trust only.")
 
     now = utc_now()
+    expires_at = now + timedelta(minutes=SIGNING_REQUEST_TTL_MINUTES)
     request_id = secrets.token_hex(16)
     nonce = secrets.token_hex(16)
     payload = SigningPayloadV2(
+        schemaVersion="2.0",
         documentName=body.documentName,
         documentHash=body.documentHash.lower(),
         hashAlgorithm=hash_algorithm,
@@ -868,10 +907,13 @@ def prepare_signing_request(
         certificateFingerprint=fingerprint,
         certificateType=record.certificate_type or "legacy-demo",
         signingPurpose=body.signingPurpose,
+        signingIntent=signing_intent,
         createdAt=isoformat(now),
+        expiresAt=isoformat(expires_at),
         nonce=nonce,
         requestId=request_id,
         payloadVersion="1.0",
+        rsaPssParams=rsa_pss_params(hash_algorithm),
     )
 
     canonical = canonicalize_signing_payload(payload.model_dump())
@@ -885,9 +927,11 @@ def prepare_signing_request(
             signer_email=record.email,
             certificate_serial=record.serial_number,
             signing_purpose=body.signingPurpose,
+            signing_intent=signing_intent,
             nonce=nonce,
             status="pending",
             created_at=_db_time(now),
+            expires_at=_db_time(expires_at),
         )
     )
     _log_audit(
@@ -910,6 +954,37 @@ def prepare_signing_request(
     )
 
 
+@router.get("/api/my/certificates")
+def list_my_certificates(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    records = db.query(CertificateRecord).filter_by(email=_actor_email(actor)).order_by(CertificateRecord.issued_at.desc()).all()
+    return {"certificates": [_record_certificate_payload(record) for record in records]}
+
+
+@router.get("/api/my/signing-requests")
+def list_my_signing_requests(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    requests = db.query(SigningRequest).filter_by(signer_email=_actor_email(actor)).order_by(SigningRequest.created_at.desc()).all()
+    return {"signingRequests": [_signing_request_payload(request) for request in requests]}
+
+
+@router.get("/api/my/signing-requests/{request_id}")
+def get_my_signing_request(
+    request_id: str,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER)),
+):
+    request = db.get(SigningRequest, request_id)
+    if not request:
+        raise HTTPException(status_code=404, detail="Signing request not found")
+    _require_signing_request_owner(request, actor)
+    return _signing_request_payload(request)
+
+
 @router.post("/api/v2/signing-requests/{request_id}/otp/request", response_model=SigningOtpRequestResponse)
 def request_signing_email_otp(
     request_id: str,
@@ -920,6 +995,10 @@ def request_signing_email_otp(
     if not request:
         raise HTTPException(status_code=404, detail="Signing request not found")
     _require_signing_request_owner(request, actor)
+    if request.expires_at and _as_utc(request.expires_at) <= utc_now():
+        request.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Signing request expired")
     if request.status != "pending":
         raise HTTPException(status_code=400, detail=f"Signing request is {request.status}")
 
@@ -969,6 +1048,10 @@ def confirm_signing_request(
     if not request:
         raise HTTPException(status_code=404, detail="Signing request not found")
     _require_signing_request_owner(request, actor)
+    if request.expires_at and _as_utc(request.expires_at) <= utc_now():
+        request.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Signing request expired")
     if request.status != "pending":
         raise HTTPException(status_code=400, detail=f"Signing request is {request.status}")
 
@@ -1056,12 +1139,24 @@ def submit_signature(
         _reject_submit(db, message, payload, cert)
     _step(steps, "Algorithm policy", "passed", message)
 
+    ok, message = _validate_payload_policy(payload, hash_algorithm, enforce_expiry=True)
+    if not ok:
+        request = db.get(SigningRequest, payload.requestId)
+        if request and message == "Signing payload expired":
+            request.status = "expired"
+        _reject_submit(db, message, payload, cert)
+    _step(steps, "Signing payload policy", "passed", message)
+
     if not _hash_hex_valid(payload.documentHash, hash_algorithm):
         _reject_submit(db, "documentHash does not match hashAlgorithm", payload, cert)
 
     request = db.get(SigningRequest, payload.requestId)
     if not request:
         _reject_submit(db, "Unknown signing request ID", payload, cert)
+    _require_signing_request_owner(request, actor)
+    if request.expires_at and _as_utc(request.expires_at) <= utc_now():
+        request.status = "expired"
+        _reject_submit(db, "Signing request expired", payload, cert)
     if request.status == "pending":
         _reject_submit(db, "Signing request has not been OTP/TOTP confirmed", payload, cert)
     if request.status != "mfa_confirmed":
@@ -1110,9 +1205,12 @@ def submit_signature(
     _step(steps, "Revocation status", "passed", "Server DB marks certificate valid.")
 
     try:
+        issued_at = parse_iso_datetime(cert.issuedAt)
         expires_at = parse_iso_datetime(cert.expiresAt)
     except ValueError:
-        _reject_submit(db, "Malformed certificate expiration", payload, cert)
+        _reject_submit(db, "Malformed certificate validity", payload, cert)
+    if issued_at > utc_now() or _as_utc(record.issued_at) > utc_now():
+        _reject_submit(db, "Certificate is not yet valid", payload, cert)
     if expires_at < utc_now() or _as_utc(record.expires_at) < utc_now():
         _reject_submit(db, "Certificate expired", payload, cert)
     _step(steps, "Validity period", "passed", "Certificate is within its validity period.")
@@ -1129,7 +1227,7 @@ def submit_signature(
 
     now = utc_now()
     db.add(UsedNonce(nonce=payload.nonce, request_id=payload.requestId, used_at=_db_time(now)))
-    request.status = "completed"
+    request.status = "signed"
     request.completed_at = _db_time(now)
 
     certificate_type = _certificate_type(cert, record)
@@ -1238,7 +1336,11 @@ def submit_signature(
 
 
 @router.post("/api/verify/v2")
-def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
+def verify_v2(
+    body: dict[str, Any],
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(VERIFIER, AUDITOR, CA_OFFICER, SIGNER)),
+):
     steps: list[dict[str, str]] = []
     warnings: list[str] = []
     document_hash = str(body.get("documentHash") or "").lower()
@@ -1258,7 +1360,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         _log_audit(
             db,
             "signature_verified",
-            payload.signerEmail if payload else None,
+            _actor_email(actor),
             "failed",
             details=reason,
             document_hash=payload.documentHash if payload else document_hash,
@@ -1268,14 +1370,14 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         return _verification_response(False, reason, report, document_hash, payload, cert, signed_at)
 
     if not document_hash or not package_data:
-        _log_audit(db, "signature_verified", None, "failed", details="documentHash and signedPackage required")
+        _log_audit(db, "signature_verified", _actor_email(actor), "failed", details="documentHash and signedPackage required")
         db.commit()
         raise HTTPException(status_code=400, detail="documentHash and signedPackage required")
 
     try:
         package = SignedPackageV2.model_validate(package_data)
     except Exception as exc:
-        _log_audit(db, "signature_verified", None, "failed", details="Malformed signedPackage")
+        _log_audit(db, "signature_verified", _actor_email(actor), "failed", details="Malformed signedPackage")
         db.commit()
         raise HTTPException(status_code=400, detail="Malformed signedPackage") from exc
 
@@ -1286,7 +1388,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         _step(steps, "Certificate parsing", "failed", str(exc))
         report = _base_report(steps, warnings, "invalid")
         report.update({"certificateParsed": "failed"})
-        _log_audit(db, "signature_verified", payload.signerEmail, "failed", details=str(exc), document_hash=payload.documentHash)
+        _log_audit(db, "signature_verified", _actor_email(actor), "failed", details=str(exc), document_hash=payload.documentHash)
         db.commit()
         return _verification_response(False, "malformed certificate", report, document_hash, payload, None, package.signedAtClient)
     signed_at = package.signedAtClient
@@ -1317,12 +1419,23 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
     if not ok:
         _step(steps, "Algorithm policy", "failed", message)
         return fail("algorithm policy failed", {"algorithmPolicyValid": "failed"}, payload, cert, signed_at)
+    ok, payload_policy_message = _validate_payload_policy(payload, payload_hash_algorithm, enforce_expiry=False)
+    if not ok:
+        _step(steps, "Signing payload policy", "failed", payload_policy_message)
+        return fail(
+            "signing payload policy failed",
+            {"signingPayloadValid": "failed", "algorithmPolicyValid": "passed"},
+            payload,
+            cert,
+            signed_at,
+        )
     if not _hash_hex_valid(document_hash, payload_hash_algorithm) or not _hash_hex_valid(
         payload.documentHash, payload_hash_algorithm
     ):
         _step(steps, "Algorithm policy", "failed", "documentHash length does not match hashAlgorithm.")
         return fail("documentHash does not match hashAlgorithm", {"algorithmPolicyValid": "failed"}, payload, cert, signed_at)
     _step(steps, "Algorithm policy", "passed", message)
+    _step(steps, "Signing payload policy", "passed", payload_policy_message)
 
     if document_hash != payload.documentHash.lower():
         _step(steps, "Document integrity", "failed", "Provided document hash differs from signed payload.")
@@ -1398,8 +1511,16 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
     trust_ok, trust_message = _verify_certificate_trust(cert)
     if not trust_ok:
         _step(steps, "Certificate trust", "failed", trust_message)
+        reason = "certificate not trusted"
+        validity_status = "not_checked"
+        if "expired" in trust_message:
+            reason = "certificate expired"
+            validity_status = "failed"
+        elif "not yet valid" in trust_message:
+            reason = "certificate not yet valid"
+            validity_status = "failed"
         return fail(
-            "certificate not trusted",
+            reason,
             {
                 "documentIntegrity": "passed",
                 "signingPayloadValid": "passed",
@@ -1407,6 +1528,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
                 "certificateTrusted": "failed",
                 "certificateType": certificate_type,
                 "certificateChainValid": "failed",
+                "certificateValidityPeriod": validity_status,
                 "keyUsageValid": "failed" if "KeyUsage" in trust_message else "not_available",
                 "algorithmPolicyValid": "passed",
             },
@@ -1521,11 +1643,31 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
         _step(steps, "Revocation status", "passed", "Server DB marks certificate valid.")
 
     try:
+        issued_at = parse_iso_datetime(cert.issuedAt)
         expires_at = parse_iso_datetime(cert.expiresAt)
     except ValueError:
-        _step(steps, "Validity period", "failed", "Certificate expiration is malformed.")
+        _step(steps, "Validity period", "failed", "Certificate validity period is malformed.")
         return fail(
             "malformed certificate validity",
+            {
+                "documentIntegrity": "passed",
+                "signingPayloadValid": "passed",
+                "certificateParsed": "passed",
+                "certificateTrusted": "passed",
+                "certificateType": certificate_type,
+                "certificateRevocationStatus": revocation_status,
+                "revocationSource": "server-db",
+                "certificateValidityPeriod": "failed",
+                "algorithmPolicyValid": "passed",
+            },
+            payload,
+            cert,
+            signed_at,
+        )
+    if issued_at > utc_now() or _as_utc(record.issued_at) > utc_now():
+        _step(steps, "Validity period", "failed", "Certificate is not yet valid.")
+        return fail(
+            "certificate not yet valid",
             {
                 "documentIntegrity": "passed",
                 "signingPayloadValid": "passed",
@@ -1712,7 +1854,7 @@ def verify_v2(body: dict[str, Any], db: Session = Depends(get_db)):
     _log_audit(
         db,
         "signature_verified",
-        payload.signerEmail,
+        _actor_email(actor),
         "success",
         details=f"requestId={payload.requestId}",
         document_hash=payload.documentHash,
@@ -1738,18 +1880,19 @@ def revoke_v2(
 
     now = utc_now()
     record.status = "revoked"
+    revoked_by = _actor_email(actor)
     db.add(
         CertificateRevocation(
             serial_number=body.serialNumber,
             reason=body.reason,
             revoked_at=_db_time(now),
-            revoked_by=body.revokedBy,
+            revoked_by=body.revokedBy or revoked_by,
         )
     )
     _log_audit(
         db,
         "certificate_revoked",
-        body.revokedBy,
+        revoked_by,
         "success",
         details=f"reason={body.reason}",
         certificate_serial=body.serialNumber,
@@ -1761,6 +1904,15 @@ def revoke_v2(
         "reason": body.reason,
         "revokedAt": isoformat(now),
     }
+
+
+@router.get("/api/certificates")
+def list_certificates(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(CA_OFFICER)),
+):
+    records = db.query(CertificateRecord).order_by(CertificateRecord.issued_at.desc()).all()
+    return {"certificates": [_record_certificate_payload(record) for record in records]}
 
 
 @router.get("/api/certificates/status/{serial_number}")
@@ -1851,6 +2003,14 @@ def verify_audit_chain(
         )
         expected_hash = compute_audit_hash(event_json, previous_hash)
         if event.previous_log_hash != previous_hash or event.current_log_hash != expected_hash:
+            _log_audit(
+                db,
+                "audit_chain_verified",
+                _actor_email(actor),
+                "failed",
+                details=f"brokenAt={event.id}",
+            )
+            db.commit()
             return {
                 "valid": False,
                 "totalEvents": len(events),
@@ -1861,7 +2021,20 @@ def verify_audit_chain(
                 },
             }
         previous_hash = event.current_log_hash
+    _log_audit(db, "audit_chain_verified", _actor_email(actor), "success", details=f"totalEvents={len(events)}")
+    db.commit()
     return {"valid": True, "totalEvents": len(events), "brokenAt": None}
+
+
+@router.get("/api/audit/logs")
+def list_audit_logs(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(AUDITOR)),
+):
+    safe_limit = max(1, min(limit, 500))
+    events = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(safe_limit).all()
+    return {"events": [audit_log_to_response(event) for event in events]}
 
 
 @router.get("/api/algorithm-policy")

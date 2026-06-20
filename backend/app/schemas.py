@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 # ── Legacy schemas (backward-compatible) ──────────────────────────────────
@@ -111,6 +111,9 @@ class X509CertificateIssueResponse(BaseModel):
 # ── V2 schemas ────────────────────────────────────────────────────────────
 
 class SigningPayloadV2(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schemaVersion: str = "2.0"
     documentName: str
     documentHash: str
     hashAlgorithm: str
@@ -121,18 +124,24 @@ class SigningPayloadV2(BaseModel):
     certificateFingerprint: str
     certificateType: str = "x509-demo"
     signingPurpose: str = "approve_document"
+    signingIntent: str = "I approve and sign this document with SecureDoc."
     createdAt: str
+    expiresAt: str
     nonce: str
     requestId: str
     payloadVersion: str = "1.0"
+    rsaPssParams: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SigningRequestCreateV2(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     documentName: str
     documentHash: str
     hashAlgorithm: str = "SHA-256"
     certificateSerialNumber: str
     signingPurpose: str = "approve_document"
+    signingIntent: str = "I approve and sign this document with SecureDoc."
 
 
 class SigningRequestResponseV2(BaseModel):
