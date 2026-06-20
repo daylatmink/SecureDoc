@@ -66,6 +66,24 @@ class SignatureRecord(Base):
     signed_package_json = Column(Text, nullable=False)
 
 
+class DocumentObject(Base):
+    __tablename__ = "documents"
+
+    document_id = Column(String, primary_key=True, index=True)
+    owner_email = Column(String, nullable=False, index=True)
+    original_filename = Column(String, nullable=False)
+    content_hash = Column(String, nullable=False, index=True)
+    hash_algorithm = Column(String, nullable=False, default="SHA-256")
+    mime_type = Column(String, nullable=False)
+    storage_path = Column(Text, nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    previous_document_id = Column(String, nullable=True, index=True)
+    immutable = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
 class CertificateRevocation(Base):
     __tablename__ = "certificate_revocations"
 

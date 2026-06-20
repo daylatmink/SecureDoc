@@ -33,6 +33,7 @@ import {
   prepareSigningRequest,
   requestSigningEmailOtp,
   revokeCertificate,
+  signPdfPades,
   signPayload,
   setupTotp,
   submitSignature,
@@ -268,7 +269,7 @@ function Home({ setActiveTab }: { setActiveTab: (tab: Tab) => void }) {
         <InfoBox title="No server-side private key" text="The v2 signing endpoint receives only a signed package, never a private key." />
         <InfoBox title="Canonical JSON" text="The signature covers the full signingPayload, not only a detached document hash." />
         <InfoBox title="DB revocation" text="Revocation is checked by serialNumber from the server DB, not from package status." />
-        <InfoBox title="Demo boundaries" text="The CA chain is local demo trust only; no public CA, HSM, TSA, or PAdES profile is implemented." />
+        <InfoBox title="Demo boundaries" text="The CA chain is local demo trust only. PAdES PDF export is available, but default key custody is still demo server-side unless replaced with HSM/remote signing." />
       </div>
     </section>
   );
@@ -401,6 +402,7 @@ function DocumentsWorkflow() {
   const [confirmationResult, setConfirmationResult] = useState<SigningConfirmResponse | null>(null);
   const [submitResult, setSubmitResult] = useState<SubmitResponse | null>(null);
   const [verifyResult, setVerifyResult] = useState<VerifyV2Response | null>(null);
+  const [padesProfile, setPadesProfile] = useState("");
   const [revokeResult, setRevokeResult] = useState<{ serialNumber: string; status: string; reason: string; revokedAt: string } | null>(null);
   const [auditResult, setAuditResult] = useState<AuditChainResult | null>(null);
   const [status, setStatus] = useState<DocumentStatus>("draft");
@@ -416,13 +418,14 @@ function DocumentsWorkflow() {
     try {
       await demoLogin(email, "SIGNER");
       const keyPair = await generateBrowserSigningKeyPair();
-      const issued = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem });
+      const issued = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem, privateKeyPem: keyPair.privateKeyPem });
       setPrivateKeyPem(keyPair.privateKeyPem);
       setCertificate(issued.certificate);
       setStatus("draft");
       setPrepareResult(null);
       setSubmitResult(null);
       setVerifyResult(null);
+      setPadesProfile("");
       setRevokeResult(null);
       setSigningConfirmed(false);
       setConfirmationCode("");
@@ -461,6 +464,7 @@ function DocumentsWorkflow() {
       setPrepareResult(prepared);
       setSubmitResult(null);
       setVerifyResult(null);
+      setPadesProfile("");
       setSigningConfirmed(false);
       setConfirmationCode("");
       setOtpRequest(null);
@@ -554,6 +558,24 @@ function DocumentsWorkflow() {
     } catch (err) {
       setStatus("verification_failed");
       setError(errorMessage(err, "Cannot sign or submit signedPackage."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function exportPadesPdf() {
+    if (!file || !certificate) {
+      setError("Choose a PDF document and create a certificate first.");
+      return;
+    }
+    setError("");
+    setLoading(true);
+    try {
+      const result = await signPdfPades(file, certificate.email, purposeLabel);
+      setPadesProfile(result.profile);
+      downloadBlob(`${file.name.replace(/\.pdf$/i, "") || "document"}-pades-signed.pdf`, result.blob);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot create PAdES signed PDF."));
     } finally {
       setLoading(false);
     }
@@ -832,7 +854,12 @@ function DocumentsWorkflow() {
               <Download size={18} />
               Export signedPackage
             </button>
+            <button className="secondary" onClick={exportPadesPdf} disabled={loading || !file || !file.name.toLowerCase().endsWith(".pdf")}>
+              <FileCheck size={18} />
+              Export PAdES PDF
+            </button>
           </div>
+          {padesProfile && <StatusLine ok text={`Downloaded ${padesProfile} signed PDF.`} />}
         </div>
       )}
 
@@ -970,7 +997,7 @@ function GenerateKeys() {
     setLoading(true);
     try {
       const keyPair = await generateBrowserSigningKeyPair();
-      const certificateResponse = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem });
+      const certificateResponse = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem, privateKeyPem: keyPair.privateKeyPem });
       setResult({ ...certificateResponse, ...keyPair });
     } catch (err) {
       setError(errorMessage(err, "Cannot generate browser keys or issue X.509 certificate."));
@@ -1953,6 +1980,10 @@ function errorMessage(error: unknown, fallback: string) {
 
 function downloadText(filename: string, content: string) {
   const blob = new Blob([content], { type: "application/json;charset=utf-8" });
+  downloadBlob(filename, blob);
+}
+
+function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;

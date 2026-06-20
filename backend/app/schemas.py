@@ -34,6 +34,7 @@ class KeyGenerateResponse(BaseModel):
     privateKeyPem: str
     publicKeyPem: str
     certificate: Certificate
+    warning: Optional[str] = None
 
 
 class RevokeCertificateRequest(BaseModel):
@@ -50,6 +51,7 @@ class SignedPackage(BaseModel):
     signatureBase64: str
     signedAt: str
     certificate: Certificate
+    warning: Optional[str] = None
 
 
 class VerifyResponse(BaseModel):
@@ -59,12 +61,14 @@ class VerifyResponse(BaseModel):
     documentHash: str
     signedAt: Optional[str]
     details: Dict[str, Any]
+    warning: Optional[str] = None
 
 
 class CaPublicKeyResponse(BaseModel):
     issuer: str
     publicKeyPem: str
     signatureAlgorithm: str
+    warning: Optional[str] = None
 
 
 class BlindSignatureDemoRequest(BaseModel):
@@ -75,6 +79,23 @@ class X509CertificateIssueRequest(BaseModel):
     name: str
     email: EmailStr
     publicKeyPem: str
+    proofChallenge: str
+    proofSignatureBase64: str
+
+
+class X509ProofChallengeRequest(BaseModel):
+    name: str
+    email: EmailStr
+    publicKeyPem: str
+
+
+class X509ProofChallengeResponse(BaseModel):
+    challenge: str
+    expiresAt: str
+    subjectName: str
+    subjectEmail: EmailStr
+    publicKeyFingerprint: str
+    warning: str
 
 
 class X509CertificateIssueResponse(BaseModel):
@@ -210,3 +231,35 @@ class CertificateStatusResponse(BaseModel):
     reason: Optional[str] = None
     revokedAt: Optional[str] = None
     expiresAt: Optional[str] = None
+
+
+class DocumentStoredResponse(BaseModel):
+    documentId: str
+    ownerEmail: EmailStr
+    originalFilename: str
+    contentHash: str
+    hashAlgorithm: str
+    mimeType: str
+    sizeBytes: int
+    version: int
+    previousDocumentId: Optional[str] = None
+    immutable: bool = False
+    createdAt: str
+    updatedAt: str
+
+
+class DocumentMarkSignedResponse(BaseModel):
+    documentId: str
+    immutable: bool
+    updatedAt: str
+
+
+class Rfc3161TimestampRequest(BaseModel):
+    messageDigestBase64: str
+    hashAlgorithm: str = "SHA-256"
+
+
+class Rfc3161TimestampResponse(BaseModel):
+    tokenBase64: str
+    hashAlgorithm: str
+    provider: str

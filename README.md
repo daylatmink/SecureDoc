@@ -3,7 +3,7 @@
 SecureDoc is a local educational web app for digital signatures. The main flow is now v2 client-side signing:
 
 - The browser generates the RSA signing key pair with Web Crypto.
-- The backend receives only `publicKeyPem` and issues an `x509-demo` signing certificate.
+- The backend receives `publicKeyPem`, asks the browser to sign a short proof-of-possession challenge, and issues an `x509-demo` signing certificate only after verifying that proof.
 - The browser signs canonical JSON of `signingPayload`.
 - The backend receives only a `signedPackage`, verifies it, issues a demo timestamp token, stores it, and returns a detailed verification report.
 - The legacy `/api/keys/generate` and `/api/sign` endpoints are disabled by default because they move private keys through the backend.
@@ -50,6 +50,7 @@ Phase 1 stabilization also adds:
 - Email OTP fallback for signing confirmation is HMAC-hashed with `SECUREDOC_OTP_PEPPER` and bound to the signing request, document hash, certificate serial, signing purpose, and nonce. The API does not return OTP values. Configure SMTP env vars to receive OTP by email.
 - TOTP Authenticator setup primitives are available in the frontend `Security` tab and are used as step-up confirmation in the signing flow. Set `SECUREDOC_TOTP_ENCRYPTION_KEY`; otherwise development uses a process-local demo encryption key and is not production-secure.
 - Request size limit, in-memory rate limit, and CORS allowlist configuration.
+- X.509 demo certificate issuance requires proof-of-possession. For signer self-service issuance, the certificate email is bound to the authenticated signer email.
 
 ## Run Frontend
 
@@ -73,7 +74,7 @@ npm --prefix frontend run build
 Use the `Documents` tab for the classroom demo:
 
 1. Generate key in browser.
-2. Request X.509 demo certificate.
+2. Request and sign a proof-of-possession challenge, then request an X.509 demo certificate.
 3. Upload or select document.
 4. Create signing request.
 5. Review `signingPayload`.
@@ -104,12 +105,16 @@ See [docs/demo-guide.md](docs/demo-guide.md) for:
 - Signatures cover canonical JSON `signingPayload`, not only a detached document hash.
 - The backend verifies algorithm policy, certificate trust, certificate DB record, validity period, revocation status, replay state, and signature validity.
 - The verification report separates cryptographic validity from trust, revocation, timestamp, server acceptance, and legal readiness fields.
+- Revocation is checked against the trusted demo timestamp where available: a certificate revoked after the signing timestamp can still validate for that old package, while a revoked certificate without trusted timestamp evidence cannot claim long-term validity.
 - Revocation uses server DB `serialNumber`, not the package `status` field.
 - `GET /api/certificates/crl` returns a signed demo CRL generated from revoked server records.
 - `GET /api/audit/verify-chain` verifies the audit log hash chain.
 - The UI includes a PDF visual stamp preview for presentation only.
-- Basic audit logs are recorded for certificate issuance, signing requests, timestamp issuance, signature submission, signature verification, CRL generation, and certificate revocation.
+- The UI can export a pyHanko-backed PAdES signed PDF. Without `SECUREDOC_RFC3161_TSA_URL`, the PDF profile is PAdES-B-B; with a reachable RFC 3161 TSA URL it can include timestamping for PAdES-B-T.
+- `POST /api/documents/store` stores uploaded documents by content hash with owner ACL checks; signed/immutable documents are versioned instead of overwritten.
+- Basic audit logs are recorded for certificate issuance, document storage/versioning, signing requests, timestamp issuance, signature submission, signature verification, CRL generation, and certificate revocation.
 - Blind signature code is separated from document signing and disabled by default. When enabled for demo, the signer signs only `blindedMessageBase64`, and redeem prevents double spending.
+- API responses include basic security headers including CSP, `X-Content-Type-Options`, referrer policy, and permissions policy. Set `SECUREDOC_HTTPS_ONLY=true` to emit HSTS in deployment behind HTTPS.
 
 ## Blind Signature Flow
 
@@ -131,11 +136,13 @@ Main blind token flow:
 ## Remaining Demo Limits
 
 - The X.509 CA chain is demo/local only, not a public CA and not legally valid.
-- The CRL and TSA are demo JSON tokens, not standards-complete OCSP/CRL or RFC 3161 timestamping.
-- There is no HSM, smart card, USB token, public CA trust, PAdES, XAdES, or CAdES.
+- The signed-package CRL/TSA are demo JSON tokens, not standards-complete OCSP/CRL or RFC 3161 timestamping. Demo timestamp tokens are signed and bound to the signing nonce, but they are not legal RFC 3161 `TimeStampToken`s.
+- PAdES PDF export uses pyHanko and produces a real PDF signature container. The default key is still a local demo server-side signer; production must replace it with HSM/KMS/remote signing and public trust.
+- RFC 3161 timestamping requires `SECUREDOC_RFC3161_TSA_URL`; without it, RFC3161 timestamp requests return configuration-required errors and PAdES export falls back to PAdES-B-B.
+- There is no HSM, smart card, USB token, public CA trust, XAdES, or CAdES.
 - `legalReady` is always `false` until trusted CA, RFC 3161 timestamping, PAdES/CAdES/XAdES policy, revocation evidence, identity proofing, and production key custody are implemented.
 - `signedAtClient` remains client-declared time; only `timestampToken` is signed by the demo TSA.
-- The visual stamp preview is not PAdES and does not make a PDF legally signed.
+- The visual stamp preview is not PAdES; use `Export PAdES PDF` for an actual PDF signature.
 - Blind signatures are educational only, not production e-voting/e-cash and not a replacement for document signing.
 - Replay checks are local to the server DB.
 - Phase 1 includes demo RBAC, CORS allowlist, request size limit, and in-memory rate limit. It is not production authentication or full HTTPS/session hardening.

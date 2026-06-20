@@ -42,6 +42,8 @@ JWT_SECRET = os.getenv("SECUREDOC_JWT_SECRET", "development-only-change-me-jwt-s
 JWT_TTL_SECONDS = int(os.getenv("SECUREDOC_JWT_TTL_SECONDS", "3600"))
 REQUEST_SIZE_LIMIT_BYTES = int(os.getenv("SECUREDOC_REQUEST_SIZE_LIMIT_BYTES", str(2 * 1024 * 1024)))
 RATE_LIMIT_REQUESTS_PER_MINUTE = int(os.getenv("SECUREDOC_RATE_LIMIT_REQUESTS_PER_MINUTE", "120"))
+HTTPS_ONLY = _bool_env("SECUREDOC_HTTPS_ONLY", IS_PRODUCTION)
+RFC3161_TSA_URL = os.getenv("SECUREDOC_RFC3161_TSA_URL", "").strip()
 SMTP_HOST = os.getenv("SECUREDOC_SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SECUREDOC_SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SECUREDOC_SMTP_USERNAME", "").strip()
@@ -74,6 +76,19 @@ RUNTIME_SECRETS_DIR = Path(
 def ensure_runtime_secrets_dir() -> Path:
     RUNTIME_SECRETS_DIR.mkdir(parents=True, exist_ok=True)
     return RUNTIME_SECRETS_DIR
+
+
+DOCUMENT_STORAGE_DIR = Path(
+    os.getenv(
+        "SECUREDOC_DOCUMENT_STORAGE_DIR",
+        str(RUNTIME_SECRETS_DIR / "documents"),
+    )
+)
+
+
+def ensure_document_storage_dir() -> Path:
+    DOCUMENT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    return DOCUMENT_STORAGE_DIR
 
 
 def ensure_demo_plaintext_keys_allowed() -> None:

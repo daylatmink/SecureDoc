@@ -7,18 +7,20 @@ Base URL local: `http://127.0.0.1:8000`.
 Luong ky chinh hien nay la v2 client-side signing voi X.509 demo certificate:
 
 1. Browser tao RSA key pair bang Web Crypto.
-2. Browser gui `publicKeyPem` toi `/api/certificates/x509/issue`.
-3. Backend demo CA cap PEM X.509 certificate theo chain:
+2. Browser gui `publicKeyPem` toi `/api/certificates/x509/proof-challenge`.
+3. Browser ky challenge bang private key local de chung minh proof-of-possession.
+4. Browser gui `publicKeyPem`, `proofChallenge`, `proofSignatureBase64` toi `/api/certificates/x509/issue`.
+5. Backend demo CA cap PEM X.509 certificate theo chain:
    `Demo Root CA -> Demo Intermediate CA -> User Signing Certificate`.
-4. Client/backend tinh `documentHash` cho file.
-5. Client goi `/api/sign/v2/prepare` voi `documentName`, `documentHash`, `hashAlgorithm`, `certificateSerialNumber`, `signingPurpose`.
-6. Backend tao `signingPayload` chuan hoa gom:
+6. Client/backend tinh `documentHash` cho file.
+7. Client goi `/api/sign/v2/prepare` voi `documentName`, `documentHash`, `hashAlgorithm`, `certificateSerialNumber`, `signingPurpose`.
+8. Backend tao `signingPayload` chuan hoa gom:
    `documentName`, `documentHash`, `hashAlgorithm`, `signatureAlgorithm`, signer info,
    `certificateSerialNumber`, `certificateFingerprint`, `certificateType`, `signingPurpose`, `requestId`, `nonce`,
    `createdAt`, `payloadVersion`.
-7. Client hien man hinh review va ky canonical JSON cua `signingPayload` tai client bang private key.
-8. Client gui `signedPackage` toi `/api/sign/v2/submit`.
-9. Backend chi verify/luu package; backend khong nhan private key trong luong v2.
+9. Client hien man hinh review va ky canonical JSON cua `signingPayload` tai client bang private key.
+10. Client gui `signedPackage` toi `/api/sign/v2/submit`.
+11. Backend chi verify/luu package; backend khong nhan private key trong luong v2.
 
 Canonicalization method: `JSON-canonical-sorted-keys`.
 
@@ -40,9 +42,11 @@ Tra ve policy thuat toan duoc phep.
 }
 ```
 
-## POST /api/certificates/x509/issue
+## POST /api/certificates/x509/proof-challenge
 
-Cap `x509-demo` certificate tu public key. Backend khong nhan private key.
+Tao challenge ngan han de client ky bang private key tuong ung voi `publicKeyPem`.
+Endpoint nay can auth role `SIGNER`, `CA_OFFICER`, hoac `ADMIN`. Neu role la
+`SIGNER`, `email` phai trung voi email trong access token.
 
 Request:
 
@@ -51,6 +55,38 @@ Request:
   "name": "Nguyen Van A",
   "email": "student@example.com",
   "publicKeyPem": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"
+}
+```
+
+Response:
+
+```json
+{
+  "challenge": "eyJwdXJwb3NlIjoiWDUwOV9DRVJUSUZJQ0FURV9QUk9PRl9PRl9QT1NTRVNTSU9OIn0.abc...",
+  "expiresAt": "2026-06-18T00:10:00+00:00",
+  "subjectName": "Nguyen Van A",
+  "subjectEmail": "student@example.com",
+  "publicKeyFingerprint": "7b8c...",
+  "warning": "Sign this challenge with the private key matching publicKeyPem before certificate issuance."
+}
+```
+
+## POST /api/certificates/x509/issue
+
+Cap `x509-demo` certificate tu public key sau khi verify proof-of-possession.
+Backend khong nhan private key. Endpoint nay can auth role `SIGNER`,
+`CA_OFFICER`, hoac `ADMIN`. Neu role la `SIGNER`, subject email bi bind vao
+email trong access token.
+
+Request:
+
+```json
+{
+  "name": "Nguyen Van A",
+  "email": "student@example.com",
+  "publicKeyPem": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n",
+  "proofChallenge": "eyJwdXJwb3NlIjoiWDUwOV9DRVJUSUZJQ0FURV9QUk9PRl9PRl9QT1NTRVNTSU9OIn0.abc...",
+  "proofSignatureBase64": "base64-rsa-pss-sha256-signature-over-proofChallenge"
 }
 ```
 
@@ -103,7 +139,7 @@ Request:
 
 Response gom `privateKeyPem`, `publicKeyPem`, `certificate`.
 
-Canh bao: endpoint nay tao private key o backend roi tra ve client, nen khong thuoc flow chinh. Flow chinh dung browser Web Crypto de tao key pair va chi gui public key len `/api/certificates/x509/issue`.
+Canh bao: endpoint nay tao private key o backend roi tra ve client, nen khong thuoc flow chinh. Flow chinh dung browser Web Crypto de tao key pair, lay proof challenge, ky challenge trong browser, roi chi gui public key + proof signature len `/api/certificates/x509/issue`.
 
 Audit event: `certificate_created`. Audit khong ghi private key.
 
@@ -122,6 +158,97 @@ Response:
   "hashAlgorithm": "SHA-256",
   "documentHash": "b94d27b9934d3e08..."
 }
+```
+
+## POST /api/documents/store
+
+Luu document theo content hash trong runtime storage. Endpoint can role `SIGNER`.
+Backend khong dung raw filename lam duong dan luu file, reject filename path traversal,
+reject PDF gia MIME/content, va gan owner ACL theo user dang auth.
+
+Request `multipart/form-data`:
+
+- `file`: document.
+
+Response:
+
+```json
+{
+  "documentId": "9f0a...",
+  "ownerEmail": "student@example.com",
+  "originalFilename": "contract.pdf",
+  "contentHash": "b94d27...",
+  "hashAlgorithm": "SHA-256",
+  "mimeType": "application/pdf",
+  "sizeBytes": 12345,
+  "version": 1,
+  "previousDocumentId": null,
+  "immutable": false,
+  "createdAt": "2026-06-18T00:00:00+00:00",
+  "updatedAt": "2026-06-18T00:00:00+00:00"
+}
+```
+
+## GET /api/documents/{documentId}
+
+Tra metadata neu actor la owner hoac `ADMIN`. User khac bi `403`.
+
+## PUT /api/documents/{documentId}/content
+
+Cap nhat content document cua owner. Neu document da duoc mark signed/immutable,
+backend khong overwrite object cu ma tao document version moi voi `previousDocumentId`.
+
+## POST /api/documents/{documentId}/mark-signed
+
+Danh dau document la immutable sau khi ky. Cac lan update sau se tao version moi.
+
+## POST /api/timestamp/rfc3161
+
+Goi RFC 3161 TSA that qua pyHanko `HTTPTimeStamper`. Endpoint nay can
+`SECUREDOC_RFC3161_TSA_URL`; neu chua cau hinh se tra `503`.
+
+Request:
+
+```json
+{
+  "messageDigestBase64": "base64-digest",
+  "hashAlgorithm": "SHA-256"
+}
+```
+
+Response:
+
+```json
+{
+  "tokenBase64": "base64-cms-timestamp-token",
+  "hashAlgorithm": "SHA-256",
+  "provider": "https://tsa.example/timestamp"
+}
+```
+
+## POST /api/pdf/pades/sign
+
+Ky PDF bang pyHanko va tra ve PDF da co chu ky so PDF thuc su
+(`/ByteRange`, CMS/CAdES detached signature, SubFilter `/ETSI.CAdES.detached`).
+Endpoint can role `SIGNER`.
+
+Neu `SECUREDOC_RFC3161_TSA_URL` duoc cau hinh, PAdES export se dung TSA do de
+them timestamp cho profile PAdES-B-T. Neu khong, profile la PAdES-B-B. Mac
+dinh signer key/cert la demo server-side signer trong runtime storage; production
+can thay bang HSM/KMS/remote signer.
+
+Request `multipart/form-data`:
+
+- `file`: PDF file.
+- `reason`: ly do ky.
+- `location`: dia diem ky.
+
+Response headers:
+
+```text
+Content-Type: application/pdf
+X-SecureDoc-PAdES-Profile: PAdES-B-B | PAdES-B-T
+X-SecureDoc-PAdES-Hash: sha256-of-signed-pdf
 ```
 
 ## POST /api/sign/v2/prepare
@@ -236,6 +363,7 @@ Response:
       "messageImprint": "e3b0...",
       "hashAlgorithm": "SHA-256",
       "timestamp": "2026-06-16T00:01:05+00:00",
+      "nonce": "d3c1...",
       "tsaName": "SecureDoc Demo TSA",
       "serialNumber": "9A12...",
       "signatureAlgorithm": "RSA-PSS-SHA256",
@@ -263,7 +391,8 @@ Backend kiem tra:
 - thoi han certificate.
 - RSA key size theo policy.
 - RSA-PSS signature tren canonical JSON cua `signingPayload`.
-- timestampToken demo neu co; neu client khong gui thi backend tao token Demo TSA cho hash cua signature.
+- timestampToken demo neu co; neu client khong gui thi backend tao token Demo TSA cho hash cua signature va bind token voi `signingPayload.nonce`.
+- Revocation duoc danh gia theo trusted demo timestamp: cert revoke sau timestamp co the van verify hop le tai thoi diem ky; revoke truoc timestamp hoac thieu timestamp se fail khi cert hien tai da revoked.
 
 Audit event: `signature_submitted` voi `success` hoac `failed`.
 
@@ -498,9 +627,11 @@ Legacy revoke nhan full certificate JSON. V2 nen dung `/api/certificates/revoke/
 
 - Flow chinh dung `x509-demo` certificate, nhung Demo CA chi la local trust, khong phai public CA.
 - Certificate khong co gia tri phap ly va khong duoc neo vao trust store cong khai.
-- CRL/TSA la demo JSON co chu ky, khong phai OCSP/CRL binary hay RFC 3161 TSA production.
+- Signed package CRL/TSA la demo JSON co chu ky, khong phai OCSP/CRL binary hay RFC 3161 TSA production.
+- `/api/timestamp/rfc3161` co the goi TSA that neu cau hinh `SECUREDOC_RFC3161_TSA_URL`.
+- `/api/pdf/pades/sign` tao PDF PAdES-B-B bang pyHanko; PAdES-B-T can TSA URL that.
 - Chua co HSM, smart card, USB token, key isolation production.
-- Chua co PAdES, XAdES, CAdES.
+- Chua co XAdES/CAdES.
 - `signedAtClient` chi la thoi gian client khai bao; `timestampToken` la demo TSA token, khong phai trusted timestamp phap ly.
 - Replay check chi co y nghia trong server DB local da nhan submit.
 - Chua co authentication, authorization, rate limit, HTTPS bat buoc hay hardening production.

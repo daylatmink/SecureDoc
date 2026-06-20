@@ -334,11 +334,31 @@ export async function issueX509Certificate(body: {
   name: string;
   email: string;
   publicKeyPem: string;
+  privateKeyPem: string;
 }): Promise<X509IssueResponse> {
+  const authHeaders = await signerAuthHeaders(body.email);
+  const challengeResponse = await fetch(`${API_BASE}/api/certificates/x509/proof-challenge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders },
+    body: JSON.stringify({
+      name: body.name,
+      email: body.email,
+      publicKeyPem: body.publicKeyPem,
+    }),
+  });
+  const challenge = await handleResponse<{ challenge: string }>(challengeResponse);
+  const proofKey = await importPrivateKey(body.privateKeyPem, "SHA-256");
+  const proofSignatureBase64 = await signText(proofKey, challenge.challenge, "SHA-256");
   const response = await fetch(`${API_BASE}/api/certificates/x509/issue`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(await roleAuthHeaders("CA_OFFICER")) },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json", ...authHeaders },
+    body: JSON.stringify({
+      name: body.name,
+      email: body.email,
+      publicKeyPem: body.publicKeyPem,
+      proofChallenge: challenge.challenge,
+      proofSignatureBase64,
+    }),
   });
   return handleResponse<X509IssueResponse>(response);
 }
@@ -369,6 +389,27 @@ export async function hashDocument(file: File, hashAlgorithm: HashAlgorithm) {
   formData.append("hashAlgorithm", hashAlgorithm);
   const response = await fetch(`${API_BASE}/api/documents/hash`, { method: "POST", body: formData });
   return handleResponse<{ documentName: string; hashAlgorithm: HashAlgorithm; documentHash: string }>(response);
+}
+
+export async function signPdfPades(file: File, signerEmail: string, reason: string): Promise<{ blob: Blob; profile: string }> {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("reason", reason);
+  formData.append("location", "SecureDoc");
+  const response = await fetch(`${API_BASE}/api/pdf/pades/sign`, {
+    method: "POST",
+    headers: await signerAuthHeaders(signerEmail),
+    body: formData,
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    const detail = data && typeof data.detail === "string" ? data.detail : "PAdES signing failed";
+    throw new Error(detail);
+  }
+  return {
+    blob: await response.blob(),
+    profile: response.headers.get("X-SecureDoc-PAdES-Profile") ?? "PAdES",
+  };
 }
 
 async function signerAuthHeaders(signerEmail: string) {
@@ -465,7 +506,15 @@ export async function signPayload(
   canonicalJson: string,
   hashAlgorithm: Exclude<HashAlgorithm, "SHA3-256">,
 ): Promise<string> {
-  const data = new TextEncoder().encode(canonicalJson);
+  return signText(privateKey, canonicalJson, hashAlgorithm);
+}
+
+export async function signText(
+  privateKey: CryptoKey,
+  value: string,
+  hashAlgorithm: Exclude<HashAlgorithm, "SHA3-256">,
+): Promise<string> {
+  const data = new TextEncoder().encode(value);
   const signature = await crypto.subtle.sign(
     { name: "RSA-PSS", saltLength: digestSize(hashAlgorithm) },
     privateKey,
