@@ -7,16 +7,21 @@ production identity system.
 import smtplib
 from email.message import EmailMessage
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, EmailStr
 from sqlalchemy.orm import Session
 
 from .auth_utils import create_email_otp, create_totp_setting, totp_storage_warning, verify_email_otp, verify_totp_setup
-from .config import SMTP_FROM_EMAIL, SMTP_HOST, SMTP_PASSWORD, SMTP_PORT, SMTP_USERNAME, SMTP_USE_TLS
+from .config import JWT_TTL_SECONDS, SMTP_FROM_EMAIL, SMTP_HOST, SMTP_PASSWORD, SMTP_PORT, SMTP_USERNAME, SMTP_USE_TLS
 from .database import SessionLocal
-from .security import SIGNER, require_roles
+from .security import SIGNER, VALID_ROLES, create_demo_access_token, require_roles
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+class DemoLoginRequest(BaseModel):
+    email: EmailStr
+    role: str
 
 
 class EmailOtpRequest(BaseModel):
@@ -81,6 +86,22 @@ def _actor_email(actor: dict[str, str]) -> str:
     return actor["user"].strip().lower()
 
 
+@router.post("/demo-login")
+def demo_login(body: DemoLoginRequest):
+    role = body.role.strip().upper()
+    if role not in VALID_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    user = body.email.strip().lower()
+    return {
+        "accessToken": create_demo_access_token(user, role),
+        "tokenType": "Bearer",
+        "expiresIn": JWT_TTL_SECONDS,
+        "user": user,
+        "role": role,
+        "warning": "Demo JWT for local SecureDoc development only. Not a production identity provider.",
+    }
+
+
 @router.post("/email-otp/request", include_in_schema=False)
 def request_email_otp(
     body: EmailOtpRequest,
@@ -127,6 +148,7 @@ def verify_email_otp_route(
 
 @router.post("/totp/setup")
 def setup_totp(
+    response: Response,
     db: Session = Depends(get_db),
     actor: dict[str, str] = Depends(require_roles(SIGNER)),
 ):
@@ -135,6 +157,7 @@ def setup_totp(
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     db.commit()
+    response.headers["Cache-Control"] = "no-store"
     return {
         "mfaId": setting.id,
         "email": setting.email,

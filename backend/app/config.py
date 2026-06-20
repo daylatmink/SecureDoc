@@ -37,6 +37,9 @@ IS_PRODUCTION = SECUREDOC_ENV in {"prod", "production"}
 
 ENABLE_LEGACY_DEMO = _bool_env("ENABLE_LEGACY_DEMO", False) and not IS_PRODUCTION
 ENABLE_BLIND_SIGNATURE_DEMO = _bool_env("ENABLE_BLIND_SIGNATURE_DEMO", False) and not IS_PRODUCTION
+ENABLE_DEMO_HEADER_AUTH = _bool_env("ENABLE_DEMO_HEADER_AUTH", False) and not IS_PRODUCTION
+JWT_SECRET = os.getenv("SECUREDOC_JWT_SECRET", "development-only-change-me-jwt-secret").strip()
+JWT_TTL_SECONDS = int(os.getenv("SECUREDOC_JWT_TTL_SECONDS", "3600"))
 REQUEST_SIZE_LIMIT_BYTES = int(os.getenv("SECUREDOC_REQUEST_SIZE_LIMIT_BYTES", str(2 * 1024 * 1024)))
 RATE_LIMIT_REQUESTS_PER_MINUTE = int(os.getenv("SECUREDOC_RATE_LIMIT_REQUESTS_PER_MINUTE", "120"))
 SMTP_HOST = os.getenv("SECUREDOC_SMTP_HOST", "").strip()
@@ -56,6 +59,9 @@ CORS_ALLOW_ORIGINS = [
 
 if IS_PRODUCTION and "*" in CORS_ALLOW_ORIGINS:
     raise RuntimeError("Wildcard CORS origins are not allowed in production")
+
+if IS_PRODUCTION and JWT_SECRET == "development-only-change-me-jwt-secret":
+    raise RuntimeError("SECUREDOC_JWT_SECRET must be set to a strong random value in production")
 
 RUNTIME_SECRETS_DIR = Path(
     os.getenv(

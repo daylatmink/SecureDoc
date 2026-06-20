@@ -27,15 +27,16 @@ from app.auth_utils import (
 from app.database import SessionLocal
 from app.main import _rate_limit_buckets, app
 from app.models import AuditLog, CertificateRecord, EmailOtpToken, SigningRequest, UserMfaSetting
+from app.security import auth_headers
 from app.x509_utils import issue_user_x509_certificate, verify_signed_demo_crl
 
 
 DOCUMENT = b"SecureDoc v2 test document"
-CA_HEADERS = {"X-SecureDoc-User": "pytest-ca", "X-SecureDoc-Role": "CA_OFFICER"}
-SIGNER_HEADERS = {"X-SecureDoc-User": "signer@example.com", "X-SecureDoc-Role": "SIGNER"}
-OTHER_SIGNER_HEADERS = {"X-SecureDoc-User": "other-signer@example.com", "X-SecureDoc-Role": "SIGNER"}
-AUDITOR_HEADERS = {"X-SecureDoc-User": "pytest-auditor", "X-SecureDoc-Role": "AUDITOR"}
-VERIFIER_HEADERS = {"X-SecureDoc-User": "pytest-verifier", "X-SecureDoc-Role": "VERIFIER"}
+CA_HEADERS = auth_headers("pytest-ca@example.com", "CA_OFFICER")
+SIGNER_HEADERS = auth_headers("signer@example.com", "SIGNER")
+OTHER_SIGNER_HEADERS = auth_headers("other-signer@example.com", "SIGNER")
+AUDITOR_HEADERS = auth_headers("pytest-auditor@example.com", "AUDITOR")
+VERIFIER_HEADERS = auth_headers("pytest-verifier@example.com", "VERIFIER")
 
 
 def test_canonical_signing_payload_is_deterministic():
@@ -149,12 +150,77 @@ def test_unauthenticated_cannot_issue_cert():
     assert response.status_code == 401
 
 
+def test_demo_login_returns_jwt_that_can_access_totp_setup():
+    with TestClient(app) as client:
+        login = client.post(
+            "/api/auth/demo-login",
+            json={"email": "jwt-signer@example.com", "role": "SIGNER"},
+        )
+        assert login.status_code == 200, login.text
+        data = login.json()
+        assert data["accessToken"]
+        assert data["tokenType"] == "Bearer"
+        assert data["expiresIn"] == 3600
+        assert data["user"] == "jwt-signer@example.com"
+        assert data["role"] == "SIGNER"
+
+        setup = client.post(
+            "/api/auth/totp/setup",
+            headers={"Authorization": f"Bearer {data['accessToken']}"},
+        )
+
+    assert setup.status_code == 200, setup.text
+    assert setup.json()["email"] == "jwt-signer@example.com"
+
+
+def test_demo_login_rejects_invalid_role():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/demo-login",
+            json={"email": "bad-role@example.com", "role": "NOT_A_ROLE"},
+        )
+
+    assert response.status_code == 400
+
+
+def test_protected_endpoint_rejects_fake_bearer_token():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/totp/setup",
+            headers={"Authorization": "Bearer fake.token.value"},
+        )
+
+    assert response.status_code == 401
+
+
+def test_raw_demo_header_auth_is_rejected_by_default():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/totp/setup",
+            headers={"X-SecureDoc-User": "spoof@example.com", "X-SecureDoc-Role": "SIGNER"},
+        )
+
+    assert response.status_code == 401
+
+
 def test_signer_cannot_revoke_cert():
     with TestClient(app) as client:
         response = client.post(
             "/api/certificates/revoke/v2",
             headers=SIGNER_HEADERS,
             json={"serialNumber": "ABC", "reason": "pytest", "revokedBy": "pytest"},
+        )
+
+    assert response.status_code == 403
+
+
+def test_signer_cannot_issue_x509_certificate():
+    _, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/certificates/x509/issue",
+            headers=SIGNER_HEADERS,
+            json={"name": "Signer Issued", "email": "signer-issued@example.com", "publicKeyPem": public_key_pem},
         )
 
     assert response.status_code == 403
@@ -171,6 +237,32 @@ def test_ca_officer_can_issue_cert():
 
     assert response.status_code == 200
     assert response.json()["certificateType"] == "x509-demo"
+
+
+def test_user_can_prepare_signing_request_for_certificate_they_own():
+    _, public_key_pem = generate_key_pair()
+    with TestClient(app) as client:
+        issued = client.post(
+            "/api/certificates/x509/issue",
+            headers=CA_HEADERS,
+            json={"name": "Signer Owner", "email": "signer@example.com", "publicKeyPem": public_key_pem},
+        )
+        assert issued.status_code == 200
+        certificate = issued.json()["certificate"]
+        response = client.post(
+            "/api/sign/v2/prepare",
+            headers=SIGNER_HEADERS,
+            json={
+                "documentName": "document.txt",
+                "documentHash": hash_bytes(DOCUMENT, "SHA-256"),
+                "hashAlgorithm": "SHA-256",
+                "certificateSerialNumber": certificate["serialNumber"],
+                "signingPurpose": "approve_document",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["signingPayload"]["signerEmail"] == "signer@example.com"
 
 
 def test_user_cannot_prepare_signing_request_for_certificate_they_do_not_own():
@@ -233,7 +325,7 @@ def test_email_otp_api_does_not_return_plain_otp():
     with TestClient(app) as client:
         response = client.post(
             "/api/auth/email-otp/request",
-            headers={"X-SecureDoc-User": "api-otp@example.com", "X-SecureDoc-Role": "SIGNER"},
+            headers=auth_headers("api-otp@example.com", "SIGNER"),
             json={"email": "api-otp@example.com", "purpose": "SENSITIVE_ACTION"},
         )
 
@@ -284,10 +376,11 @@ def test_email_otp_attempt_limit_and_expiry():
 
 
 def test_totp_setup_requires_valid_code_and_does_not_store_plain_secret():
-    headers = {"X-SecureDoc-User": "mfa@example.com", "X-SecureDoc-Role": "SIGNER"}
+    headers = auth_headers("mfa@example.com", "SIGNER")
     with TestClient(app) as client:
         setup = client.post("/api/auth/totp/setup", headers=headers)
         assert setup.status_code == 200, setup.text
+        assert setup.headers["Cache-Control"] == "no-store"
         data = setup.json()
         assert data["email"] == "mfa@example.com"
         assert data["otpauthUri"].startswith("otpauth://totp/")
@@ -320,7 +413,7 @@ def test_unauthenticated_totp_setup_is_rejected():
 
 
 def test_totp_verify_setup_does_not_accept_secret():
-    headers = {"X-SecureDoc-User": "totp-contract@example.com", "X-SecureDoc-Role": "SIGNER"}
+    headers = auth_headers("totp-contract@example.com", "SIGNER")
     with TestClient(app) as client:
         setup = client.post("/api/auth/totp/setup", headers=headers)
         assert setup.status_code == 200
@@ -335,7 +428,7 @@ def test_totp_verify_setup_does_not_accept_secret():
 
 
 def test_enabled_mfa_is_not_reset_by_regular_totp_setup():
-    headers = {"X-SecureDoc-User": "enabled-mfa@example.com", "X-SecureDoc-Role": "SIGNER"}
+    headers = auth_headers("enabled-mfa@example.com", "SIGNER")
     with TestClient(app) as client:
         setup = client.post("/api/auth/totp/setup", headers=headers)
         assert setup.status_code == 200

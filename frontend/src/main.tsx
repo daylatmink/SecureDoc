@@ -25,18 +25,21 @@ import {
   browserSigningHashSupported,
   canonicalizePayload,
   confirmSigningRequest,
-  demoAuthHeaders,
+  demoLogin,
   generateBrowserSigningKeyPair,
   hashDocument,
   importPrivateKey,
   issueX509Certificate,
   prepareSigningRequest,
   requestSigningEmailOtp,
+  revokeCertificate,
   signPayload,
   setupTotp,
   submitSignature,
+  verifyAuditChain,
   verifyTotpSetup,
   verifyV2,
+  type AuditChainResult,
   type Certificate,
   type HashAlgorithm,
   type PrepareResponse,
@@ -381,12 +384,6 @@ function StatusLine({ ok, text }: { ok: boolean; text: string }) {
 type DocumentStatus = "draft" | "pending_signature" | "signed" | "verification_failed" | "certificate_revoked";
 type SigningConfirmationMethod = "EMAIL_OTP" | "TOTP";
 
-type AuditChainResult = {
-  valid: boolean;
-  totalEvents: number;
-  brokenAt: null | { index: number; id: number; eventId: string };
-};
-
 function DocumentsWorkflow() {
   const [name, setName] = useState("Nguyen Van A");
   const [email, setEmail] = useState("student@example.com");
@@ -417,6 +414,7 @@ function DocumentsWorkflow() {
     setError("");
     setLoading(true);
     try {
+      await demoLogin(email, "SIGNER");
       const keyPair = await generateBrowserSigningKeyPair();
       const issued = await issueX509Certificate({ name, email, publicKeyPem: keyPair.publicKeyPem });
       setPrivateKeyPem(keyPair.privateKeyPem);
@@ -449,6 +447,7 @@ function DocumentsWorkflow() {
     setError("");
     setLoading(true);
     try {
+      await demoLogin(certificate.email, "SIGNER");
       const hash = await hashDocument(file, hashAlgorithm);
       const prepared = await prepareSigningRequest({
         documentName: file.name,
@@ -593,12 +592,11 @@ function DocumentsWorkflow() {
     setError("");
     setLoading(true);
     try {
-      const revokeResponse = await fetch(`${API_BASE}/api/certificates/revoke/v2`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...demoAuthHeaders.caOfficer },
-        body: JSON.stringify({ serialNumber: certificate.serialNumber, reason: "classroom_demo_revoke", revokedBy: "local-demo-user" })
+      const revoked = await revokeCertificate({
+        serialNumber: certificate.serialNumber,
+        reason: "classroom_demo_revoke",
+        revokedBy: "local-demo-user",
       });
-      const revoked = await parseResponse<{ serialNumber: string; status: string; reason: string; revokedAt: string }>(revokeResponse);
       setRevokeResult(revoked);
 
       const algorithm = submitResult.signedPackage.signingPayload.hashAlgorithm;
@@ -620,8 +618,7 @@ function DocumentsWorkflow() {
   async function checkAuditChain() {
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/audit/verify-chain`, { headers: demoAuthHeaders.auditor });
-      setAuditResult(await parseResponse<AuditChainResult>(response));
+      setAuditResult(await verifyAuditChain());
     } catch (err) {
       setError(errorMessage(err, "Cannot verify audit chain."));
     }
@@ -1373,12 +1370,7 @@ function RevokeCertificate() {
       return;
     }
     try {
-      const response = await fetch(`${API_BASE}/api/certificates/revoke/v2`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...demoAuthHeaders.caOfficer },
-        body: JSON.stringify({ serialNumber: serial, reason, revokedBy: "local-demo-user" })
-      });
-      setResult(await parseResponse<{ serialNumber: string; status: string; reason: string; revokedAt: string }>(response));
+      setResult(await revokeCertificate({ serialNumber: serial, reason, revokedBy: "local-demo-user" }));
     } catch (err) {
       setError(errorMessage(err, "Cannot revoke certificate."));
     }
