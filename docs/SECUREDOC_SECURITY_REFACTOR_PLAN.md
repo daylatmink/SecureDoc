@@ -1,1189 +1,1362 @@
-# SecureDoc Security & Digital Signature Refactor Plan
+# SecureDoc Digital Signature Full Roadmap
 
-## Trạng thái triển khai trong repo
+## 0. Mục tiêu tổng thể
 
-File này là roadmap bảo mật dài hạn. Trong lần refactor hiện tại repo đã xử lý các mục nền tảng sau:
+SecureDoc được định hướng thành một hệ thống ký số tài liệu có phân quyền, có xác thực người dùng, có quản lý chứng thư số, có quy trình ký/xác minh rõ ràng, và có các module mở rộng như timestamp, PAdES, audit log, LTV và chữ ký mù.
 
-```text
-[x] Disable legacy private-key API by default
-[x] Hide legacy private-key routes from OpenAPI by default
-[x] Remove hard-coded demo PIN 123456 from frontend signing flow
-[x] Add Email OTP model/API with hash, purpose, expiry, used_at, attempt_count
-[x] Add TOTP Authenticator setup/verify primitives for MFA design
-[x] Add basic demo RBAC roles for sensitive endpoints
-[x] Move demo CA/TSA/blind-signer runtime keys out of backend source tree
-[x] Add production guard for plaintext demo keys
-[x] Split verify report into crypto/trust/revocation/timestamp/server/legal fields
-[x] Add verify report warnings/errors separation
-[x] Fix document hashing endpoint to respect requested hash algorithm
-[x] Add request size limit, in-memory rate limit, and CORS allowlist config
-[x] Disable blind-signature demo routes by default
-[x] Add proof-of-possession challenge for X.509 certificate issuance
-[x] Bind signer self-service certificate subject email to authenticated signer
-[x] Bind demo timestamp token to signing nonce
-[x] Evaluate revocation against trusted demo timestamp when present
-[x] Add secure document storage API with path traversal/MIME checks
-[x] Add document owner ACL and immutable versioning
-[x] Add CSP/security response headers
-[x] Add pyHanko-backed PAdES-B-B PDF signing endpoint
-[x] Add RFC3161 HTTP TSA provider integration via SECUREDOC_RFC3161_TSA_URL
-[x] Add regression tests for the implemented security changes
-[x] Add .env.example and SECURITY.md
-```
+Hệ thống không còn đi theo hướng demo classroom/full pipeline gom tất cả role vào một màn hình. Thay vào đó, hệ thống được thiết kế theo mô hình sản phẩm:
 
-Các mục sau vẫn là roadmap, chưa được coi là hoàn thành:
+* `SIGNER`: người ký tài liệu.
+* `CA_OFFICER`: cán bộ cấp/thu hồi chứng thư số.
+* `VERIFIER`: người xác minh chữ ký.
+* `AUDITOR`: người kiểm tra audit log.
+* `ADMIN`: người quản trị user/role/hệ thống.
 
-```text
-[ ] Production authentication + RBAC backed by real accounts/JWT/session
-[ ] Email delivery and full TOTP MFA login flow
-[x] Proof-of-possession for certificate issuance
-[ ] Full RFC 5280 path validation
-[x] RFC 3161 TimeStampToken provider integration when external TSA is configured
-[x] PAdES-B-B PDF signing profile
-[ ] PAdES-B-T requires configured external TSA in deployment
-[ ] CAdES/XAdES signing profile
-[ ] HSM/KMS/token-backed key custody
-[ ] Distributed production rate limiting, HTTPS, CSRF/session hardening
-```
+Các thành phần chữ ký số cần bao phủ:
 
-Do đó repo vẫn là **educational demo**, không phải hệ thống production-ready hoặc legally-ready.
-
-> Mục tiêu của file này: đặt vào repo để AI/code agent hoặc developer đọc và chỉnh sửa hệ thống SecureDoc theo hướng an toàn hơn, gần chuẩn chữ ký số thực tế hơn.  
-> Ưu tiên chính: bỏ các luồng demo nguy hiểm, chuẩn hóa PKI/X.509, timestamp, PDF signing, xác thực người dùng, MFA, audit và kiểm thử bảo mật.
+1. Cơ chế tạo chữ ký số.
+2. Giao thức chữ ký số.
+3. Dịch vụ chữ ký số.
+4. Quản lý khóa và chứng thư.
+5. Xác thực người ký.
+6. Timestamp và xác minh thời điểm ký.
+7. Ký PDF/PAdES.
+8. Thu hồi chứng thư và xác minh trạng thái.
+9. Audit log và khả năng truy vết.
+10. Chữ ký mù cho privacy-preserving token service.
 
 ---
 
-## 0. Nguyên tắc refactor bắt buộc
+## Nguyên tắc triển khai
 
-1. **Không phá luồng v2 đang pass test**, trừ khi có test mới thay thế rõ ràng.
-2. **Không được để private key đi qua API client-server** trong mode bình thường.
-3. **Không được gọi hệ thống là production-ready, legally-ready hoặc PAdES-compliant** nếu chưa implement đủ các phần tương ứng.
-4. **Mọi thay đổi security phải có test âm tính**: sửa dữ liệu, đổi cert, dùng cert hết hạn, dùng nonce sai, dùng token sai đều phải fail.
-5. **Tách rõ 3 cấp độ verify**:
-   - `cryptoValid`: chữ ký và hash đúng về mặt mật mã.
-   - `trustedChainValid`: certificate chain đáng tin theo trust anchor.
-   - `serverAccepted`: package/signature thực sự thuộc luồng được SecureDoc tạo/nhận.
+* Không copy thuật toán ký thành nhiều bản.
+* Backend signing pipeline là nguồn sự thật duy nhất.
+* Frontend chỉ tách theo role/UI, không tách logic mật mã.
+* Không để frontend tự khai role.
+* Không dùng `X-SecureDoc-User` / `X-SecureDoc-Role` mặc định.
+* Không để user mode tự dùng token `CA_OFFICER` hoặc `AUDITOR` ngầm.
+* Không hardcode secret, app password, private key.
+* Không commit `.env`.
+* Không claim production-ready nếu chưa có HSM/KMS, public CA, RFC3161 thật, PAdES-LTV đầy đủ.
 
 ---
 
-## 1. P0 — Tắt hoặc cô lập legacy API nguy hiểm
+# PHASE 0 — Product Cleanup & Architecture Baseline
 
-### Vấn đề
+## Mục tiêu
 
-Legacy API vẫn expose hành vi demo nguy hiểm:
+Dọn kiến trúc hiện tại để SecureDoc không còn là demo pipeline lẫn lộn nhiều role. Chuẩn bị nền cho hệ thống phân quyền thật hơn.
 
-- `/api/keys/generate` trả `privateKeyPem` cho client.
-- `/api/sign` nhận `privateKeyPem` từ client.
+## Việc cần làm
 
-Các API này làm sai mô hình chữ ký số thực tế vì private key không được rời khỏi chủ thể ký hoặc thiết bị lưu khóa an toàn.
+### 0.1. Frontend cleanup
 
-### Việc cần sửa
+Bỏ `DocumentsWorkflow` khỏi main navigation.
 
-- Thêm biến môi trường:
+Không còn một màn hình gom toàn bộ:
+
+* generate key
+* issue cert
+* prepare
+* OTP
+* sign
+* submit
+* verify
+* revoke
+* audit
+
+vào cùng một user-facing flow.
+
+Thay bằng các màn hình theo role:
+
+```text
+/sign        → SIGNER
+/ca          → CA_OFFICER
+/verify      → VERIFIER
+/audit       → AUDITOR
+/admin       → ADMIN
+/security    → MFA/TOTP settings
+```
+
+Nếu frontend chưa dùng router thì vẫn có thể dùng tab state, nhưng tab phải phản ánh đúng role.
+
+### 0.2. Xóa demo auth khỏi user flow
+
+Loại bỏ khỏi user-facing frontend:
+
+```typescript
+demoAuthHeaders
+roleAuthHeaders("CA_OFFICER")
+roleAuthHeaders("AUDITOR")
+X-SecureDoc-User
+X-SecureDoc-Role
+```
+
+User flow chỉ dùng:
+
+```http
+Authorization: Bearer <access_token>
+```
+
+### 0.3. Giữ một signing pipeline duy nhất
+
+Backend vẫn giữ một pipeline chuẩn:
+
+```text
+prepare signing request
+→ request OTP/TOTP
+→ confirm signing intent
+→ client-side sign
+→ submit signed package
+→ verify
+```
+
+Không tạo pipeline riêng cho demo và pipeline riêng cho user.
+
+## Deliverable
+
+* Không còn `DocumentsWorkflow` là flow chính.
+* Frontend chia theo role.
+* Không còn role-switch ngầm trong user UI.
+* Backend signing API vẫn hoạt động.
+
+## Test
+
+```bash
+python -m pytest backend/tests -q
+npm --prefix frontend run build
+```
+
+---
+
+# PHASE 1 — Auth, User, Role, OTP, TOTP, RBAC
+
+## Mục tiêu
+
+Xây nền xác thực và phân quyền cho hệ thống. Đây là phase bắt buộc trước khi nâng chuẩn X.509/PAdES.
+
+## 1.1. SMTP sender
+
+Tài khoản gửi OTP của hệ thống:
+
+```text
+lucdoka1245@gmail.com
+```
+
+`.env.example`:
 
 ```env
-ENABLE_LEGACY_DEMO=false
+SECUREDOC_SMTP_HOST=smtp.gmail.com
+SECUREDOC_SMTP_PORT=587
+SECUREDOC_SMTP_USERNAME=lucdoka1245@gmail.com
+SECUREDOC_SMTP_PASSWORD=change-me-google-app-password
+SECUREDOC_SMTP_FROM_EMAIL=lucdoka1245@gmail.com
+SECUREDOC_SMTP_USE_TLS=true
 ```
 
-- Nếu `ENABLE_LEGACY_DEMO=false`:
-  - Không register route legacy.
-  - Hoặc route trả `404 Not Found` / `410 Gone`.
-  - Ẩn khỏi OpenAPI/Swagger.
+Quy tắc:
 
-- Nếu cần giữ demo cho lớp học:
-  - Đưa route vào prefix riêng: `/api/demo/...`
-  - Gắn cảnh báo rõ trong response và Swagger: `DEMO_ONLY_DO_NOT_USE_IN_PRODUCTION`.
+* Không hardcode app password.
+* Không commit `.env`.
+* Nếu SMTP chưa cấu hình, không gửi email thật.
+* Không trả OTP plaintext trong response.
+* OTP được gửi từ `lucdoka1245@gmail.com`.
+* OTP được gửi đến email user hoặc `signing_request.signer_email`.
 
-### Acceptance criteria
+## 1.2. User model
 
-- Khi chạy mode mặc định, gọi `/api/keys/generate` không trả private key.
-- Khi chạy mode mặc định, gọi `/api/sign` không nhận `privateKeyPem`.
-- OpenAPI không hiển thị legacy route trong mode bình thường.
-
-### Test cần thêm
-
-- `test_legacy_generate_key_disabled_by_default`
-- `test_legacy_sign_disabled_by_default`
-- `test_legacy_routes_hidden_from_openapi_when_disabled`
-
----
-
-## 2. P0 — Bổ sung authentication, authorization và role model
-
-### Vấn đề
-
-Các chức năng nhạy cảm như issue certificate, revoke certificate, tạo signing request, xem audit/CRL không được public. Nếu ai cũng có thể gọi các API này thì hệ thống không có giá trị quản trị chữ ký số.
-
-### Role đề xuất
+Thêm bảng `users`:
 
 ```text
-ADMIN        : quản trị hệ thống
-CA_OFFICER   : cấp/revoke chứng thư
-TSA_SERVICE  : ký timestamp token nội bộ
-SIGNER       : người ký tài liệu
-VERIFIER     : người xác minh tài liệu
-AUDITOR      : xem audit log
-```
-
-### Việc cần sửa
-
-- Thêm login/session/JWT hoặc cơ chế auth hiện có.
-- Thêm middleware kiểm tra role.
-- Các API phải enforce quyền:
-
-```text
-Issue user certificate        -> CA_OFFICER hoặc ADMIN
-Revoke certificate            -> CA_OFFICER hoặc ADMIN
-Create signing request        -> SIGNER
-Submit signed package         -> SIGNER
-Verify package                -> public hoặc VERIFIER, nhưng phải rate-limit
-View audit log                -> AUDITOR hoặc ADMIN
-Manage CA/TSA config          -> ADMIN
-```
-
-### Acceptance criteria
-
-- User chưa login không gọi được API issue/revoke cert.
-- User role `SIGNER` không revoke được cert.
-- User role `VERIFIER` không issue được cert.
-- API verify public nếu giữ public thì phải rate-limit.
-
-### Test cần thêm
-
-- `test_unauthenticated_cannot_issue_cert`
-- `test_signer_cannot_revoke_cert`
-- `test_ca_officer_can_issue_cert`
-- `test_auditor_can_read_audit_log`
-
----
-
-## 3. P0 — Thay PIN mặc định `123456` bằng Email OTP và TOTP
-
-### Vấn đề
-
-Không được dùng PIN mặc định như `123456` cho verification/MFA. Đây là shared secret dễ đoán, có thể bypass xác thực.
-
-### Thiết kế mới
-
-Dùng cả hai cơ chế nhưng chia vai trò rõ:
-
-```text
-Email OTP -> xác thực sự kiện ngắn hạn
-TOTP      -> MFA đăng nhập dài hạn bằng Authenticator app
-```
-
-### Email OTP dùng cho
-
-- Verify tài khoản sau đăng ký.
-- Reset password.
-- Đổi email.
-- Xác nhận thao tác nhạy cảm nếu user chưa bật TOTP.
-
-### TOTP dùng cho
-
-- MFA khi đăng nhập.
-- Xác nhận thao tác nhạy cảm nếu user đã bật MFA.
-
-### Database đề xuất
-
-```sql
-users
-----
 id
-email
-password_hash
-enabled
-account_non_locked
-login_attempts
-last_login
+email unique
+name
+role
+status
 created_at
 updated_at
 ```
 
-```sql
-email_otp_tokens
-----
-id
-user_id
-purpose              -- REGISTER, RESET_PASSWORD, CHANGE_EMAIL, SENSITIVE_ACTION
-otp_hash
-expires_at
-used_at
-attempt_count
-max_attempts
-created_at
-```
-
-```sql
-user_mfa_settings
-----
-id
-user_id
-type                 -- TOTP
-secret_encrypted
-enabled
-verified_at
-created_at
-updated_at
-last_used_at
-```
-
-```sql
-mfa_recovery_codes
-----
-id
-user_id
-code_hash
-used_at
-created_at
-```
-
-### Quy tắc Email OTP
-
-- OTP sinh bằng `SecureRandom`.
-- Không lưu OTP thô, chỉ lưu hash.
-- OTP hết hạn sau 5-10 phút.
-- Sai quá 5 lần thì khóa token.
-- Không log OTP.
-- Không trả OTP trong API response.
-- Resend phải có rate-limit.
-
-### Quy tắc TOTP
-
-- Secret riêng cho từng user.
-- QR code chỉ hiển thị trong setup lần đầu.
-- Không lưu QR image lâu dài trong public folder.
-- Secret phải được encrypt trước khi lưu DB.
-- Không log secret.
-- Có recovery codes.
-- Login chỉ cấp full access token sau khi pass TOTP.
-
-### API đề xuất
+Role hợp lệ:
 
 ```text
-POST /auth/register
-POST /auth/verify-email-otp
-POST /auth/login
-POST /auth/login/totp
-POST /auth/password-reset/request
-POST /auth/password-reset/confirm
-POST /auth/refresh-token
-
-POST /mfa/totp/setup
-POST /mfa/totp/verify-setup
-POST /mfa/totp/disable
-POST /mfa/recovery-codes/regenerate
+ADMIN
+CA_OFFICER
+SIGNER
+VERIFIER
+AUDITOR
 ```
 
-### Acceptance criteria
+Status:
 
-- Không còn hard-code PIN `123456` trong code production.
-- OTP mỗi lần request là khác nhau.
-- OTP hết hạn và không dùng lại được.
-- TOTP QR chỉ hiển thị khi setup.
-- Login với user bật MFA phải trả `mfaRequired=true`, chưa cấp access token đầy đủ.
+```text
+active
+disabled
+```
 
-### Test cần thêm
+## 1.3. Login bằng email OTP
 
-- `test_no_default_pin_123456_in_auth_flow`
-- `test_email_otp_expires`
-- `test_email_otp_cannot_be_reused`
-- `test_email_otp_attempt_limit`
-- `test_totp_setup_requires_valid_code`
-- `test_login_requires_totp_when_mfa_enabled`
-- `test_invalid_totp_does_not_issue_access_token`
+Thay login demo bằng login OTP.
+
+### Request login OTP
+
+```http
+POST /api/auth/login/request-otp
+```
+
+Body:
+
+```json
+{
+  "email": "student1@example.com"
+}
+```
+
+Backend:
+
+* kiểm tra user tồn tại trong DB
+* kiểm tra user active
+* tạo OTP purpose `LOGIN`
+* hash OTP bằng HMAC-SHA256 + `SECUREDOC_OTP_PEPPER`
+* gửi OTP đến `user.email`
+* không trả OTP plaintext
+
+### Verify login OTP
+
+```http
+POST /api/auth/login/verify-otp
+```
+
+Body:
+
+```json
+{
+  "email": "student1@example.com",
+  "otp": "123456"
+}
+```
+
+Backend:
+
+* verify OTP
+* kiểm tra expiry
+* kiểm tra attempt_count
+* kiểm tra used_at
+* nếu hợp lệ thì cấp JWT
+
+Response:
+
+```json
+{
+  "accessToken": "...",
+  "tokenType": "Bearer",
+  "expiresIn": 3600,
+  "user": {
+    "email": "student1@example.com",
+    "name": "Student 1",
+    "role": "SIGNER"
+  }
+}
+```
+
+Role lấy từ DB, không lấy từ request body.
+
+## 1.4. JWT/RBAC
+
+JWT payload:
+
+```json
+{
+  "sub": "student1@example.com",
+  "role": "SIGNER",
+  "iat": 1234567890,
+  "exp": 1234571490,
+  "typ": "securedoc-access"
+}
+```
+
+`require_roles()` phải:
+
+* đọc `Authorization: Bearer <JWT>`
+* verify signature bằng `SECUREDOC_JWT_SECRET`
+* check `exp`
+* lấy user/role từ token
+* check role ở backend
+* reject fake token
+* reject expired token
+* reject raw header auth nếu `ENABLE_DEMO_HEADER_AUTH=false`
+
+`.env.example`:
+
+```env
+SECUREDOC_JWT_SECRET=change-me-long-random-jwt-secret
+SECUREDOC_JWT_TTL_SECONDS=3600
+ENABLE_DEMO_HEADER_AUTH=false
+```
+
+## 1.5. Role rules
+
+### SIGNER
+
+Được:
+
+* xem certificate của mình
+* xem signing request của mình
+* setup TOTP của mình
+* request signing OTP của mình
+* confirm signing request của mình
+* ký tài liệu của mình
+* submit signed package của mình
+
+Không được:
+
+* issue certificate
+* revoke certificate
+* xem audit log
+* ký bằng certificate của email khác
+
+### CA_OFFICER
+
+Được:
+
+* issue certificate cho user
+* revoke certificate
+* xem danh sách certificate
+
+Không được:
+
+* ký thay signer
+* confirm signing request thay signer
+
+### VERIFIER
+
+Được:
+
+* verify tài liệu/signed package
+* xem verification report
+
+Không được:
+
+* thay đổi certificate
+* ký tài liệu
+* xem audit nội bộ nếu không có quyền
+
+### AUDITOR
+
+Được:
+
+* xem audit log
+* verify audit chain
+* export audit report
+
+Không được:
+
+* ký tài liệu
+* cấp certificate
+* thu hồi certificate
+
+### ADMIN
+
+Được:
+
+* quản lý user
+* phân role
+* disable user
+* cấu hình hệ thống
+
+## 1.6. TOTP/MFA
+
+Endpoint:
+
+```http
+POST /api/auth/totp/setup
+POST /api/auth/totp/verify-setup
+```
+
+Quy tắc:
+
+* chỉ authenticated `SIGNER` được setup
+* setup cho chính actor email
+* verify setup chỉ nhận `{ "code": "123456" }`
+* không nhận secret từ client
+* không lưu secret plaintext/base64 nếu claim encrypted
+* response setup có `Cache-Control: no-store`
+* nếu MFA đã enabled thì không reset bằng setup thường nếu không có re-auth
+
+## 1.7. Signing OTP
+
+Signing OTP dùng cho xác nhận ý chí ký.
+
+OTP phải bind với:
+
+```text
+requestId
+documentHash
+certificateSerial
+signingPurpose
+nonce
+```
+
+Quy tắc:
+
+* gửi đến `signing_request.signer_email`
+* không trả OTP plaintext
+* có resend cooldown
+* tạo OTP mới thì revoke/expire OTP cũ
+* submit khi chưa confirm OTP/TOTP phải fail
+* confirm xong mới submit được
+
+## 1.8. API cần có
+
+```text
+POST /api/auth/login/request-otp
+POST /api/auth/login/verify-otp
+GET  /api/me
+
+GET  /api/my/certificates
+GET  /api/my/signing-requests
+GET  /api/my/signing-requests/{id}
+
+POST /api/sign/v2/prepare
+POST /api/v2/signing-requests/{id}/otp/request
+POST /api/v2/signing-requests/{id}/confirm
+POST /api/sign/v2/submit
+
+POST /api/certificates/x509/issue
+POST /api/certificates/revoke/v2
+
+POST /api/verify/v2
+
+GET /api/audit/logs
+GET /api/audit/verify-chain
+```
+
+## 1.9. Tests
+
+* login OTP request với user tồn tại thành công
+* login OTP request với user không tồn tại fail
+* OTP đúng trả JWT đúng role
+* OTP sai fail
+* fake JWT fail 401
+* expired JWT fail 401
+* raw `X-SecureDoc-*` header fail
+* SIGNER không gọi được CA endpoint
+* CA_OFFICER issue cert được
+* SIGNER không dùng cert người khác
+* SIGNER chỉ xem signing request của mình
+* signing OTP gửi đúng `signing_request.signer_email`
+* SMTP trống không trả OTP plaintext
+* submit chưa confirm fail
+* confirm rồi submit pass
+* OTP cooldown hoạt động
+* OTP cũ bị revoke
+* TOTP setup cần auth
+* TOTP verify setup không nhận `secret`
 
 ---
 
-## 4. P0 — Key custody cho CA/TSA/private keys
+# PHASE 2 — Certificate Authority, X.509, Chain of Trust
 
-### Vấn đề
+## Mục tiêu
 
-CA/TSA private key đang được ghi local plaintext hoặc dùng `NoEncryption()`. Đây là không phù hợp với hệ thống thực tế.
+Chuẩn hóa phần chứng thư số. Thay mô hình certificate tự thiết kế bằng mô hình gần chuẩn X.509 hơn.
 
-### Nguyên tắc
+## 2.1. CA hierarchy
 
-```text
-Root CA key          -> offline, không dùng trực tiếp hằng ngày
-Intermediate CA key  -> dùng để issue/revoke cert
-TSA key              -> chỉ dùng để ký timestamp token
-Signer private key   -> thuộc người ký, không thuộc backend
-```
-
-### Việc cần sửa ngắn hạn
-
-Nếu chưa tích hợp HSM/KMS ngay:
-
-- Encrypt private key at rest bằng passphrase hoặc master key từ env/secret manager.
-- Set file permission chặt, ví dụ `0600`.
-- Không commit private key vào repo.
-- Không ghi key vào thư mục source code.
-- Tách thư mục runtime secrets khỏi backend app.
-- Thêm `.gitignore` cho key/cert runtime.
-
-### Việc cần sửa dài hạn
-
-- Tích hợp HSM/KMS/USB token/smart card hoặc remote signing service.
-- Root CA offline.
-- Intermediate CA riêng.
-- Có key rotation.
-- Có backup/key ceremony.
-- Có audit cho mọi lần dùng CA/TSA key.
-
-### Acceptance criteria
-
-- Không có private key plaintext trong repo.
-- Runtime key không được tạo trong source tree.
-- CA/TSA private key không dùng `NoEncryption()` trong mode non-demo.
-- Có warning/block nếu chạy production mà key plaintext.
-
-### Test cần thêm
-
-- `test_ca_private_key_not_written_plaintext_in_production_mode`
-- `test_tsa_private_key_not_written_plaintext_in_production_mode`
-- `test_runtime_secret_paths_are_outside_source_tree`
-
----
-
-## 5. P1 — X.509 chain validation theo RFC 5280
-
-### Vấn đề
-
-Chain verify tự viết thường không đủ chuẩn. Không chỉ kiểm chữ ký cert này bởi cert kia, mà còn phải path validation đầy đủ.
-
-### Cần kiểm đầy đủ
+Tách:
 
 ```text
-- Trust anchor đúng
-- BasicConstraints
-- KeyUsage
-- ExtendedKeyUsage
-- CertificatePolicies
-- SubjectKeyIdentifier
-- AuthorityKeyIdentifier
-- CRLDistributionPoints
-- AuthorityInformationAccess
-- pathLenConstraint
-- notBefore/notAfter của toàn bộ chain
-- signature algorithm của cert
-- serial number đủ entropy
+Root CA
+Intermediate CA
+End-user signing certificate
+TSA certificate
 ```
 
-### Extension policy đề xuất
+Root CA nên offline về mặt thiết kế.
 
-CA certificate:
+Intermediate CA dùng để issue certificate cho signer.
+
+TSA certificate dùng riêng cho timestamp.
+
+## 2.2. Certificate profiles
+
+### Root CA
+
+Extensions:
 
 ```text
 BasicConstraints: CA=true
 KeyUsage: keyCertSign, cRLSign
+SubjectKeyIdentifier
 ```
 
-User signing certificate:
+### Intermediate CA
+
+Extensions:
+
+```text
+BasicConstraints: CA=true, pathLen phù hợp
+KeyUsage: keyCertSign, cRLSign
+SubjectKeyIdentifier
+AuthorityKeyIdentifier
+CRLDistributionPoints nếu có
+AuthorityInfoAccess nếu có
+```
+
+### Signer certificate
+
+Extensions:
 
 ```text
 BasicConstraints: CA=false
-KeyUsage: digitalSignature hoặc nonRepudiation/contentCommitment
-ExtendedKeyUsage: documentSigning hoặc custom policy OID
+KeyUsage: digitalSignature
+ExtendedKeyUsage nếu cần
+Subject email/name
+SubjectKeyIdentifier
+AuthorityKeyIdentifier
+CertificatePolicies nếu có
 ```
 
-TSA certificate:
+### TSA certificate
+
+Extensions:
 
 ```text
 BasicConstraints: CA=false
 KeyUsage: digitalSignature
 ExtendedKeyUsage: timeStamping
+SubjectKeyIdentifier
+AuthorityKeyIdentifier
 ```
 
-### Việc cần sửa
+## 2.3. Certificate lifecycle
 
-- Không tự viết path validation nếu có thể tránh.
-- Tích hợp thư viện validator chuẩn hoặc gọi OpenSSL/certvalidator.
-- Nếu vẫn giữ validator nội bộ, phải có test phủ đủ các case âm tính.
-
-### Acceptance criteria
-
-- Cert user hết hạn -> verify fail.
-- Cert CA thiếu `keyCertSign` -> chain fail.
-- TSA cert thiếu EKU `timeStamping` -> timestamp fail.
-- Chain thiếu intermediate -> fail, trừ khi intermediate được nhúng/tìm qua AIA.
-- Cert not-yet-valid -> fail.
-
-### Test cần thêm
-
-- `test_chain_rejects_expired_user_cert`
-- `test_chain_rejects_not_yet_valid_cert`
-- `test_chain_rejects_ca_without_key_cert_sign`
-- `test_chain_rejects_wrong_eku_for_tsa`
-- `test_chain_rejects_missing_intermediate`
-
----
-
-## 6. P1 — Certificate issuance phải có identity proofing và proof-of-possession
-
-### Vấn đề
-
-CA không được issue cert chỉ vì client gửi public key. Cần chứng minh người yêu cầu thật sự sở hữu private key tương ứng và subject trong cert khớp identity đã xác thực.
-
-### Việc cần sửa
-
-- User phải login trước khi request certificate.
-- User phải verify email/identity trước khi được cấp cert.
-- Client phải chứng minh proof-of-possession:
-  - server gửi challenge;
-  - client ký challenge bằng private key;
-  - server verify bằng public key trong CSR/request.
-- Subject/SubjectAltName trong cert lấy từ user identity đã xác thực, không tin hoàn toàn input client.
-- CA officer/admin approve nếu hệ thống mô phỏng CA thực tế.
-
-### Acceptance criteria
-
-- Không issue cert cho anonymous user.
-- Không issue cert nếu proof-of-possession fail.
-- Không cho client tự set subject tùy ý để mạo danh người khác.
-
-### Test cần thêm
-
-- `test_cert_issue_requires_authenticated_user`
-- `test_cert_issue_requires_proof_of_possession`
-- `test_cert_subject_bound_to_verified_user_identity`
-
----
-
-## 7. P1 — Thay demo timestamp JSON bằng RFC 3161 TimeStampToken
-
-### Vấn đề
-
-Timestamp hiện tại dạng JSON tự ký không phải RFC 3161 TSA. Timestamp chuẩn cần `TimeStampToken` dạng CMS SignedData.
-
-### Yêu cầu tối thiểu
-
-- Request có `messageImprint` gồm:
-  - hash algorithm;
-  - hashed message.
-- Response có TimeStampToken dạng CMS SignedData.
-- TSTInfo chứa đúng messageImprint.
-- Nếu request có nonce, response phải có đúng nonce.
-- TSA certificate phải có EKU `timeStamping`.
-- Verify timestamp phải kiểm chữ ký TSA và chain TSA.
-
-### Việc cần sửa
-
-- Tách interface timestamp:
-
-```python
-class TimestampProvider:
-    def request_timestamp(self, digest: bytes, hash_alg: str, nonce: bytes | None) -> bytes:
-        ...
-
-class DemoJsonTimestampProvider(TimestampProvider):
-    ...
-
-class Rfc3161TimestampProvider(TimestampProvider):
-    ...
-```
-
-- Mode demo có thể dùng JSON provider, nhưng mode chuẩn phải dùng RFC 3161.
-- Response verify phải có `timestampValid` riêng.
-
-### Acceptance criteria
-
-- Timestamp token không còn là JSON trong mode chuẩn.
-- Verify fail nếu message imprint mismatch.
-- Verify fail nếu nonce mismatch.
-- Verify fail nếu TSA cert thiếu EKU `timeStamping`.
-
-### Test cần thêm
-
-- `test_rfc3161_timestamp_imprint_mismatch_fails`
-- `test_rfc3161_timestamp_nonce_mismatch_fails`
-- `test_rfc3161_timestamp_requires_tsa_eku`
-
----
-
-## 8. P1/P2 — PDF signing chuyển từ visual stamp sang PAdES
-
-### Vấn đề
-
-PDF stamp/preview chỉ là hiển thị trực quan, không phải chữ ký số PDF thật. Nếu mục tiêu là ký PDF thực tế, cần PAdES.
-
-### Mục tiêu theo giai đoạn
+CA Officer quản lý:
 
 ```text
-Stage 1: PAdES-B-B
-Stage 2: PAdES-B-T
-Stage 3: PAdES-B-LT
-Stage 4: PAdES-B-LTA
+issue certificate
+renew certificate
+revoke certificate
+view certificate status
 ```
 
-### Yêu cầu kỹ thuật PDF signing
-
-- PDF Signature Dictionary.
-- `ByteRange` đúng.
-- `Contents` chứa CMS/CAdES detached signature.
-- `SubFilter` phù hợp.
-- Signed attributes tối thiểu:
-  - content-type;
-  - message-digest;
-  - signing-certificate-v2.
-- PAdES-B-T: thêm RFC 3161 timestamp.
-- PAdES-B-LT: nhúng cert chain + OCSP/CRL vào DSS/VRI.
-- PAdES-B-LTA: thêm document timestamp cho long-term archival.
-
-### Việc cần sửa
-
-- Giữ visual stamp như phần hiển thị phụ, không coi là chữ ký.
-- Thêm module PDF signer chuẩn, ưu tiên dùng thư viện có hỗ trợ PAdES.
-- Verify PDF phải dựa trên ByteRange/CMS, không dựa trên preview stamp.
-
-### Acceptance criteria
-
-- File PDF ký xong được PDF viewer/validator nhận diện là có chữ ký số.
-- Sửa 1 byte trong signed ByteRange -> verify fail.
-- Visual stamp bị xóa/sửa không được coi là verify chữ ký nếu cryptographic signature còn/không còn tương ứng.
-
-### Test cần thêm
-
-- `test_pdf_signature_byterange_tamper_fails`
-- `test_pdf_signature_content_tamper_fails`
-- `test_pdf_signature_has_cms_contents`
-- `test_pdf_pades_bt_contains_timestamp`
-
----
-
-## 9. P1 — Verify result phải tách nhiều trạng thái
-
-### Vấn đề
-
-Một package có thể đúng về mật mã nhưng chưa từng được SecureDoc submit/accept. Không nên trả chung một field `valid` gây hiểu nhầm.
-
-### Response model đề xuất
-
-```json
-{
-  "cryptoValid": true,
-  "documentHashValid": true,
-  "signatureValid": true,
-  "trustedChainValid": true,
-  "revocationValid": true,
-  "timestampValid": true,
-  "serverAccepted": false,
-  "legalReady": false,
-  "warnings": [
-    "Package is cryptographically valid but was not submitted to SecureDoc"
-  ]
-}
-```
-
-### Ý nghĩa
+Certificate status:
 
 ```text
-cryptoValid       : chữ ký/hash đúng
-trustedChainValid : chain từ signer cert lên trust anchor hợp lệ
-revocationValid   : cert chưa bị revoke tại thời điểm ký
- timestampValid   : timestamp token hợp lệ
-serverAccepted    : package/requestId/nonce tồn tại trong hệ thống
-legalReady         : chỉ true khi đủ policy pháp lý/kỹ thuật đã định nghĩa
+active
+revoked
+expired
+superseded
 ```
 
-### Acceptance criteria
+## 2.4. Chain validation
 
-- Package offline hợp lệ nhưng nonce chưa từng submit -> `cryptoValid=true`, `serverAccepted=false`.
-- Package submit qua SecureDoc đúng luồng -> `serverAccepted=true`.
-- UI phải hiển thị khác nhau giữa “cryptographically valid” và “accepted by SecureDoc”.
+Verify module phải check:
 
-### Test cần thêm
+* parse certificate
+* signature chain
+* validity period
+* issuer/subject
+* BasicConstraints
+* KeyUsage
+* EKU
+* SKI/AKI nếu có
+* trusted root
+* revocation status
 
-- `test_offline_valid_package_is_not_server_accepted`
-- `test_submitted_package_is_server_accepted`
-- `test_ui_distinguishes_crypto_valid_from_server_accepted`
+## 2.5. Revocation
 
----
-
-## 10. P1 — Revocation theo thời điểm ký
-
-### Vấn đề
-
-Không chỉ kiểm cert hiện tại có revoked không. Cần kiểm cert có hợp lệ tại thời điểm ký đã được timestamp không.
-
-### Trường hợp cần xử lý
+Có thể bắt đầu với DB revocation, nhưng thiết kế phải hướng đến:
 
 ```text
-Cert bị revoke sau thời điểm ký hợp lệ  -> chữ ký cũ có thể vẫn trusted
-Cert bị revoke trước thời điểm ký       -> chữ ký không trusted
-Không có trusted timestamp              -> khó chứng minh thời điểm ký
+CRL
+OCSP
+AIA
+CRL Distribution Points
 ```
 
-### Việc cần sửa
+Nếu có trusted timestamp, revocation nên được xác minh theo thời điểm ký.
 
-- Verify revocation theo `signingTime` hoặc trusted RFC3161 timestamp.
-- Lưu hoặc nhúng OCSP/CRL evidence.
-- Với PAdES-LT, đưa OCSP/CRL vào DSS/VRI.
+Nếu chưa có trusted timestamp, xác minh theo thời điểm hiện tại và cảnh báo rõ.
 
-### Acceptance criteria
+## 2.6. Tests
 
-- Cert revoked after timestamp -> old signature vẫn có thể valid nếu policy cho phép.
-- Cert revoked before timestamp -> verify fail.
-- Không có timestamp -> không được kết luận long-term trusted.
-
-### Test cần thêm
-
-- `test_signature_valid_when_cert_revoked_after_signing_time`
-- `test_signature_invalid_when_cert_revoked_before_signing_time`
-- `test_no_timestamp_cannot_claim_ltv_ready`
+* cert expired fail
+* cert not-yet-valid fail
+* CA thiếu `keyCertSign` fail
+* signer cert có `CA=true` fail
+* signer cert thiếu `digitalSignature` fail
+* TSA thiếu EKU `timeStamping` fail
+* wrong issuer fail
+* revoked cert fail
+* unknown root fail
+* broken chain fail
 
 ---
 
-## 11. P1 — Canonical payload và signature binding
+# PHASE 3 — Core Digital Signature Mechanism & Signing Protocol
 
-### Vấn đề
+## Mục tiêu
 
-Ký đúng thuật toán chưa đủ. Payload được ký phải bind đầy đủ tài liệu, người ký, thuật toán, cert, nonce và signing intent. Nếu không có thể bị mix-and-match hoặc signature substitution.
+Chuẩn hóa cơ chế tạo chữ ký số và giao thức ký. Đây là phần lõi của hệ thống.
 
-### Payload đề xuất
+## 3.1. Client-side signing
 
-```json
-{
-  "schemaVersion": "SecureDoc-Signature-v2",
-  "documentHash": "...",
-  "hashAlgorithm": "SHA-256",
-  "signatureAlgorithm": "RSA-PSS-SHA256",
-  "documentId": "...",
-  "fileName": "...",
-  "mimeType": "application/pdf",
-  "signerCertSerial": "...",
-  "signerCertFingerprint": "...",
-  "issuedAt": "...",
-  "nonce": "...",
-  "signingIntent": "I approve and sign this document"
-}
-```
+Nguyên tắc:
 
-### Việc cần sửa
+* private key không gửi lên backend
+* backend không ký thay user
+* browser/client ký canonical payload
+* backend chỉ verify signed package
 
-- Canonicalization phải deterministic tuyệt đối.
-- Verify phải reject nếu thiếu field bắt buộc.
-- Verify phải reject nếu algorithm metadata khác algorithm thực tế.
-- Bind signature với cert fingerprint/serial.
-- Bind signature với document hash và nonce/requestId.
-
-### Acceptance criteria
-
-- Đổi `documentHash` -> verify fail.
-- Đổi `signerCertFingerprint` -> verify fail.
-- Đổi `signatureAlgorithm` -> verify fail.
-- Thiếu `schemaVersion` hoặc field bắt buộc -> verify fail.
-
-### Test cần thêm
-
-- `test_payload_tamper_document_hash_fails`
-- `test_payload_tamper_signer_cert_fails`
-- `test_payload_algorithm_confusion_fails`
-- `test_payload_missing_required_field_fails`
-
----
-
-## 12. P1 — Algorithm allowlist và downgrade protection
-
-### Vấn đề
-
-Hệ thống phải reject thuật toán yếu hoặc không được policy cho phép. Không được để client tự khai algorithm rồi backend tin theo.
-
-### Policy đề xuất
-
-Allowed:
+Ưu tiên:
 
 ```text
-Hash: SHA-256, SHA-384, SHA-512
-Signature: RSA-PSS-SHA256/SHA384/SHA512, ECDSA-SHA256/SHA384, Ed25519 nếu hỗ trợ đầy đủ
-RSA key size: >= 3072 cho mức ~128-bit security dài hạn hơn
+WebCrypto non-extractable key
 ```
 
-Rejected:
+Nếu vẫn export private key để demo/local thì phải ghi rõ không production-ready.
+
+## 3.2. Signing payload
+
+Signing payload phải có:
+
+```text
+schemaVersion
+documentName
+documentHash
+hashAlgorithm
+signatureAlgorithm
+signerEmail
+signerName
+certificateSerialNumber
+certificateFingerprint
+signingPurpose
+signingIntent
+requestId
+nonce
+createdAt
+expiresAt
+```
+
+## 3.3. Canonicalization
+
+Payload phải canonical hóa trước khi ký.
+
+Yêu cầu:
+
+* deterministic JSON
+* sorted keys
+* UTF-8
+* không ký object tùy ý chưa chuẩn hóa
+* không cho field bị thêm/sửa sau ký mà vẫn pass
+
+## 3.4. Algorithm policy
+
+Allow:
+
+```text
+SHA-256
+SHA-384
+SHA-512
+RSA-PSS
+ECDSA nếu triển khai
+```
+
+Reject:
 
 ```text
 MD5
 SHA-1
-RSA < 2048
-RSA-PKCS1-v1_5 nếu policy chỉ cho PSS
+none
 unknown algorithm
-algorithm mismatch giữa metadata và signature object
+algorithm downgrade
 ```
 
-### Acceptance criteria
+RSA-PSS phải kiểm soát:
 
-- Reject SHA-1/MD5.
-- Reject RSA key quá ngắn.
-- Reject algorithm không nằm trong allowlist.
-- Verify không bị algorithm confusion.
+```text
+hash
+MGF1 hash
+salt length
+```
 
-### Test cần thêm
+## 3.5. Signing request protocol
 
-- `test_rejects_md5_digest`
-- `test_rejects_sha1_digest`
-- `test_rejects_small_rsa_key`
-- `test_rejects_unknown_signature_algorithm`
+Flow:
+
+```text
+1. SIGNER chọn document.
+2. Client hash document.
+3. Client gọi prepare signing request.
+4. Backend tạo requestId + nonce + payload.
+5. User confirm bằng OTP/TOTP.
+6. Client ký canonical payload.
+7. Client submit signed package.
+8. Backend verify.
+9. Backend mark accepted/rejected.
+```
+
+## 3.6. Verify response
+
+Verify response phải tách rõ:
+
+```text
+cryptoValid
+documentHashValid
+trustedChainValid
+revocationValid
+timestampValid
+serverAccepted
+signingRequestConfirmed
+legalReady
+warnings
+errors
+verificationSteps
+```
+
+## 3.7. Tests
+
+* document sửa 1 byte fail
+* payload sửa 1 field fail
+* nonce mismatch fail
+* requestId mismatch fail
+* cert fingerprint mismatch fail
+* algorithm downgrade fail
+* SHA-1 fail
+* MD5 fail
+* signed package crypto valid nhưng chain fail report đúng
+* chưa confirm OTP/TOTP thì submit fail
+* confirmed rồi submit pass
 
 ---
 
-## 13. P1/P2 — Blind signature chỉ được coi là demo nếu chưa chuẩn hóa
+# PHASE 4 — Digital Signature Services
 
-### Vấn đề
+## Mục tiêu
 
-Textbook RSA blind signature bằng raw modular exponentiation trên hash không nên gọi là production blind signature.
+Xây hệ thống thành một dịch vụ ký số hoàn chỉnh thay vì chỉ là API ký/xác minh rời rạc.
 
-### Việc cần sửa
+## 4.1. Signing service
 
-- Đổi tên module/route nếu vẫn demo:
+Chức năng:
+
+* tạo signing request
+* gán signer
+* theo dõi trạng thái
+* gửi OTP
+* confirm intent
+* nhận signed package
+* verify
+* lưu kết quả
+
+Trạng thái signing request:
 
 ```text
-/api/demo/blind-signature/...
+draft
+pending
+mfa_confirmed
+signed
+rejected
+expired
+cancelled
 ```
 
-- Gắn warning rõ:
+## 4.2. Verification service
 
-```text
-This is a textbook RSA blind signature demo, not production-safe.
-```
+Chức năng:
 
-- Nếu muốn nâng cấp:
-  - dùng scheme chuẩn hơn như RSA-FDH blind signature;
-  - domain separation;
-  - rate limit;
-  - anti-abuse;
-  - không expose blinding factor/token nhạy cảm;
-  - kiểm thử unlinkability ở mức demo;
-  - chống dùng service làm signing oracle.
+* verify package
+* verify document hash
+* verify certificate chain
+* verify revocation
+* verify timestamp
+* xuất verification report
 
-### Acceptance criteria
+## 4.3. Certificate service
 
-- Documentation không gọi blind signature hiện tại là production-ready.
-- Route demo không enabled trong production mode.
-- Không trả blinding factor/token nhạy cảm nếu không cần thiết.
+Chức năng:
 
-### Test cần thêm
+* issue certificate
+* revoke certificate
+* renew certificate
+* list certificate
+* check certificate status
 
-- `test_blind_signature_demo_disabled_in_production`
-- `test_blind_signature_rate_limited`
-- `test_blind_signature_response_does_not_expose_sensitive_blinding_factor`
+## 4.4. User service
+
+Chức năng:
+
+* tạo user
+* phân role
+* disable user
+* xem user profile
+* quản lý MFA
+
+## 4.5. Audit service
+
+Chức năng:
+
+* ghi event
+* xem audit log
+* verify audit chain
+* export audit report
+
+## 4.6. Tests
+
+* signer xem được request của mình
+* signer không xem được request người khác
+* CA officer issue/revoke được
+* verifier verify được
+* auditor xem audit được
+* signer không xem audit được
+* audit event được tạo khi issue/revoke/sign/verify
 
 ---
 
-## 14. P1/P2 — Audit log append-only
+# PHASE 5 — Timestamp, RFC 3161, Long-Term Validation Foundation
 
-### Vấn đề
+## Mục tiêu
 
-Hệ chữ ký số cần audit có khả năng truy vết. Log thường có thể bị sửa/xóa, không đủ.
+Bổ sung timestamp đáng tin cậy để chứng minh thời điểm ký.
 
-### Event cần log
+## 5.1. Timestamp abstraction
+
+Tạo abstraction:
 
 ```text
-- user login/logout
-- MFA enabled/disabled
-- certificate issued
-- certificate revoked
-- signing request created
-- document signed
-- package submitted
-- package verified
-- timestamp requested
-- admin action
-- failed security checks
+TimestampProvider
+TimestampToken
+TimestampVerifier
 ```
 
-### Thiết kế đề xuất
+Nếu chưa tích hợp TSA thật, phải ghi rõ:
 
-```sql
-audit_events
-----
+```text
+timestamp abstraction only
+not RFC3161 production-ready
+```
+
+## 5.2. RFC 3161 direction
+
+Thiết kế hướng đến:
+
+```text
+TimeStampReq
+TimeStampResp
+messageImprint
+TSTInfo
+TSA certificate
+CMS SignedData
+```
+
+Timestamp token phải bind với document/signature imprint.
+
+## 5.3. Timestamp verify
+
+Verify:
+
+* timestamp token signature
+* TSA certificate chain
+* TSA EKU timeStamping
+* message imprint
+* timestamp time
+* timestamp token integrity
+
+## 5.4. Revocation by signing time
+
+Nếu có trusted timestamp:
+
+```text
+certificate validity/revocation nên xét tại signing time
+```
+
+Nếu không có trusted timestamp:
+
+```text
+verify theo current time và cảnh báo legalReady=false
+```
+
+## 5.5. Tests
+
+* timestamp imprint mismatch fail
+* TSA cert thiếu EKU fail
+* timestamp token bị sửa fail
+* expired signer cert nhưng valid tại signing time được xử lý đúng
+* revoked sau signing time được xử lý đúng nếu timestamp trusted
+* timestamp missing thì legalReady=false
+
+---
+
+# PHASE 6 — PDF Signing & PAdES
+
+## Mục tiêu
+
+Nâng từ signed JSON package sang ký PDF gần chuẩn PAdES.
+
+## 6.1. PAdES baseline
+
+Hướng tới:
+
+```text
+PAdES-B-B
+PAdES-B-T
+PAdES-B-LT
+PAdES-B-LTA
+```
+
+Triển khai trước PAdES-B-T nếu đủ thời gian.
+
+## 6.2. PDF signature structure
+
+Cần có:
+
+```text
+PDF Signature Dictionary
+ByteRange
+Contents
+SubFilter
+detached CMS signature
+signer certificate chain
+timestamp token
+```
+
+## 6.3. Detached signature
+
+Không ký toàn bộ PDF sau khi chèn signature placeholder sai cách.
+
+Phải ký đúng byte ranges.
+
+## 6.4. PAdES-B-T
+
+Bổ sung timestamp token cho signature.
+
+## 6.5. LTV direction
+
+Về sau bổ sung:
+
+```text
+DSS
+VRI
+OCSP/CRL embedded
+document timestamp
+```
+
+## 6.6. Tests
+
+* sửa PDF 1 byte sau ký fail
+* ByteRange sai fail
+* CMS signature sai fail
+* thiếu certificate chain warning/fail tùy policy
+* timestamp imprint mismatch fail
+* revoked cert reflect đúng trong report
+
+---
+
+# PHASE 7 — Blind Signature Module
+
+## Mục tiêu
+
+Bổ sung chữ ký mù như module privacy riêng. Không dùng chữ ký mù để thay thế chữ ký tài liệu thông thường.
+
+## 7.1. Vị trí trong hệ thống
+
+Chữ ký mù là module riêng:
+
+```text
+Privacy Token Service
+Blind Signature Service
+```
+
+Không nằm trong document signing flow chính.
+
+Document signing cần định danh người ký.
+
+Blind signature phục vụ:
+
+```text
+anonymous approval token
+privacy-preserving access token
+survey/e-voting style token
+anonymous receipt
+```
+
+## 7.2. Nguyên tắc bảo mật
+
+* Blind signer key riêng.
+* Không dùng CA key.
+* Không dùng TSA key.
+* Không expose blinding factor.
+* Không log dữ liệu phá unlinkability.
+* Có rate limit.
+* Có purpose/domain separation.
+* Có double-spend protection.
+
+## 7.3. Blind token payload
+
+Payload trước khi blind:
+
+```text
+schemaVersion
+purpose
+tokenId
+nonce
+issuedFor
+expiresAt
+domainSeparator
+```
+
+Ví dụ:
+
+```text
+SecureDoc-BlindSignature-v1:anonymous_approval
+SecureDoc-BlindSignature-v1:access_token
+```
+
+## 7.4. Protocol
+
+Flow:
+
+```text
+1. Client tạo token payload.
+2. Client blind payload.
+3. Client gửi blinded message lên server.
+4. Server kiểm tra user có quyền request token.
+5. Server ký blinded message.
+6. Client unblind signature.
+7. Client nhận blind-signed token.
+8. Client redeem token khi cần.
+9. Server verify signature và chống double-spend.
+```
+
+## 7.5. Blind token storage
+
+Bảng:
+
+```text
+blind_signature_sessions
+blind_tokens
+```
+
+Fields:
+
+```text
 id
-actor_user_id
-action
-resource_type
-resource_id
-request_id
-ip_address
-user_agent
+token_id
+purpose
+requester_email
+blinded_message_hash
+signed_blind_message
+final_token_hash
+status
 created_at
-previous_event_hash
-event_hash
+expires_at
+redeemed_at
 ```
 
-Trong đó:
+Nếu lưu `requester_email`, phải ghi rõ hệ thống chỉ đạt privacy-limited unlinkability.
+
+Nếu muốn unlinkability mạnh hơn, redemption path không được nối trực tiếp final token với requester.
+
+## 7.6. Redeem/double-spend protection
+
+Khi redeem:
+
+* verify blind signature
+* check token purpose
+* check expiry
+* check final_token_hash chưa dùng
+* mark redeemed
+* reject token dùng lại
+
+## 7.7. Frontend
+
+Tạo page riêng:
 
 ```text
-event_hash = SHA256(canonical_event_without_hash + previous_event_hash)
+/privacy-tokens
 ```
 
-### Acceptance criteria
+Chức năng:
 
-- Mỗi event có hash.
-- Event sau chứa hash của event trước.
-- Không có API update/delete audit event thông thường.
-- Auditor/Admin xem được audit theo quyền.
+* request blind token
+* unblind token
+* redeem token
+* verify token
+* hiển thị limitation
 
-### Test cần thêm
+Không đưa vào flow ký tài liệu chính.
 
-- `test_audit_event_hash_chain_valid`
-- `test_audit_event_cannot_be_modified_by_normal_api`
-- `test_security_actions_create_audit_events`
+## 7.8. Tests
 
----
-
-## 15. P2 — Secure document storage
-
-### Vấn đề
-
-SecureDoc không chỉ cần chữ ký. File tài liệu cũng phải được bảo vệ.
-
-### Việc cần sửa
-
-- Lưu file theo content hash hoặc object ID, không dùng raw filename.
-- Chống path traversal.
-- Kiểm MIME type thật, không chỉ extension.
-- Giới hạn kích thước upload.
-- Quét malware nếu mô phỏng hệ thực tế.
-- Mã hóa at rest nếu lưu tài liệu nhạy cảm.
-- Per-document ACL: owner, signer, viewer, admin.
-- Không cho overwrite file đã ký; dùng versioning/immutable object.
-
-### Acceptance criteria
-
-- Upload `../../evil.py` không ghi ra ngoài thư mục storage.
-- File `.pdf` giả nhưng MIME không hợp lệ bị reject.
-- User A không đọc được document private của User B.
-- File đã ký không bị overwrite; nếu update thì tạo version mới.
-
-### Test cần thêm
-
-- `test_upload_rejects_path_traversal_filename`
-- `test_upload_rejects_invalid_mime`
-- `test_document_acl_blocks_other_user`
-- `test_signed_document_is_immutable`
+* request blind token thành công
+* user không có quyền request purpose bị reject
+* thiếu domain separator bị reject
+* token hết hạn redeem fail
+* redeem 2 lần fail
+* token payload bị sửa fail
+* signature verify fail nếu dùng sai public key
+* server không trả blinding factor
+* rate limit hoạt động
+* blind signer key khác CA key
+* blind signer key khác TSA key
 
 ---
 
-## 16. P2 — Frontend/browser signing hardening
+# PHASE 8 — Storage, Audit, Key Custody
 
-### Vấn đề
+## Mục tiêu
 
-Browser signing tốt hơn gửi private key lên server, nhưng vẫn có rủi ro XSS, dependency độc, localStorage leak.
+Hardening hệ thống để gần sản phẩm vận hành.
 
-### Việc cần sửa
+## 8.1. Document storage
 
-- Không lưu private key plaintext trong localStorage/sessionStorage.
-- Ưu tiên WebCrypto non-extractable key.
-- Nếu phải export/backup key, yêu cầu passphrase mạnh và encrypt key.
-- Content Security Policy nghiêm ngặt.
-- Không inline script.
-- Không log private key, PEM, signing payload nhạy cảm.
-- Confirmation screen phải hiển thị chính xác tài liệu/hash/ý nghĩa ký trước khi ký.
-
-### Acceptance criteria
-
-- Không tìm thấy private key plaintext trong localStorage.
-- CSP được cấu hình.
-- User phải confirm nội dung trước khi ký.
-- Signing payload hiển thị cho user không bị đánh tráo bởi UI.
-
-### Test cần thêm
-
-- `test_private_key_not_stored_plaintext_in_browser_storage`
-- `test_signing_requires_user_confirmation`
-- `test_frontend_has_csp_headers`
-
----
-
-## 17. P2 — API hardening
-
-### Việc cần sửa
-
-- Rate limit:
-  - login;
-  - OTP verify;
-  - TOTP verify;
-  - issue cert;
-  - revoke cert;
-  - timestamp;
-  - verify package;
-  - blind signature.
-- Replay protection cho signing request.
-- CORS allowlist.
-- CSRF protection nếu dùng cookie.
-- HTTPS-only config.
-- Secure cookie nếu có session:
-  - `HttpOnly`;
-  - `Secure`;
-  - `SameSite`.
-- Request size limit.
-- Không log dữ liệu nhạy cảm.
-
-### Acceptance criteria
-
-- Brute force OTP/TOTP bị chặn.
-- CORS không allow `*` trong production.
-- Request quá lớn bị reject.
-- Replay signing request bị reject.
-
-### Test cần thêm
-
-- `test_totp_rate_limit`
-- `test_otp_rate_limit`
-- `test_cors_not_wildcard_in_production`
-- `test_replay_signing_request_rejected`
-- `test_large_request_rejected`
-
----
-
-## 18. P2 — Database migration và config production
-
-### Việc cần sửa
-
-- Dùng Alembic/Flyway/Liquibase hoặc migration tool phù hợp.
-- Không tự động tạo/sửa schema tùy tiện trong production.
-- Tách config:
-  - `development`;
-  - `test`;
-  - `production`.
-- `.env.example` chỉ chứa placeholder.
-- `.gitignore` phải ignore:
-  - `.env`;
-  - private keys;
-  - cert runtime;
-  - upload storage;
-  - logs;
-  - local DB.
-
-### Acceptance criteria
-
-- Fresh clone chạy được bằng `.env.example` + migration.
-- Không có secret thật trong repo.
-- Production mode không dùng debug config.
-
-### Test/check cần thêm
-
-- CI check không có private key fixture ngoài thư mục test cho phép.
-- CI check không commit `.env`.
-- Migration chạy sạch trên DB mới.
-
----
-
-## 19. P3 — Test strategy mới
-
-### Test hiện tại
-
-Backend pass 17/17 là tín hiệu tốt, nhưng chưa chứng minh hệ thống secure. Cần tăng test âm tính và interoperability test.
-
-### Negative tests bắt buộc
+Document cần:
 
 ```text
-- Sửa 1 byte document -> verify fail
-- Đổi signer cert -> fail
-- Đổi cert chain -> fail
-- Đổi algorithm metadata -> fail
-- Cert expired -> fail
-- Cert not-yet-valid -> fail
-- Cert revoked before signing time -> fail
-- Timestamp imprint mismatch -> fail
-- Timestamp nonce mismatch -> fail
-- Chain thiếu intermediate -> fail
-- CA thiếu BasicConstraints CA=true -> fail
-- CA thiếu keyCertSign -> fail
-- TSA thiếu EKU timeStamping -> fail
-- Replay nonce/requestId -> fail
+document_id
+owner_id
+content_hash
+storage_path
+mime_type
+size
+status
+created_at
+updated_at
 ```
 
-### Interoperability tests nên có
+Quy tắc:
+
+* content hash bất biến
+* không overwrite âm thầm document đã ký
+* ACL theo user/role
+* MIME sniffing
+* extension whitelist
+* path traversal protection
+* versioning
+
+## 8.2. Key custody
+
+Không lưu private key plaintext.
+
+CA/TSA/blind signer key:
+
+* tách key riêng
+* không hardcode
+* không commit
+* production nên dùng HSM/KMS
+* root CA nên offline
+
+User signing key:
+
+* ưu tiên client-side
+* WebCrypto non-extractable nếu có thể
+* nếu export private key thì phải encrypt bằng passphrase và cảnh báo rõ
+
+## 8.3. Audit log
+
+Audit log append-only:
 
 ```text
-- Verify certificate chain bằng OpenSSL hoặc certvalidator
-- Verify RFC3161 timestamp bằng OpenSSL ts nếu dùng RFC3161
-- PDF ký xong được Adobe Reader hoặc validator nhận diện
-- CMS signature verify bằng thư viện độc lập
+eventId
+actor
+role
+action
+targetType
+targetId
+status
+timestamp
+metadata
+previousHash
+eventHash
 ```
 
-### CI đề xuất
+Ghi log cho:
+
+* login OTP request
+* login success/fail
+* issue cert
+* revoke cert
+* prepare signing request
+* request signing OTP
+* confirm signing
+* submit signature
+* verify signature
+* audit export
+* blind token request/redeem
+
+## 8.4. Audit chain
+
+Mỗi event hash bind với previous hash.
+
+Nếu sửa event cũ, verify chain fail.
+
+## 8.5. Tests
+
+* user không có quyền không đọc được document
+* path traversal bị reject
+* MIME sai bị reject
+* signed document không bị overwrite
+* sửa audit event cũ bị phát hiện
+* private key plaintext không xuất hiện trong localStorage nếu claim secure
+* CA key không nằm trong repo
+
+---
+
+# PHASE 9 — Production Hardening, CI/CD, Final Report
+
+## Mục tiêu
+
+Đóng gói hệ thống để báo cáo như sản phẩm hoàn chỉnh ở mức đồ án.
+
+## 9.1. Security hardening
+
+* CORS allowlist
+* rate limit
+* request size limit
+* security headers
+* no secret logging
+* no OTP logging
+* no private key logging
+* `.env.example` đầy đủ
+* production check cho default secrets
+
+## 9.2. Database
+
+SQLite dùng local/dev.
+
+Báo cáo cần ghi:
 
 ```text
-backend tests
+SQLite phù hợp demo/local.
+Production nên dùng PostgreSQL.
+```
+
+Nếu đủ thời gian, thêm migration bằng Alembic.
+
+## 9.3. CI/CD
+
+GitHub Actions:
+
+```text
+backend pytest
 frontend build
-lint/typecheck
-security tests
-secret scan
-dependency vulnerability scan
+lint/type check nếu có
+dependency scan nếu có
 ```
 
----
+## 9.4. Frontend UX
 
-## 20. Definition of Done theo từng mức
+Role-based UX:
 
-### Demo-safe
+* Login page
+* Signer dashboard
+* CA Officer dashboard
+* Verifier page
+* Auditor page
+* Admin page
 
-- Legacy API bị tắt mặc định.
-- Không còn PIN mặc định.
-- Không gửi private key qua API.
-- Có auth cơ bản.
-- Có test âm tính cho tamper document/signature.
+Không expose:
 
-### PKI-aware
+* OTP
+* JWT secret
+* app password
+* private key plaintext nếu claim secure
+* role switch
 
-- X.509 validation dùng validator chuẩn hoặc test phủ kỹ.
-- Có revocation model.
-- Có role CA officer.
-- Có proof-of-possession khi issue cert.
-- CA/TSA key không plaintext trong mode thường.
+## 9.5. Documentation
 
-### Signature-system-ready
-
-- Verify result tách nhiều trạng thái.
-- Timestamp RFC3161.
-- Revocation theo signing time.
-- Audit append-only.
-- Document ACL + immutable storage.
-
-### PAdES-ready
-
-- PDF signature dùng ByteRange/CMS.
-- Có PAdES-B-B/B-T.
-- B-LT/B-LTA nếu cần long-term validation.
-- PDF verify được bởi tool bên ngoài.
-
-### Production-ready
-
-- HSM/KMS hoặc key custody tương đương.
-- HTTPS, rate limit, CORS/CSRF, secure cookie.
-- Monitoring/audit/backup/rotation.
-- Migration DB.
-- CI security checks.
-- Documentation rõ ràng.
-
----
-
-## 21. Thứ tự implement khuyến nghị
-
-### Sprint 1 — Chặn lỗi nguy hiểm
-
-1. Tắt legacy API.
-2. Bỏ PIN `123456`, thay bằng Email OTP/TOTP design tối thiểu.
-3. Thêm auth/role guard cho route nhạy cảm.
-4. Tách verify response thành nhiều trạng thái.
-5. Thêm test âm tính cơ bản.
-
-### Sprint 2 — Chuẩn hóa PKI
-
-1. Proof-of-possession khi issue cert.
-2. X.509 extension policy.
-3. Path validation chuẩn.
-4. Revocation model.
-5. CA/TSA key encryption at rest.
-
-### Sprint 3 — Timestamp và PDF
-
-1. RFC3161 timestamp provider.
-2. PAdES-B-B.
-3. PAdES-B-T.
-4. PDF validation tests.
-
-### Sprint 4 — Production hardening
-
-1. Audit append-only.
-2. Document ACL + immutable storage.
-3. Rate limit/CORS/CSRF/HTTPS.
-4. Frontend signing hardening.
-5. CI security checks.
-
----
-
-## 22. Documentation cần cập nhật
-
-Tạo/cập nhật các file sau:
+README/report cần có:
 
 ```text
-README.md
-SECURITY.md
-docs/architecture.md
-docs/security-model.md
-docs/digital-signature-flow.md
-docs/pki-x509-design.md
-docs/timestamp-rfc3161.md
-docs/pades-roadmap.md
-docs/threat-model.md
-docs/api.md
-.env.example
+architecture
+threat model
+RBAC model
+signing flow
+verification flow
+certificate lifecycle
+OTP/TOTP flow
+timestamp flow
+PAdES direction
+blind signature module
+audit model
+limitations
+future work
 ```
 
-### README cần nói rõ
+## 9.6. Final limitation section
 
-- Repo hiện ở mức demo/educational hay production.
-- Legacy API chỉ dùng demo.
-- Luồng v2 không gửi private key lên backend.
-- Các giới hạn hiện tại: chưa PAdES, chưa RFC3161 nếu chưa làm, chưa HSM/KMS.
+Báo cáo phải nói rõ nếu chưa làm:
 
-### SECURITY.md cần có
+```text
+chưa public CA
+chưa HSM/KMS thật
+chưa RFC3161 production TSA thật
+chưa PAdES-LTV đầy đủ
+chưa legal-grade digital signature
+Gmail SMTP chỉ là sender demo/dev
+SQLite chỉ là local/dev
+```
 
-- Cách report vulnerability.
-- Không commit secrets.
-- Key handling rules.
-- Supported security modes.
-- Production warning.
+## 9.7. Tests cuối
+
+* backend pytest pass
+* frontend build pass
+* login OTP pass
+* email OTP manual test pass
+* signer sign flow pass
+* verify valid signature pass
+* tampered document fail
+* revoked cert fail
+* CA role test pass
+* auditor role test pass
+* blind token double redeem fail
+* audit chain tamper fail
 
 ---
 
-## 23. Ghi chú quan trọng cho AI/code agent
+# Implementation Order
 
-Khi sửa repo, không được chỉ đổi text/documentation rồi coi là hoàn tất. Với mỗi mục P0/P1, cần:
+Không làm tất cả cùng lúc.
+
+Thứ tự thực hiện:
 
 ```text
-1. Sửa code.
-2. Thêm hoặc sửa test.
-3. Cập nhật docs.
-4. Chạy test backend.
-5. Chạy build frontend nếu ảnh hưởng UI.
-6. Ghi rõ phần nào còn là demo.
+Phase 0  → dọn frontend, bỏ DocumentsWorkflow
+Phase 1  → user/auth/RBAC/OTP/TOTP
+Phase 2  → X.509/CA/chain/revocation
+Phase 3  → signing mechanism/protocol
+Phase 4  → digital signature services
+Phase 5  → timestamp/RFC3161 foundation
+Phase 6  → PDF/PAdES
+Phase 7  → blind signature module
+Phase 8  → storage/audit/key custody
+Phase 9  → production hardening/final report
 ```
 
-Không được tạo cảm giác hệ thống đã đạt chuẩn pháp lý nếu chưa có:
+Sau mỗi phase chạy:
 
-```text
-- trusted CA thực tế;
-- RFC3161 timestamp thật;
-- PAdES thật cho PDF;
-- revocation checking đúng;
-- key custody bằng HSM/KMS/token hoặc tương đương;
-- identity proofing và quy trình vận hành.
+```bash
+python -m pytest backend/tests -q
+npm --prefix frontend run build
 ```
 
----
-
-## 24. Checklist nhanh
+Sau mỗi phase báo cáo:
 
 ```text
-[x] Disable legacy private-key API by default
-[x] Remove default PIN 123456
-[x] Implement Email OTP with expiry, hash, attempt limit
-[x] Implement TOTP MFA setup primitives
-[ ] Add recovery codes
-[x] Add demo auth + RBAC
-[ ] Encrypt CA/TSA keys or integrate KMS/HSM
-[x] Add proof-of-possession for cert issuance
-[ ] Improve X.509 validation
-[ ] Add EKU/KeyUsage/BasicConstraints policies
-[x] Implement revocation semantics by signing time
-[x] Add RFC3161 provider endpoint for external TSA
-[x] Implement PAdES-B-B roadmap for PDF
-[ ] Implement PAdES-B-T/LT/LTA deployment with trusted TSA/revocation evidence
-[x] Split verify result fields
-[ ] Add canonical payload binding checks
-[ ] Add algorithm allowlist
-[x] Gate blind signature demo
-[ ] Add append-only audit log
-[x] Add document ACL and immutable storage
-[x] Harden frontend signing and browser key storage
-[x] Add rate limit and CORS config
-[x] Add CSP/security headers and HTTPS/HSTS opt-in
-[ ] Add CSRF/HTTPS/session hardening
-[x] Add lightweight SQLite migration guards for new demo tables/columns
-[ ] Add migration and production config
-[x] Add negative tests
-[ ] Add interoperability tests
-[x] Update README/SECURITY/docs
+Changed files:
+- ...
+
+Completed:
+- ...
+
+Tests added:
+- ...
+
+Test result:
+- backend pytest:
+- frontend build:
+
+Remaining limitations:
+- ...
 ```
