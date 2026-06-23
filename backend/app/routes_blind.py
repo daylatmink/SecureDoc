@@ -25,6 +25,7 @@ from .blind_signature import (
 from .crypto_utils import isoformat, parse_iso_datetime, utc_now
 from .database import SessionLocal
 from .models import BlindSignatureSession
+from .security import ADMIN, SIGNER, require_roles
 
 router = APIRouter(prefix="/api/blind-signature", tags=["blind-signature"])
 
@@ -120,7 +121,11 @@ def _token_matches_session(session: BlindSignatureSession, token: dict[str, Any]
 
 
 @router.post("/sessions")
-def create_blind_session(body: BlindSessionCreateRequest, db: Session = Depends(get_db)):
+def create_blind_session(
+    body: BlindSessionCreateRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER, ADMIN)),
+):
     if body.purpose not in ALLOWED_BLIND_PURPOSES:
         raise HTTPException(status_code=400, detail="Invalid blind signature purpose")
     token = create_token(body.purpose, body.ttlSeconds)
@@ -143,13 +148,21 @@ def create_blind_session(body: BlindSessionCreateRequest, db: Session = Depends(
 
 
 @router.get("/sessions/{sessionId}")
-def get_blind_session(sessionId: str, db: Session = Depends(get_db)):
+def get_blind_session(
+    sessionId: str,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER, ADMIN)),
+):
     session = _load_session(db, sessionId)
     return _session_response(session)
 
 
 @router.post("/sign")
-def sign_blinded_token(body: BlindSignRequest, db: Session = Depends(get_db)):
+def sign_blinded_token(
+    body: BlindSignRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER, ADMIN)),
+):
     session = _load_session(db, body.sessionId)
     if _is_expired(session):
         session.status = "expired"
@@ -171,7 +184,11 @@ def sign_blinded_token(body: BlindSignRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/verify")
-def verify_blind_signature(body: BlindVerifyRequest, db: Session = Depends(get_db)):
+def verify_blind_signature(
+    body: BlindVerifyRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER, ADMIN)),
+):
     session = _load_session(db, body.sessionId)
     if not _token_matches_session(session, body.token):
         return {
@@ -205,7 +222,11 @@ def verify_blind_signature(body: BlindVerifyRequest, db: Session = Depends(get_d
 
 
 @router.post("/redeem")
-def redeem_blind_token(body: BlindRedeemRequest, db: Session = Depends(get_db)):
+def redeem_blind_token(
+    body: BlindRedeemRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER, ADMIN)),
+):
     session = _load_session(db, body.sessionId)
     if session.status == "spent" or session.spent_at is not None:
         return {
@@ -258,10 +279,15 @@ def redeem_blind_token(body: BlindRedeemRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/demo")
-def legacy_blind_demo(body: BlindDemoRequest, db: Session = Depends(get_db)):
+def legacy_blind_demo(
+    body: BlindDemoRequest,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(SIGNER, ADMIN)),
+):
     session_response = create_blind_session(
         BlindSessionCreateRequest(purpose=body.purpose, ttlSeconds=600),
         db,
+        actor,
     )
     sign_response = sign_blinded_token(
         BlindSignRequest(
@@ -269,6 +295,7 @@ def legacy_blind_demo(body: BlindDemoRequest, db: Session = Depends(get_db)):
             blindedMessageBase64=session_response["blindedMessageBase64"],
         ),
         db,
+        actor,
     )
     final_signature = unblind_signature(
         sign_response["blindSignatureBase64"],
@@ -281,6 +308,7 @@ def legacy_blind_demo(body: BlindDemoRequest, db: Session = Depends(get_db)):
             finalSignatureBase64=final_signature,
         ),
         db,
+        actor,
     )
     return {
         "scheme": BLIND_SIGNATURE_SCHEME,

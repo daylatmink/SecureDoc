@@ -13,7 +13,16 @@ from sqlalchemy.orm import Session
 
 from .audit_service import log_audit
 from .auth_utils import create_email_otp, create_totp_setting, totp_storage_warning, verify_email_otp, verify_totp_setup
-from .config import JWT_TTL_SECONDS, SMTP_FROM_EMAIL, SMTP_HOST, SMTP_PASSWORD, SMTP_PORT, SMTP_USERNAME, SMTP_USE_TLS
+from .config import (
+    DEMO_OTP_IN_RESPONSE,
+    JWT_TTL_SECONDS,
+    SMTP_FROM_EMAIL,
+    SMTP_HOST,
+    SMTP_PASSWORD,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_USE_TLS,
+)
 from .database import SessionLocal
 from .models import User
 from .security import SIGNER, create_access_token, require_roles
@@ -76,6 +85,8 @@ def get_db():
 
 def _send_otp_email(email: str, purpose: str, otp: str) -> str:
     if not SMTP_HOST:
+        if DEMO_OTP_IN_RESPONSE:
+            return f"demo_otp:{otp}"
         return "not_configured_demo_no_otp_in_response"
 
     message = EmailMessage()

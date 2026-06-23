@@ -1,12 +1,22 @@
 const API_BASE = "http://127.0.0.1:8000";
 
 export type UserRole = "ADMIN" | "CA_OFFICER" | "SIGNER" | "VERIFIER" | "AUDITOR";
+export type UserStatus = "active" | "disabled";
 
 export type AuthUser = {
   email: string;
   name: string;
   role: UserRole;
-  status?: string;
+  status?: UserStatus;
+};
+
+export type AdminUser = {
+  email: string;
+  name: string;
+  role: UserRole;
+  status: UserStatus;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type LoginOtpRequestResponse = {
@@ -220,6 +230,55 @@ export type AuditChainResult = {
   brokenAt: null | { index: number; id: number; eventId: string };
 };
 
+export type AuditEvent = {
+  id: number;
+  eventId: string;
+  eventType: string;
+  actor: string | null;
+  documentHash: string | null;
+  certificateSerial: string | null;
+  result: string;
+  details: string | null;
+  createdAt: string;
+  previousLogHash: string | null;
+  currentLogHash: string;
+};
+
+export type AuditExportReport = {
+  generatedAt: string;
+  exportedBy: string;
+  chain: AuditChainResult;
+  totalEvents: number;
+  includedEvents: number;
+  events: AuditEvent[];
+};
+
+export type TimestampStatus = {
+  demoTsaEnabled: boolean;
+  rfc3161Configured: boolean;
+  rfc3161Provider: string | null;
+  legalReady: boolean;
+  warning: string;
+};
+
+export type PadesStatus = {
+  enabled: boolean;
+  defaultProfile: "PAdES-B-B" | "PAdES-B-T" | string;
+  timestampedProfileAvailable: boolean;
+  rfc3161Configured: boolean;
+  rfc3161Provider: string | null;
+  legalReady: boolean;
+  warning: string;
+};
+
+export type BlindSignatureStatus = {
+  enabled: boolean;
+  scheme: string;
+  allowedPurposes: string[];
+  legalReady: boolean;
+  warning: string;
+};
+
 export function setAuthToken(token: string | null) {
   sessionToken = token;
 }
@@ -253,6 +312,49 @@ export async function getMe(): Promise<AuthUser> {
     headers: authHeaders(),
   });
   return handleResponse<AuthUser>(response);
+}
+
+export async function listAdminUsers(): Promise<{ users: AdminUser[] }> {
+  const response = await fetch(`${API_BASE}/api/admin/users`, {
+    headers: authHeaders(),
+  });
+  return handleResponse<{ users: AdminUser[] }>(response);
+}
+
+export async function createAdminUser(body: {
+  email: string;
+  name: string;
+  role: UserRole;
+  status?: UserStatus;
+}): Promise<AdminUser> {
+  const response = await fetch(`${API_BASE}/api/admin/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<AdminUser>(response);
+}
+
+export async function updateAdminUser(email: string, body: {
+  name?: string;
+  role?: UserRole;
+  status?: UserStatus;
+}): Promise<AdminUser> {
+  const response = await fetch(`${API_BASE}/api/admin/users/${encodeURIComponent(email)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<AdminUser>(response);
+}
+
+export async function setAdminUserEnabled(email: string, enabled: boolean): Promise<AdminUser> {
+  const action = enabled ? "enable" : "disable";
+  const response = await fetch(`${API_BASE}/api/admin/users/${encodeURIComponent(email)}/${action}`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return handleResponse<AdminUser>(response);
 }
 
 export async function requestEmailOtp(body: {
@@ -415,6 +517,41 @@ export async function verifyAuditChain(): Promise<AuditChainResult> {
   return handleResponse<AuditChainResult>(response);
 }
 
+export async function listAuditLogs(limit = 100): Promise<{ events: AuditEvent[] }> {
+  const response = await fetch(`${API_BASE}/api/audit/logs?limit=${encodeURIComponent(String(limit))}`, {
+    headers: authHeaders(),
+  });
+  return handleResponse<{ events: AuditEvent[] }>(response);
+}
+
+export async function exportAuditReport(limit = 500): Promise<AuditExportReport> {
+  const response = await fetch(`${API_BASE}/api/audit/export?limit=${encodeURIComponent(String(limit))}`, {
+    headers: authHeaders(),
+  });
+  return handleResponse<AuditExportReport>(response);
+}
+
+export async function getTimestampStatus(): Promise<TimestampStatus> {
+  const response = await fetch(`${API_BASE}/api/timestamp/status`, {
+    headers: authHeaders(),
+  });
+  return handleResponse<TimestampStatus>(response);
+}
+
+export async function getPadesStatus(): Promise<PadesStatus> {
+  const response = await fetch(`${API_BASE}/api/pdf/pades/status`, {
+    headers: authHeaders(),
+  });
+  return handleResponse<PadesStatus>(response);
+}
+
+export async function getBlindSignatureStatus(): Promise<BlindSignatureStatus> {
+  const response = await fetch(`${API_BASE}/api/blind-signature/status`, {
+    headers: authHeaders(),
+  });
+  return handleResponse<BlindSignatureStatus>(response);
+}
+
 export async function hashDocument(file: File, hashAlgorithm: HashAlgorithm) {
   const formData = new FormData();
   formData.append("file", file);
@@ -444,7 +581,7 @@ export async function signPdfPades(file: File, _signerEmail: string, reason: str
   };
 }
 
-function authHeaders() {
+export function authHeaders() {
   if (!sessionToken) throw new Error("Please sign in with email OTP first.");
   return { Authorization: `Bearer ${sessionToken}` };
 }

@@ -320,6 +320,26 @@ p {
   color: #4b5f6d;
 }
 
+.statusBadge.active {
+  background: #f0fdf8;
+  color: #047857;
+}
+
+.statusBadge.disabled {
+  background: #fff5f5;
+  color: #b91c1c;
+}
+
+.statusBadge.success {
+  background: #f0fdf8;
+  color: #047857;
+}
+
+.statusBadge.failed {
+  background: #fff5f5;
+  color: #b91c1c;
+}
+
 .statusBadge.pending_signature {
   background: #fff7ed;
   color: #9a3412;

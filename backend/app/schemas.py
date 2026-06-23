@@ -1,6 +1,6 @@
 """Pydantic schemas — legacy (unchanged) + v2 client-side signing."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -109,6 +109,36 @@ class X509CertificateIssueResponse(BaseModel):
 
 
 # ── V2 schemas ────────────────────────────────────────────────────────────
+
+UserRole = Literal["ADMIN", "CA_OFFICER", "SIGNER", "VERIFIER", "AUDITOR"]
+UserStatus = Literal["active", "disabled"]
+
+
+class UserCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+    name: str
+    role: UserRole
+    status: UserStatus = "active"
+
+
+class UserUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = None
+    role: Optional[UserRole] = None
+    status: Optional[UserStatus] = None
+
+
+class UserResponse(BaseModel):
+    email: EmailStr
+    name: str
+    role: UserRole
+    status: UserStatus
+    createdAt: str
+    updatedAt: str
+
 
 class SigningPayloadV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -266,6 +296,51 @@ class DocumentMarkSignedResponse(BaseModel):
 class Rfc3161TimestampRequest(BaseModel):
     messageDigestBase64: str
     hashAlgorithm: str = "SHA-256"
+
+
+class TimestampStatusResponse(BaseModel):
+    demoTsaEnabled: bool
+    rfc3161Configured: bool
+    rfc3161Provider: Optional[str] = None
+    legalReady: bool = False
+    warning: str
+
+
+class PadesStatusResponse(BaseModel):
+    enabled: bool
+    defaultProfile: str
+    timestampedProfileAvailable: bool
+    rfc3161Configured: bool
+    rfc3161Provider: Optional[str] = None
+    legalReady: bool = False
+    warning: str
+
+
+class BlindSignatureStatusResponse(BaseModel):
+    enabled: bool
+    scheme: str
+    allowedPurposes: List[str]
+    legalReady: bool = False
+    warning: str
+
+
+class SecurityReadinessCheck(BaseModel):
+    key: str
+    passed: bool
+    severity: str
+    message: str
+
+
+class SecurityReadinessResponse(BaseModel):
+    environment: str
+    productionMode: bool
+    corsAllowOrigins: List[str]
+    requestSizeLimitBytes: int
+    rateLimitRequestsPerMinute: int
+    httpsOnly: bool
+    checks: List[SecurityReadinessCheck]
+    databaseRecommendation: str
+    legalReady: bool = False
 
 
 class Rfc3161TimestampResponse(BaseModel):

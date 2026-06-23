@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.blind_signature import blind_token, create_token, sign_blinded_message, unblind_signature, verify_final_signature
 from app.main import app
+from app.security import auth_headers
 
 
 def test_blind_signature_demo_routes_disabled_by_default():
@@ -19,6 +20,18 @@ def test_blind_signature_demo_routes_disabled_by_default():
         )
 
     assert response.status_code == 404
+
+
+def test_blind_signature_status_is_available_when_demo_routes_disabled():
+    with TestClient(app) as client:
+        response = client.get("/api/blind-signature/status", headers=auth_headers("demo-admin@example.com", "ADMIN"))
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["enabled"] is False
+    assert data["scheme"] == "RSA blind signature educational demo"
+    assert "anonymous_access_token" in data["allowedPurposes"]
+    assert data["legalReady"] is False
 
 
 def test_blind_signature_helper_success_flow():

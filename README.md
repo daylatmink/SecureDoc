@@ -68,6 +68,9 @@ python -m pytest backend/tests
 npm --prefix frontend run build
 ```
 
+GitHub Actions workflow is available at `.github/workflows/ci.yml` and runs
+backend pytest plus frontend production build on push and pull request.
+
 ## Main V2 Flow
 
 Use the `Documents` tab for the classroom demo:
@@ -139,3 +142,10 @@ Main blind token flow:
 - Blind signatures are educational only, not production e-voting/e-cash and not a replacement for document signing.
 - Replay checks are local to the server DB.
 - Phase 1 includes demo RBAC, CORS allowlist, request size limit, and in-memory rate limit. It is not production authentication or full HTTPS/session hardening.
+
+## Phase 9 Hardening Notes
+
+- `GET /api/system/security-readiness` gives `ADMIN`/`AUDITOR` users a non-secret readiness report for CORS, request size limit, rate limit, security headers, HTTPS/HSTS mode, JWT secret configuration, SMTP delivery, database recommendation, and legal readiness.
+- `SECUREDOC_ENV=production` disables demo-only auth/OTP/blind-signature flags and rejects wildcard CORS or the default JWT secret.
+- SQLite is still the local/demo database. Production should use PostgreSQL with migrations.
+- Final limitations remain explicit: no public CA, no HSM/KMS, no production RFC 3161 TSA, no full PAdES-LTV, no legal-grade signature claim, Gmail SMTP only as demo/dev sender.

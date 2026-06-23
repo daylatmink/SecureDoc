@@ -38,6 +38,7 @@ from .database import SessionLocal, init_db
 from .models import CertificateRecord
 from .routes_blind import router as blind_router
 from .routes_auth import router as auth_router
+from .routes_admin import router as admin_router
 from .routes_v2 import router as v2_router
 from .schemas import (
     CaPublicKeyResponse,
@@ -99,6 +100,7 @@ async def request_hardening_middleware(request: Request, call_next):
 
 
 app.include_router(auth_router)
+app.include_router(admin_router)
 app.include_router(v2_router)
 if ENABLE_BLIND_SIGNATURE_DEMO:
     app.include_router(blind_router)

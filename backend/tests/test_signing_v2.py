@@ -2,6 +2,7 @@ import base64
 import copy
 import hashlib
 import hmac
+import json
 import sys
 import os
 import time
@@ -9,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ["SECUREDOC_DATABASE_URL"] = "sqlite:///:memory:"
+os.environ["SECUREDOC_DEMO_OTP_IN_RESPONSE"] = "false"
+os.environ["SECUREDOC_SMTP_HOST"] = ""
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cryptography import x509
@@ -28,8 +31,8 @@ from app.auth_utils import (
 )
 from app.database import SessionLocal
 from app.main import _rate_limit_buckets, app
-from app.models import AuditLog, CertificateRecord, CertificateRevocation, EmailOtpToken, SigningRequest, UserMfaSetting
-from app.security import auth_headers
+from app.models import AuditLog, CertificateRecord, CertificateRevocation, EmailOtpToken, SigningRequest, User, UserMfaSetting
+from app.security import auth_headers, create_access_token
 from app.x509_utils import (
     X509_INTERMEDIATE_COMMON_NAME,
     X509_CERTIFICATE_TYPE,
@@ -48,6 +51,7 @@ SIGNER_HEADERS = auth_headers("signer@example.com", "SIGNER")
 OTHER_SIGNER_HEADERS = auth_headers("other-signer@example.com", "SIGNER")
 AUDITOR_HEADERS = auth_headers("pytest-auditor@example.com", "AUDITOR")
 VERIFIER_HEADERS = auth_headers("pytest-verifier@example.com", "VERIFIER")
+ADMIN_HEADERS = auth_headers("demo-admin@example.com", "ADMIN")
 
 
 def test_canonical_signing_payload_is_deterministic():
@@ -184,6 +188,25 @@ def test_login_otp_existing_user_passes():
     assert data["delivery"] == "not_configured_demo_no_otp_in_response"
 
 
+def test_login_otp_can_return_demo_code_when_explicitly_enabled(monkeypatch):
+    import app.routes_auth as routes_auth
+
+    monkeypatch.setattr(routes_auth, "SMTP_HOST", "")
+    monkeypatch.setattr(routes_auth, "DEMO_OTP_IN_RESPONSE", True)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/login/request-otp",
+            json={"email": "signer@example.com"},
+        )
+
+    assert response.status_code == 200, response.text
+    delivery = response.json()["delivery"]
+    assert delivery.startswith("demo_otp:")
+    assert delivery.removeprefix("demo_otp:").isdigit()
+    assert len(delivery.removeprefix("demo_otp:")) == 6
+
+
 def test_login_otp_unknown_user_fails():
     with TestClient(app) as client:
         response = client.post(
@@ -249,6 +272,98 @@ def test_raw_demo_header_auth_is_rejected_by_default():
         )
 
     assert response.status_code == 401
+
+
+def test_admin_can_manage_users_and_events_are_audited():
+    email = "phase4-managed-user@example.com"
+    with TestClient(app) as client:
+        create = client.post(
+            "/api/admin/users",
+            headers=ADMIN_HEADERS,
+            json={"email": email, "name": "Phase 4 User", "role": "SIGNER"},
+        )
+        users = client.get("/api/admin/users", headers=ADMIN_HEADERS)
+        get_created = client.get(f"/api/admin/users/{email}", headers=ADMIN_HEADERS)
+        update = client.patch(
+            f"/api/admin/users/{email}",
+            headers=ADMIN_HEADERS,
+            json={"name": "Phase 4 Verifier", "role": "VERIFIER"},
+        )
+        disable = client.post(f"/api/admin/users/{email}/disable", headers=ADMIN_HEADERS)
+        login_disabled = client.post("/api/auth/login/request-otp", json={"email": email})
+        enable = client.post(f"/api/admin/users/{email}/enable", headers=ADMIN_HEADERS)
+        login_enabled = client.post("/api/auth/login/request-otp", json={"email": email})
+
+    assert create.status_code == 201, create.text
+    assert create.json()["email"] == email
+    assert create.json()["role"] == "SIGNER"
+    assert users.status_code == 200
+    assert any(user["email"] == email for user in users.json()["users"])
+    assert get_created.status_code == 200
+    assert get_created.json()["email"] == email
+    assert update.status_code == 200, update.text
+    assert update.json()["name"] == "Phase 4 Verifier"
+    assert update.json()["role"] == "VERIFIER"
+    assert disable.status_code == 200, disable.text
+    assert disable.json()["status"] == "disabled"
+    assert login_disabled.status_code == 404
+    assert enable.status_code == 200, enable.text
+    assert enable.json()["status"] == "active"
+    assert login_enabled.status_code == 200, login_enabled.text
+
+    with SessionLocal() as db:
+        event_types = {event.event_type for event in db.query(AuditLog).all()}
+    assert {"user_created", "user_updated", "user_disabled", "user_enabled"}.issubset(event_types)
+
+
+def test_seeded_users_can_be_synced_when_dev_flag_is_enabled(monkeypatch):
+    import app.database as database
+
+    email = "demo-ca-officer@example.com"
+    with SessionLocal() as db:
+        user = db.get(User, email)
+        assert user is not None
+        user.name = "Stale Demo CA"
+        user.role = "SIGNER"
+        user.status = "disabled"
+        db.commit()
+
+    monkeypatch.setattr(database, "SYNC_SEEDED_USERS", True)
+    database._seed_default_users()
+
+    with SessionLocal() as db:
+        user = db.get(User, email)
+        assert user is not None
+        assert user.name == "Demo CA Officer"
+        assert user.role == "CA_OFFICER"
+        assert user.status == "active"
+
+
+def test_non_admin_cannot_manage_users():
+    with TestClient(app) as client:
+        response = client.get("/api/admin/users", headers=SIGNER_HEADERS)
+
+    assert response.status_code == 403
+
+
+def test_disabled_user_existing_jwt_is_rejected():
+    email = "phase4-disabled-token@example.com"
+    with TestClient(app) as client:
+        create = client.post(
+            "/api/admin/users",
+            headers=ADMIN_HEADERS,
+            json={"email": email, "name": "Disabled Token User", "role": "SIGNER"},
+        )
+        assert create.status_code == 201, create.text
+        token = create_access_token(email)
+
+        disable = client.post(f"/api/admin/users/{email}/disable", headers=ADMIN_HEADERS)
+        assert disable.status_code == 200, disable.text
+
+        me = client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+
+    assert me.status_code == 401
+    assert me.json()["detail"] == "User is not active"
 
 
 def test_signer_cannot_revoke_cert():
@@ -709,6 +824,19 @@ def test_rfc3161_endpoint_requires_configured_tsa_url():
     assert timestamp.json()["detail"] == "SECUREDOC_RFC3161_TSA_URL is not configured"
 
 
+def test_timestamp_status_explains_demo_and_rfc3161_configuration():
+    with TestClient(app) as client:
+        response = client.get("/api/timestamp/status", headers=SIGNER_HEADERS)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["demoTsaEnabled"] is True
+    assert data["rfc3161Configured"] is False
+    assert data["rfc3161Provider"] is None
+    assert data["legalReady"] is False
+    assert "demo JSON timestamp" in data["warning"]
+
+
 def test_pades_pdf_signing_produces_pdf_signature():
     with TestClient(app) as client:
         response = client.post(
@@ -724,6 +852,20 @@ def test_pades_pdf_signing_produces_pdf_signature():
     assert b"/ByteRange" in response.content
     assert b"/ETSI.CAdES.detached" in response.content
     assert b"/Contents" in response.content
+
+
+def test_pades_status_reports_demo_profile_and_limitations():
+    with TestClient(app) as client:
+        response = client.get("/api/pdf/pades/status", headers=SIGNER_HEADERS)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["enabled"] is True
+    assert data["defaultProfile"] == "PAdES-B-B"
+    assert data["timestampedProfileAvailable"] is False
+    assert data["rfc3161Configured"] is False
+    assert data["legalReady"] is False
+    assert "local demo server-side signer" in data["warning"]
 
 
 def test_private_key_not_stored_plaintext_in_browser_storage():
@@ -1400,6 +1542,44 @@ def test_auditor_can_list_audit_logs():
 
     assert response.status_code == 200
     assert response.json()["events"]
+
+
+def test_auditor_can_export_audit_report():
+    with TestClient(app) as client:
+        _create_submitted_package(client)
+        response = client.get("/api/audit/export", headers=AUDITOR_HEADERS)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["exportedBy"] == "pytest-auditor@example.com"
+    assert data["chain"]["valid"] is True
+    assert data["totalEvents"] >= data["includedEvents"] > 0
+    assert any(event["eventType"] == "audit_report_exported" for event in data["events"])
+
+
+def test_admin_can_view_security_readiness_without_secret_values():
+    with TestClient(app) as client:
+        response = client.get("/api/system/security-readiness", headers=ADMIN_HEADERS)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["environment"] == "development"
+    assert data["productionMode"] is False
+    assert data["legalReady"] is False
+    assert data["requestSizeLimitBytes"] > 0
+    assert data["rateLimitRequestsPerMinute"] > 0
+    check_keys = {check["key"] for check in data["checks"]}
+    assert {"cors_allowlist", "rate_limit", "request_size_limit", "jwt_secret", "database"}.issubset(check_keys)
+    serialized = json.dumps(data)
+    assert "development-only-change-me-jwt-secret" not in serialized
+    assert "SECUREDOC_SMTP_PASSWORD" not in serialized
+
+
+def test_signer_cannot_view_security_readiness():
+    with TestClient(app) as client:
+        response = client.get("/api/system/security-readiness", headers=SIGNER_HEADERS)
+
+    assert response.status_code == 403
 
 
 def test_signer_cannot_view_audit_chain():

@@ -18,7 +18,21 @@ from sqlalchemy.orm import Session
 
 from .auth_utils import create_signing_email_otp, verify_enabled_totp_for_email, verify_signing_email_otp
 from .audit_service import audit_log_to_response, log_audit
-from .config import JWT_SECRET, RFC3161_TSA_URL, ensure_document_storage_dir
+from .blind_signature import ALLOWED_BLIND_PURPOSES, BLIND_SIGNATURE_SCHEME
+from .config import (
+    CORS_ALLOW_ORIGINS,
+    ENABLE_BLIND_SIGNATURE_DEMO,
+    HTTPS_ONLY,
+    IS_PRODUCTION,
+    JWT_SECRET,
+    RATE_LIMIT_REQUESTS_PER_MINUTE,
+    REQUEST_SIZE_LIMIT_BYTES,
+    RFC3161_TSA_URL,
+    SECUREDOC_ENV,
+    SMTP_HOST,
+    SMTP_PASSWORD,
+    ensure_document_storage_dir,
+)
 from .crypto_utils import (
     ALGORITHM_POLICY,
     ALLOWED_SIGNING_PURPOSES,
@@ -53,11 +67,14 @@ from .models import (
 from .pades_utils import sign_pdf_pades as sign_pdf_pades_bytes
 from .schemas import (
     Certificate,
+    BlindSignatureStatusResponse,
     DocumentMarkSignedResponse,
     DocumentStoredResponse,
+    PadesStatusResponse,
     Rfc3161TimestampRequest,
     Rfc3161TimestampResponse,
     RevokeBySerialRequest,
+    SecurityReadinessResponse,
     SignedPackageV2,
     SigningConfirmRequest,
     SigningConfirmResponse,
@@ -65,6 +82,7 @@ from .schemas import (
     SigningPayloadV2,
     SigningRequestCreateV2,
     SigningRequestResponseV2,
+    TimestampStatusResponse,
     X509CertificateIssueRequest,
     X509CertificateIssueResponse,
     X509ProofChallengeRequest,
@@ -1985,12 +2003,7 @@ def certificate_crl(
     return crl
 
 
-@router.get("/api/audit/verify-chain")
-def verify_audit_chain(
-    db: Session = Depends(get_db),
-    actor: dict[str, str] = Depends(require_roles(AUDITOR)),
-):
-    events = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+def _audit_chain_status(events: list[AuditLog]) -> dict[str, Any]:
     previous_hash = None
     for index, event in enumerate(events, start=1):
         event_json = build_audit_event_json(
@@ -2003,14 +2016,6 @@ def verify_audit_chain(
         )
         expected_hash = compute_audit_hash(event_json, previous_hash)
         if event.previous_log_hash != previous_hash or event.current_log_hash != expected_hash:
-            _log_audit(
-                db,
-                "audit_chain_verified",
-                _actor_email(actor),
-                "failed",
-                details=f"brokenAt={event.id}",
-            )
-            db.commit()
             return {
                 "valid": False,
                 "totalEvents": len(events),
@@ -2021,9 +2026,25 @@ def verify_audit_chain(
                 },
             }
         previous_hash = event.current_log_hash
-    _log_audit(db, "audit_chain_verified", _actor_email(actor), "success", details=f"totalEvents={len(events)}")
-    db.commit()
     return {"valid": True, "totalEvents": len(events), "brokenAt": None}
+
+
+@router.get("/api/audit/verify-chain")
+def verify_audit_chain(
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(AUDITOR)),
+):
+    events = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+    status = _audit_chain_status(events)
+    _log_audit(
+        db,
+        "audit_chain_verified",
+        _actor_email(actor),
+        "success" if status["valid"] else "failed",
+        details=f"totalEvents={len(events)}" if status["valid"] else f"brokenAt={status['brokenAt']['id']}",
+    )
+    db.commit()
+    return status
 
 
 @router.get("/api/audit/logs")
@@ -2037,9 +2058,47 @@ def list_audit_logs(
     return {"events": [audit_log_to_response(event) for event in events]}
 
 
+@router.get("/api/audit/export")
+def export_audit_report(
+    limit: int = 500,
+    db: Session = Depends(get_db),
+    actor: dict[str, str] = Depends(require_roles(AUDITOR)),
+):
+    safe_limit = max(1, min(limit, 1000))
+    _log_audit(db, "audit_report_exported", _actor_email(actor), "success", details=f"limit={safe_limit}")
+    db.commit()
+    events_asc = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+    events_desc = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(safe_limit).all()
+    return {
+        "generatedAt": isoformat(utc_now()),
+        "exportedBy": _actor_email(actor),
+        "chain": _audit_chain_status(events_asc),
+        "totalEvents": len(events_asc),
+        "includedEvents": len(events_desc),
+        "events": [audit_log_to_response(event) for event in events_desc],
+    }
+
+
 @router.get("/api/algorithm-policy")
 def get_algorithm_policy():
     return ALGORITHM_POLICY
+
+
+@router.get("/api/timestamp/status", response_model=TimestampStatusResponse)
+def get_timestamp_status(
+    actor: dict[str, str] = Depends(require_roles(SIGNER, VERIFIER, CA_OFFICER, AUDITOR)),
+):
+    return {
+        "demoTsaEnabled": True,
+        "rfc3161Configured": bool(RFC3161_TSA_URL),
+        "rfc3161Provider": RFC3161_TSA_URL or None,
+        "legalReady": False,
+        "warning": (
+            "SecureDoc submit flow issues demo JSON timestamp tokens automatically. "
+            "RFC3161 is used only when SECUREDOC_RFC3161_TSA_URL is configured, "
+            "and this demo is not a legal-grade LTV signature service."
+        ),
+    }
 
 
 @router.post("/api/timestamp/rfc3161", response_model=Rfc3161TimestampResponse)
@@ -2109,3 +2168,121 @@ async def sign_pdf_pades(
         "X-SecureDoc-PAdES-Hash": signed_hash,
     }
     return StreamingResponse(io.BytesIO(signed_pdf), media_type="application/pdf", headers=headers)
+
+
+@router.get("/api/pdf/pades/status", response_model=PadesStatusResponse)
+def get_pades_status(
+    actor: dict[str, str] = Depends(require_roles(SIGNER, VERIFIER, CA_OFFICER, AUDITOR)),
+):
+    rfc3161_configured = bool(RFC3161_TSA_URL)
+    return {
+        "enabled": True,
+        "defaultProfile": "PAdES-B-T" if rfc3161_configured else "PAdES-B-B",
+        "timestampedProfileAvailable": rfc3161_configured,
+        "rfc3161Configured": rfc3161_configured,
+        "rfc3161Provider": RFC3161_TSA_URL or None,
+        "legalReady": False,
+        "warning": (
+            "PAdES export uses a local demo server-side signer. "
+            "PAdES-B-T requires SECUREDOC_RFC3161_TSA_URL. "
+            "PAdES-LT/LTA, public CA validation, and production key custody are not implemented."
+        ),
+    }
+
+
+@router.get("/api/blind-signature/status", response_model=BlindSignatureStatusResponse)
+def get_blind_signature_status(
+    actor: dict[str, str] = Depends(require_roles(SIGNER, CA_OFFICER, VERIFIER, AUDITOR)),
+):
+    return {
+        "enabled": ENABLE_BLIND_SIGNATURE_DEMO,
+        "scheme": BLIND_SIGNATURE_SCHEME,
+        "allowedPurposes": sorted(ALLOWED_BLIND_PURPOSES),
+        "legalReady": False,
+        "warning": (
+            "Blind signatures are an educational privacy-token module, separate from document signing. "
+            "Set ENABLE_BLIND_SIGNATURE_DEMO=true to expose demo session/sign/verify/redeem routes."
+        ),
+    }
+
+
+def _readiness_check(key: str, passed: bool, severity: str, message: str) -> dict[str, Any]:
+    return {"key": key, "passed": passed, "severity": severity, "message": message}
+
+
+@router.get("/api/system/security-readiness", response_model=SecurityReadinessResponse)
+def get_security_readiness(
+    actor: dict[str, str] = Depends(require_roles(ADMIN, AUDITOR)),
+):
+    jwt_default = JWT_SECRET == "development-only-change-me-jwt-secret" or JWT_SECRET.startswith("change-me")
+    wildcard_cors = "*" in CORS_ALLOW_ORIGINS
+    smtp_configured = bool(SMTP_HOST and SMTP_PASSWORD)
+    checks = [
+        _readiness_check(
+            "cors_allowlist",
+            not wildcard_cors,
+            "critical" if IS_PRODUCTION else "warning",
+            "CORS uses an explicit allowlist." if not wildcard_cors else "Wildcard CORS origin is unsafe for production.",
+        ),
+        _readiness_check(
+            "request_size_limit",
+            REQUEST_SIZE_LIMIT_BYTES > 0,
+            "critical",
+            f"Request body limit is {REQUEST_SIZE_LIMIT_BYTES} bytes.",
+        ),
+        _readiness_check(
+            "rate_limit",
+            RATE_LIMIT_REQUESTS_PER_MINUTE > 0,
+            "critical",
+            f"Rate limit is {RATE_LIMIT_REQUESTS_PER_MINUTE} requests/minute per client/path.",
+        ),
+        _readiness_check(
+            "security_headers",
+            True,
+            "info",
+            "Middleware emits X-Content-Type-Options, Referrer-Policy, CSP, and Permissions-Policy.",
+        ),
+        _readiness_check(
+            "https_only",
+            HTTPS_ONLY,
+            "critical" if IS_PRODUCTION else "warning",
+            "HTTPS/HSTS mode is enabled." if HTTPS_ONLY else "HTTPS/HSTS mode is disabled for local development.",
+        ),
+        _readiness_check(
+            "jwt_secret",
+            not jwt_default,
+            "critical",
+            "JWT secret is configured away from the demo default."
+            if not jwt_default
+            else "JWT secret still looks like a demo/default value.",
+        ),
+        _readiness_check(
+            "smtp_delivery",
+            smtp_configured,
+            "warning",
+            "SMTP delivery is configured." if smtp_configured else "SMTP delivery is not configured; OTP email delivery is demo/local only.",
+        ),
+        _readiness_check(
+            "database",
+            False,
+            "warning",
+            "SQLite is acceptable for local demo. Production should use PostgreSQL with migrations.",
+        ),
+        _readiness_check(
+            "legal_grade_signature",
+            False,
+            "warning",
+            "Public CA trust, production TSA, PAdES-LTV, identity proofing, and HSM/KMS are not complete.",
+        ),
+    ]
+    return {
+        "environment": SECUREDOC_ENV,
+        "productionMode": IS_PRODUCTION,
+        "corsAllowOrigins": CORS_ALLOW_ORIGINS,
+        "requestSizeLimitBytes": REQUEST_SIZE_LIMIT_BYTES,
+        "rateLimitRequestsPerMinute": RATE_LIMIT_REQUESTS_PER_MINUTE,
+        "httpsOnly": HTTPS_ONLY,
+        "checks": checks,
+        "databaseRecommendation": "SQLite phu hop demo/local. Production nen dung PostgreSQL.",
+        "legalReady": False,
+    }

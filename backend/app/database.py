@@ -4,6 +4,8 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from .config import SYNC_SEEDED_USERS
+
 DATABASE_URL = os.getenv("SECUREDOC_DATABASE_URL", "sqlite:///./securedoc.db")
 
 engine_options = {"connect_args": {"check_same_thread": False}}
@@ -26,7 +28,8 @@ def _seed_default_users() -> None:
     from .models import User
 
     defaults = [
-        ("tai.dv230062@sis.hust.edu.vn", "Default Signer", "SIGNER"),
+        ("tai.dv230062@sis.hust.edu.vn", "Default Signer", "CA_OFFICER"),
+        ("vutuanminhvtm2k5@gmail.com", "Tester", "CA_OFFICER" ),
         ("signer@example.com", "Test Signer", "SIGNER"),
         ("other-signer@example.com", "Other Signer", "SIGNER"),
         ("nguyenhathanhdz2k5@gmail.com", "Pytest CA Officer", "CA_OFFICER"),
@@ -45,8 +48,14 @@ def _seed_default_users() -> None:
     now = utc_now().replace(tzinfo=None)
     with SessionLocal() as db:
         for email, name, role in defaults:
-            if not db.get(User, email):
+            user = db.get(User, email)
+            if not user:
                 db.add(User(email=email, name=name, role=role, status="active", created_at=now, updated_at=now))
+            elif SYNC_SEEDED_USERS:
+                user.name = name
+                user.role = role
+                user.status = "active"
+                user.updated_at = now
         db.commit()
 
 

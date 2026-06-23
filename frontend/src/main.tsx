@@ -1,4 +1,4 @@
-import React, { useId, useState } from "react";
+import React, { useEffect, useId, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertTriangle,
@@ -25,40 +25,56 @@ import {
   canonicalizePayload,
   clearAuthToken,
   confirmSigningRequest,
+  createAdminUser,
+  exportAuditReport,
   generateBrowserSigningKeyPair,
+  getPadesStatus,
+  getTimestampStatus,
   getMe,
   hashDocument,
   importPrivateKey,
   issueX509Certificate,
+  listAuditLogs,
+  listAdminUsers,
   prepareSigningRequest,
   requestLoginOtp,
   requestSigningEmailOtp,
   revokeCertificate,
+  setAdminUserEnabled,
   setAuthToken,
   signPdfPades,
   signPayload,
   setupTotp,
   submitSignature,
+  updateAdminUser,
   verifyAuditChain,
   verifyLoginOtp,
   verifyTotpSetup,
   verifyV2,
+  type AdminUser,
   type AuditChainResult,
+  type AuditEvent,
   type AuthUser,
   type Certificate,
   type HashAlgorithm,
+  type PadesStatus,
   type PrepareResponse,
   type SignedPackageV2,
   type SigningConfirmResponse,
   type SigningOtpRequestResponse,
   type SubmitResponse,
+  type TimestampStatus,
   type TotpSetupResponse,
   type TotpVerifyResponse,
   type UserRole,
+  type UserStatus,
   type VerificationReport,
   type VerificationStep,
   type VerifyV2Response,
-  type X509IssueResponse
+  type X509IssueResponse,
+  authHeaders,
+  getBlindSignatureStatus,
+  type BlindSignatureStatus
 } from "./signing-v2";
 import "./styles.css";
 
@@ -147,7 +163,7 @@ type BlindRedeemResponse = {
   spentAt?: string;
 };
 
-type Tab = "home" | "keys" | "signv2" | "verifyv2" | "revoke" | "audit" | "admin";
+type Tab = "home" | "keys" | "signv2" | "verifyv2" | "revoke" | "audit" | "admin" | "privacy";
 type NavItem = { tab: Tab; label: string; helper: string; icon: React.ReactNode };
 
 const roleTabs: Record<UserRole, NavItem[]> = {
@@ -170,9 +186,13 @@ const roleTabs: Record<UserRole, NavItem[]> = {
   ],
   ADMIN: [
     { tab: "home", label: "Tong quan", helper: "Admin", icon: <BadgeCheck size={18} /> },
-    { tab: "admin", label: "Users", helper: "Roles", icon: <Fingerprint size={18} /> }
+    { tab: "admin", label: "Users", helper: "Roles", icon: <Fingerprint size={18} /> },
+    { tab: "privacy", label: "Privacy tokens", helper: "Blind", icon: <EyeOff size={18} /> }
   ]
 };
+
+const userRoles: UserRole[] = ["SIGNER", "CA_OFFICER", "VERIFIER", "AUDITOR", "ADMIN"];
+const userStatuses: UserStatus[] = ["active", "disabled"];
 
 const hashAlgorithmOptions: Array<{ value: HashAlgorithm; label: string; helper: string }> = [
   { value: "SHA-256", label: "SHA-256", helper: "Default for v2 browser signing." },
@@ -243,6 +263,7 @@ function App() {
         {activeTab === "revoke" && <RevokeCertificate />}
         {activeTab === "audit" && <AuditChain />}
         {activeTab === "admin" && <AdminPanel />}
+        {activeTab === "privacy" && <BlindSignatureDemo />}
       </main>
     </div>
   );
@@ -614,8 +635,21 @@ function SignDocumentV2() {
   const [confirmationCode, setConfirmationCode] = useState("");
   const [otpRequest, setOtpRequest] = useState<SigningOtpRequestResponse | null>(null);
   const [confirmationResult, setConfirmationResult] = useState<SigningConfirmResponse | null>(null);
+  const [timestampStatus, setTimestampStatus] = useState<TimestampStatus | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    void loadTimestampStatus();
+  }, []);
+
+  async function loadTimestampStatus() {
+    try {
+      setTimestampStatus(await getTimestampStatus());
+    } catch {
+      setTimestampStatus(null);
+    }
+  }
 
   async function prepare() {
     if (!file) {
@@ -760,6 +794,12 @@ function SignDocumentV2() {
             <ShieldCheck size={16} />
             The private key is used only by browser Web Crypto in this v2 flow. It is not sent to the API.
           </div>
+          {timestampStatus && (
+            <div className="warningBanner">
+              <AlertTriangle size={16} />
+              Timestamp: demo TSA {timestampStatus.demoTsaEnabled ? "enabled" : "disabled"}; RFC3161 {timestampStatus.rfc3161Configured ? "configured" : "not configured"}. Legal ready: {timestampStatus.legalReady ? "yes" : "no"}.
+            </div>
+          )}
           <FileInput label="Document" onFile={setFile} />
           <HashAlgorithmSelect value={hashAlgorithm} setValue={setHashAlgorithm} />
           <label>
@@ -860,6 +900,14 @@ function SignDocumentV2() {
           <dl className="detailList">
             <DetailItem label="Received at server" value={submitResult.receivedAtServer} />
             <DetailItem label="Final decision" value={submitResult.verificationReport.finalDecision} />
+            <DetailItem label="Timestamp status" value={submitResult.verificationReport.timestampStatus} />
+            {submitResult.signedPackage.timestampToken && (
+              <>
+                <DetailItem label="Timestamp token time" value={String(submitResult.signedPackage.timestampToken.timestamp ?? "-")} />
+                <DetailItem label="Timestamp token serial" value={String(submitResult.signedPackage.timestampToken.serialNumber ?? "-")} />
+                <DetailItem label="Timestamp TSA" value={String(submitResult.signedPackage.timestampToken.tsaName ?? "SecureDoc Demo TSA")} />
+              </>
+            )}
             <DetailItem label="Signature" value={`${submitResult.signedPackage.signatureBase64.slice(0, 120)}...`} />
           </dl>
           {submitResult.warnings.length > 0 && <WarningList warnings={submitResult.warnings} />}
@@ -873,7 +921,80 @@ function SignDocumentV2() {
           </div>
         </div>
       )}
+      <PadesPdfPanel />
     </section>
+  );
+}
+
+function PadesPdfPanel() {
+  const [file, setFile] = useState<File | null>(null);
+  const [reason, setReason] = useState("SecureDoc document approval");
+  const [status, setStatus] = useState<PadesStatus | null>(null);
+  const [result, setResult] = useState<{ filename: string; profile: string } | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  async function loadStatus() {
+    try {
+      setStatus(await getPadesStatus());
+    } catch {
+      setStatus(null);
+    }
+  }
+
+  async function signPdf() {
+    if (!file) {
+      setError("Choose a PDF file first.");
+      return;
+    }
+    setError("");
+    setResult(null);
+    setLoading(true);
+    try {
+      const response = await signPdfPades(file, "", reason);
+      const filename = `${file.name.replace(/\.pdf$/i, "") || "document"}-pades-signed.pdf`;
+      downloadBlob(filename, response.blob);
+      setResult({ filename, profile: response.profile });
+    } catch (err) {
+      setError(errorMessage(err, "Cannot sign PDF with PAdES."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="surface">
+      <div className="resultHeader">
+        <FileCheck size={22} />
+        <div>
+          <h3>PAdES PDF export</h3>
+          <p>Create a standards-shaped PDF signature container with pyHanko. This uses a local demo server-side signer.</p>
+        </div>
+      </div>
+      {status && (
+        <dl className="detailList">
+          <DetailItem label="Default profile" value={status.defaultProfile} />
+          <DetailItem label="RFC3161 TSA" value={status.rfc3161Configured ? status.rfc3161Provider ?? "configured" : "not configured"} />
+          <DetailItem label="Legal ready" value={status.legalReady ? "yes" : "no"} />
+          <DetailItem label="Warning" value={status.warning} />
+        </dl>
+      )}
+      <FileInput label="PDF document" onFile={setFile} />
+      <label>
+        Signing reason
+        <input value={reason} onChange={(event) => setReason(event.target.value)} />
+      </label>
+      <button className="primary" onClick={signPdf} disabled={loading || !file}>
+        <FileCheck size={18} />
+        {loading ? "Signing PDF..." : "Sign PDF PAdES"}
+      </button>
+      {result && <p className="successText">Downloaded {result.filename}. Profile: {result.profile}</p>}
+      {error && <p className="errorText" role="alert">{error}</p>}
+    </div>
   );
 }
 
@@ -998,8 +1119,13 @@ function RevokeCertificate() {
 
 function AuditChain() {
   const [result, setResult] = useState<AuditChainResult | null>(null);
+  const [events, setEvents] = useState<AuditEvent[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    void loadLogs();
+  }, []);
 
   async function verifyChain() {
     setError("");
@@ -1013,14 +1139,51 @@ function AuditChain() {
     }
   }
 
+  async function loadLogs() {
+    setError("");
+    setLoading(true);
+    try {
+      const response = await listAuditLogs(100);
+      setEvents(response.events);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot load audit logs."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function downloadAuditReport() {
+    setError("");
+    setLoading(true);
+    try {
+      const report = await exportAuditReport(500);
+      downloadText("securedoc_audit_report.json", JSON.stringify(report, null, 2));
+      setEvents(report.events);
+      setResult(report.chain);
+    } catch (err) {
+      setError(errorMessage(err, "Cannot export audit report."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <section className="page taskPage">
-      <PageHeader title="Audit chain" description="Auditor-only verification of the audit hash chain." />
+      <PageHeader title="Audit chain" description="Auditor-only audit log review and hash-chain verification." />
       <div className="surface">
-        <button className="primary" onClick={verifyChain} disabled={loading}>
-          <ShieldCheck size={18} />
-          Verify audit chain
-        </button>
+        <div className="buttonRow">
+          <button className="primary" onClick={verifyChain} disabled={loading}>
+            <ShieldCheck size={18} />
+            Verify audit chain
+          </button>
+          <button className="secondary" onClick={loadLogs} disabled={loading}>
+            Refresh logs
+          </button>
+          <button className="secondary" onClick={downloadAuditReport} disabled={loading}>
+            <Download size={18} />
+            Export report
+          </button>
+        </div>
         {error && <p className="errorText" role="alert">{error}</p>}
       </div>
       {result && (
@@ -1035,16 +1198,218 @@ function AuditChain() {
           </div>
         </div>
       )}
+      <div className="documentTableWrap">
+        <table className="documentTable">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+              <th>Actor</th>
+              <th>Result</th>
+              <th>Target</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {events.map((event) => (
+              <tr key={event.eventId}>
+                <td>{new Date(event.createdAt).toLocaleString()}</td>
+                <td>{event.eventType}</td>
+                <td>{event.actor ?? "-"}</td>
+                <td><span className={`statusBadge ${event.result}`}>{event.result}</span></td>
+                <td>{event.certificateSerial ?? event.documentHash?.slice(0, 18) ?? "-"}</td>
+                <td>{event.details ?? "-"}</td>
+              </tr>
+            ))}
+            {events.length === 0 && (
+              <tr>
+                <td colSpan={6}>No audit events found.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }
 
 function AdminPanel() {
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [selectedEmail, setSelectedEmail] = useState("");
+  const [form, setForm] = useState<{ email: string; name: string; role: UserRole; status: UserStatus }>({
+    email: "",
+    name: "",
+    role: "SIGNER",
+    status: "active",
+  });
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void refreshUsers();
+  }, []);
+
+  async function refreshUsers() {
+    setError("");
+    setLoading(true);
+    try {
+      const response = await listAdminUsers();
+      setUsers(response.users);
+      if (!selectedEmail && response.users.length > 0) {
+        selectUser(response.users[0]);
+      }
+    } catch (err) {
+      setError(errorMessage(err, "Cannot load users."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function selectUser(user: AdminUser) {
+    setSelectedEmail(user.email);
+    setForm({ email: user.email, name: user.name, role: user.role, status: user.status });
+    setMessage("");
+    setError("");
+  }
+
+  function resetForCreate() {
+    setSelectedEmail("");
+    setForm({ email: "", name: "", role: "SIGNER", status: "active" });
+    setMessage("");
+    setError("");
+  }
+
+  async function saveUser() {
+    setError("");
+    setMessage("");
+    setLoading(true);
+    try {
+      const saved = selectedEmail
+        ? await updateAdminUser(selectedEmail, {
+            name: form.name,
+            role: form.role,
+            status: form.status,
+          })
+        : await createAdminUser(form);
+      const response = await listAdminUsers();
+      setUsers(response.users);
+      selectUser(saved);
+      setMessage(selectedEmail ? "User updated." : "User created.");
+    } catch (err) {
+      setError(errorMessage(err, selectedEmail ? "Cannot update user." : "Cannot create user."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function toggleUser(user: AdminUser) {
+    setError("");
+    setMessage("");
+    setLoading(true);
+    try {
+      const updated = await setAdminUserEnabled(user.email, user.status !== "active");
+      const response = await listAdminUsers();
+      setUsers(response.users);
+      selectUser(updated);
+      setMessage(updated.status === "active" ? "User enabled." : "User disabled.");
+    } catch (err) {
+      setError(errorMessage(err, "Cannot change user status."));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <section className="page taskPage">
-      <PageHeader title="User administration" description="User and role records are stored in the users table." />
+      <PageHeader title="User administration" description="Create users, assign roles, and disable accounts from the SecureDoc users table." />
       <div className="surface">
-        <p className="fieldHint">Admin API for editing users is not implemented yet. Seeded product users are managed server-side for this phase.</p>
+        <div className="formGrid">
+          <label>
+            Email
+            <input
+              value={form.email}
+              onChange={(event) => setForm({ ...form, email: event.target.value })}
+              placeholder="student@example.com"
+              disabled={Boolean(selectedEmail)}
+            />
+          </label>
+          <label>
+            Name
+            <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Display name" />
+          </label>
+          <label>
+            Role
+            <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value as UserRole })}>
+              {userRoles.map((role) => (
+                <option key={role} value={role}>{role}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Status
+            <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as UserStatus })}>
+              {userStatuses.map((status) => (
+                <option key={status} value={status}>{status}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="buttonRow">
+          <button className="primary" onClick={saveUser} disabled={loading || !form.email.trim() || !form.name.trim()}>
+            <Fingerprint size={18} />
+            {selectedEmail ? "Update user" : "Create user"}
+          </button>
+          <button className="secondary" onClick={resetForCreate} disabled={loading}>
+            New user
+          </button>
+          <button className="secondary" onClick={refreshUsers} disabled={loading}>
+            Refresh
+          </button>
+        </div>
+        {message && <p className="successText">{message}</p>}
+        {error && <p className="errorText" role="alert">{error}</p>}
+      </div>
+
+      <div className="documentTableWrap">
+        <table className="documentTable">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Name</th>
+              <th>Role</th>
+              <th>Status</th>
+              <th>Updated</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map((user) => (
+              <tr key={user.email}>
+                <td>{user.email}</td>
+                <td>{user.name}</td>
+                <td>{user.role}</td>
+                <td><span className={`statusBadge ${user.status}`}>{user.status}</span></td>
+                <td>{new Date(user.updatedAt).toLocaleString()}</td>
+                <td>
+                  <div className="tableActions">
+                    <button className="secondary" onClick={() => selectUser(user)} disabled={loading}>
+                      Edit
+                    </button>
+                    <button className="secondary" onClick={() => toggleUser(user)} disabled={loading}>
+                      {user.status === "active" ? "Disable" : "Enable"}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {users.length === 0 && (
+              <tr>
+                <td colSpan={6}>No users found.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </section>
   );
@@ -1177,6 +1542,7 @@ function VerifyDocumentLegacy() {
 
 function BlindSignatureDemo() {
   const [purpose, setPurpose] = useState<BlindPurpose>("anonymous_access_token");
+  const [status, setStatus] = useState<BlindSignatureStatus | null>(null);
   const [session, setSession] = useState<BlindSessionResponse | null>(null);
   const [signResult, setSignResult] = useState<BlindSignResponse | null>(null);
   const [finalSignatureBase64, setFinalSignatureBase64] = useState("");
@@ -1186,7 +1552,24 @@ function BlindSignatureDemo() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  async function loadStatus() {
+    setError("");
+    try {
+      setStatus(await getBlindSignatureStatus());
+    } catch (err) {
+      setError(errorMessage(err, "Cannot load blind signature status."));
+    }
+  }
+
   async function createSession() {
+    if (status && !status.enabled) {
+      setError("Blind signature demo routes are disabled. Set ENABLE_BLIND_SIGNATURE_DEMO=true and restart backend.");
+      return;
+    }
     setError("");
     setSession(null);
     setSignResult(null);
@@ -1198,7 +1581,7 @@ function BlindSignatureDemo() {
     try {
       const response = await fetch(`${API_BASE}/api/blind-signature/sessions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ purpose, ttlSeconds: 600 })
       });
       setSession(await parseResponse<BlindSessionResponse>(response));
@@ -1216,7 +1599,7 @@ function BlindSignatureDemo() {
     try {
       const response = await fetch(`${API_BASE}/api/blind-signature/sign`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           sessionId: session.sessionId,
           blindedMessageBase64: session.blindedMessageBase64
@@ -1255,7 +1638,7 @@ function BlindSignatureDemo() {
     try {
       const response = await fetch(`${API_BASE}/api/blind-signature/verify`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           sessionId: session.sessionId,
           token: session.token,
@@ -1274,7 +1657,7 @@ function BlindSignatureDemo() {
     try {
       const response = await fetch(`${API_BASE}/api/blind-signature/redeem`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           sessionId: session.sessionId,
           token: session.token,
@@ -1297,6 +1680,15 @@ function BlindSignatureDemo() {
           <AlertTriangle size={16} />
           Educational demo only. Blind signatures are for privacy/anonymous-token problems, not document identity signing.
         </div>
+        {status && (
+          <dl className="detailList">
+            <DetailItem label="Module status" value={status.enabled ? "enabled" : "disabled"} />
+            <DetailItem label="Scheme" value={status.scheme} />
+            <DetailItem label="Allowed purposes" value={status.allowedPurposes.join(", ")} />
+            <DetailItem label="Legal ready" value={status.legalReady ? "yes" : "no"} />
+            <DetailItem label="Warning" value={status.warning} />
+          </dl>
+        )}
         <label>
           Purpose
           <select value={purpose} onChange={(event) => setPurpose(event.target.value as BlindPurpose)}>
@@ -1305,7 +1697,7 @@ function BlindSignatureDemo() {
             <option value="e_cash_demo">e_cash_demo</option>
           </select>
         </label>
-        <button className="primary" onClick={createSession} disabled={loading}>
+        <button className="primary" onClick={createSession} disabled={loading || status?.enabled === false}>
           <EyeOff size={18} />
           {loading ? "Creating..." : "1. Create token and blind it"}
         </button>

@@ -42,6 +42,94 @@ Tra ve policy thuat toan duoc phep.
 }
 ```
 
+## Admin user APIs
+
+Nhung endpoint nay can role `ADMIN`. Role va status duoc luu trong bang
+`users`; frontend khong duoc tu khai role.
+
+### GET /api/admin/users
+
+Tra danh sach users.
+
+```json
+{
+  "users": [
+    {
+      "email": "student@example.com",
+      "name": "Student",
+      "role": "SIGNER",
+      "status": "active",
+      "createdAt": "2026-06-18T00:00:00+00:00",
+      "updatedAt": "2026-06-18T00:00:00+00:00"
+    }
+  ]
+}
+```
+
+### GET /api/admin/users/{email}
+
+Tra role/status that trong DB cho mot user. Dung endpoint nay khi can kiem tra
+DB hien tai thay vi nhin vao seed trong `database.py`.
+
+### POST /api/admin/users
+
+Tao user moi.
+
+```json
+{
+  "email": "student@example.com",
+  "name": "Student",
+  "role": "SIGNER",
+  "status": "active"
+}
+```
+
+Role hop le:
+
+```text
+ADMIN
+CA_OFFICER
+SIGNER
+VERIFIER
+AUDITOR
+```
+
+Status hop le:
+
+```text
+active
+disabled
+```
+
+Audit event: `user_created`.
+
+### PATCH /api/admin/users/{email}
+
+Cap nhat `name`, `role`, hoac `status`.
+
+```json
+{
+  "name": "Student Updated",
+  "role": "VERIFIER",
+  "status": "active"
+}
+```
+
+Audit event: `user_updated`.
+
+### POST /api/admin/users/{email}/disable
+
+Disable user. User bi disable khong request login OTP duoc va JWT cu cung bi
+reject do `require_roles()` doc lai status tu DB.
+
+Audit event: `user_disabled`.
+
+### POST /api/admin/users/{email}/enable
+
+Enable user.
+
+Audit event: `user_enabled`.
+
 ## POST /api/certificates/x509/proof-challenge
 
 Tao challenge ngan han de client ky bang private key tuong ung voi `publicKeyPem`.
@@ -226,6 +314,28 @@ Response:
 }
 ```
 
+## GET /api/timestamp/status
+
+Tra trang thai cau hinh timestamp hien tai. Endpoint nay khong goi TSA ngoai,
+chi cho frontend/report biet he thong dang dung demo TSA hay co cau hinh
+RFC3161 provider.
+
+Response:
+
+```json
+{
+  "demoTsaEnabled": true,
+  "rfc3161Configured": false,
+  "rfc3161Provider": null,
+  "legalReady": false,
+  "warning": "SecureDoc submit flow issues demo JSON timestamp tokens automatically..."
+}
+```
+
+Luu y: submit flow se tu cap demo JSON timestamp token neu client khong gui
+`timestampToken`. Token nay giup demo revocation-by-signing-time, nhung khong
+phai RFC3161/LTV production token.
+
 ## POST /api/pdf/pades/sign
 
 Ky PDF bang pyHanko va tra ve PDF da co chu ky so PDF thuc su
@@ -250,6 +360,29 @@ Content-Type: application/pdf
 X-SecureDoc-PAdES-Profile: PAdES-B-B | PAdES-B-T
 X-SecureDoc-PAdES-Hash: sha256-of-signed-pdf
 ```
+
+## GET /api/pdf/pades/status
+
+Tra kha nang PAdES hien tai. Endpoint nay khong ky PDF, chi cho frontend/report
+biet profile mac dinh va trang thai RFC3161.
+
+Response:
+
+```json
+{
+  "enabled": true,
+  "defaultProfile": "PAdES-B-B",
+  "timestampedProfileAvailable": false,
+  "rfc3161Configured": false,
+  "rfc3161Provider": null,
+  "legalReady": false,
+  "warning": "PAdES export uses a local demo server-side signer..."
+}
+```
+
+Gioi han: PAdES export hien la demo PAdES-B-B, hoac PAdES-B-T neu co
+`SECUREDOC_RFC3161_TSA_URL`. Chua co PAdES-LT/LTA, DSS/VRI, OCSP/CRL embedded,
+public CA trust hay HSM/KMS.
 
 ## POST /api/sign/v2/prepare
 
@@ -532,9 +665,118 @@ Response:
 }
 ```
 
+## GET /api/audit/logs
+
+Tra danh sach audit events gan nhat. Endpoint nay can role `AUDITOR`.
+
+Query:
+
+```text
+limit=100
+```
+
+Response:
+
+```json
+{
+  "events": [
+    {
+      "id": 12,
+      "eventId": "9f3a...",
+      "eventType": "signature_verified",
+      "actor": "verifier@example.com",
+      "documentHash": "b94d27...",
+      "certificateSerial": "A1B2C3",
+      "result": "success",
+      "details": "requestId=...",
+      "createdAt": "2026-06-18T00:00:00+00:00",
+      "previousLogHash": "aabb...",
+      "currentLogHash": "ccdd..."
+    }
+  ]
+}
+```
+
+## GET /api/audit/export
+
+Xuat audit report JSON de nop kem demo/report. Endpoint nay can role `AUDITOR`.
+Backend ghi them audit event `audit_report_exported`, sau do tra chain status va
+danh sach events moi nhat.
+
+Query:
+
+```text
+limit=500
+```
+
+Response:
+
+```json
+{
+  "generatedAt": "2026-06-18T00:00:00+00:00",
+  "exportedBy": "auditor@example.com",
+  "chain": {
+    "valid": true,
+    "totalEvents": 20,
+    "brokenAt": null
+  },
+  "totalEvents": 20,
+  "includedEvents": 20,
+  "events": []
+}
+```
+
+## GET /api/system/security-readiness
+
+Tra checklist hardening hien tai de dua vao final report. Endpoint nay can role
+`ADMIN` hoac `AUDITOR` va khong tra ve gia tri secret.
+
+Response:
+
+```json
+{
+  "environment": "development",
+  "productionMode": false,
+  "corsAllowOrigins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+  "requestSizeLimitBytes": 2097152,
+  "rateLimitRequestsPerMinute": 120,
+  "httpsOnly": false,
+  "checks": [
+    {
+      "key": "cors_allowlist",
+      "passed": true,
+      "severity": "warning",
+      "message": "CORS uses an explicit allowlist."
+    }
+  ],
+  "databaseRecommendation": "SQLite phu hop demo/local. Production nen dung PostgreSQL.",
+  "legalReady": false
+}
+```
+
+Endpoint nay dung de chung minh Phase 9 hardening: CORS allowlist, request size
+limit, rate limit, security headers, HTTPS/HSTS flag, secret default check, SMTP
+delivery state, database recommendation va legal-grade limitations.
+
 ## Blind signature APIs
 
 Blind signature flow is separate from document signing. Document signatures identify a signer for a document. Blind signatures are for privacy/anonymous-token problems where the signer authorizes a blinded token without seeing the original token.
+
+The status endpoint is always available to authenticated users. Session/sign/verify/redeem routes are exposed only when `ENABLE_BLIND_SIGNATURE_DEMO=true` and require an authenticated `SIGNER` or `ADMIN` token.
+
+### GET /api/blind-signature/status
+
+Returns whether the educational blind-signature demo routes are enabled.
+
+```json
+{
+  "enabled": false,
+  "scheme": "RSA blind signature educational demo",
+  "allowedPurposes": ["anonymous_access_token", "e_cash_demo", "e_voting_demo"],
+  "legalReady": false,
+  "warning": "Blind signatures are an educational privacy-token module..."
+}
+```
 
 Allowed token purposes:
 
